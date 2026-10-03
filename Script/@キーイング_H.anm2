@@ -1,0 +1,485 @@
+--[[
+キーイング_H.anm2（マット調整 v1.01 / スピル除去 v1.01 / トラックマット v1.03）
+
+  マット調整   : アルファを 収縮／膨張 → エッジぼかし → レベル補正 の順で整える（マルチパス）
+  スピル除去   : 背景色の回り込み（スピル）を中和する（1 パス）
+  トラックマット : 他レイヤーの輝度／アルファでマスクする
+
+適用順は マット調整 → スピル除去 を推奨（α を整えてから RGB の被りを取る）。
+
+マット調整の「黒レベル」「白レベル」「マットコントラスト」は α に対する操作なので、
+α=1 一色の不透明素材では見た目が変わらない（仕様どおりの挙動）。
+キー抜き後の半透明なエッジを持つマットに対して効く。
+なお 黒レベル >= 白レベル のときはレベル補正そのものを行わない
+（α が全て 0 になって画像が消えるため）。
+
+※このコメント内で行頭に 「＠」 を置かないこと。ファイル名が @ 始まりのファイルでは
+  ブロックコメントの中でも行頭の区切り記号がセクション区切りとして登録される。
+]]
+
+@マット調整
+--information:マット調整@キーイング_H v1.01 by HexBrowns
+--label:HexScript
+--filter
+--group:マット形状
+--track@choke:収縮／膨張,-16,16,0,0.1
+--track@feather:エッジぼかし,0,32,0,0.1
+--group
+--group:マットレベル
+--track@black_level:黒レベル,0,100,0,0.1
+--track@white_level:白レベル,0,100,100,0.1
+--track@matte_gamma:マットコントラスト,-100,100,0,0.1
+--group
+
+--[[pixelshader@ps_matte_choke_h:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 texel;
+    float radius;
+    float dilate;
+};
+float4 ps_matte_choke_h(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.SampleLevel(smp, uv, 0);
+    float4 wide = c;
+    float min_a = c.a;
+    for (int i = -16; i <= 16; ++i) {
+        float fi = float(i);
+        if (abs(fi) <= radius) {
+            float4 s = src.SampleLevel(smp, saturate(uv + texel * fi), 0);
+            if (s.a > wide.a) { wide = s; }
+            min_a = min(min_a, s.a);
+        }
+    }
+    if (dilate > 0.5) {
+        return wide;
+    }
+    float scale = min_a / max(c.a, 1e-5);
+    return float4(c.rgb * scale, min_a);
+}
+]]
+
+--[[pixelshader@ps_matte_choke_v:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 texel;
+    float radius;
+    float dilate;
+};
+float4 ps_matte_choke_v(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.SampleLevel(smp, uv, 0);
+    float4 wide = c;
+    float min_a = c.a;
+    for (int i = -16; i <= 16; ++i) {
+        float fi = float(i);
+        if (abs(fi) <= radius) {
+            float4 s = src.SampleLevel(smp, saturate(uv + texel * fi), 0);
+            if (s.a > wide.a) { wide = s; }
+            min_a = min(min_a, s.a);
+        }
+    }
+    if (dilate > 0.5) {
+        return wide;
+    }
+    float scale = min_a / max(c.a, 1e-5);
+    return float4(c.rgb * scale, min_a);
+}
+]]
+
+--[[pixelshader@ps_matte_blur_h:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 texel;
+    float radius;
+    float sigma;
+};
+float4 ps_matte_blur_h(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    // マットのエッジぼかしなので α だけを平均する。RGBA をまとめて平均すると
+    // マットではなく画像そのものがぼける。RGB は中心画素の straight 値を保ち、
+    // 新しい α で再乗算して premultiplied のまま次のパスへ渡す
+    float4 c = src.SampleLevel(smp, uv, 0);
+    float acc = 0.0;
+    float wsum = 0.0;
+    float3 acc_rgb = float3(0.0, 0.0, 0.0);
+    float sg = max(sigma, 1e-4);
+    float denom = 2.0 * sg * sg;
+    for (int i = -32; i <= 32; ++i) {
+        float fi = float(i);
+        if (abs(fi) <= radius) {
+            float w = exp(-(fi * fi) / denom);
+            float4 sm = src.SampleLevel(smp, saturate(uv + texel * fi), 0);
+            acc += sm.a * w;
+            acc_rgb += sm.rgb * w;
+            wsum += w;
+        }
+    }
+    float na = saturate(acc / max(wsum, 1e-5));
+    // 中心が不透明なら元の色をそのまま保つ（内部をぼかさないため）。
+    // 中心が透明な画素は元の色を持たないので、0 を入れると外側へ広がった α が
+    // 暗いフチになる。近傍の premultiplied 合計を α 合計で割って色を復元する
+    // （α で重み付けした近傍の straight 色の平均になる）
+    float3 straight = c.rgb / max(c.a, 1e-4);
+    if (c.a <= 0.001) {
+        straight = acc_rgb / max(acc, 1e-5);
+    }
+    return float4(saturate(straight * na), na);
+}
+]]
+
+--[[pixelshader@ps_matte_blur_v:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 texel;
+    float radius;
+    float sigma;
+};
+float4 ps_matte_blur_v(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    // 正本: ps_matte_blur_h（変更時は横パス側も同時に直す）。α のみをぼかす
+    float4 c = src.SampleLevel(smp, uv, 0);
+    float acc = 0.0;
+    float wsum = 0.0;
+    float3 acc_rgb = float3(0.0, 0.0, 0.0);
+    float sg = max(sigma, 1e-4);
+    float denom = 2.0 * sg * sg;
+    for (int i = -32; i <= 32; ++i) {
+        float fi = float(i);
+        if (abs(fi) <= radius) {
+            float w = exp(-(fi * fi) / denom);
+            float4 sm = src.SampleLevel(smp, saturate(uv + texel * fi), 0);
+            acc += sm.a * w;
+            acc_rgb += sm.rgb * w;
+            wsum += w;
+        }
+    }
+    float na = saturate(acc / max(wsum, 1e-5));
+    // 中心が不透明なら元の色をそのまま保つ（内部をぼかさないため）。
+    // 中心が透明な画素は元の色を持たないので、0 を入れると外側へ広がった α が
+    // 暗いフチになる。近傍の premultiplied 合計を α 合計で割って色を復元する
+    // （α で重み付けした近傍の straight 色の平均になる）
+    float3 straight = c.rgb / max(c.a, 1e-4);
+    if (c.a <= 0.001) {
+        straight = acc_rgb / max(acc, 1e-5);
+    }
+    return float4(saturate(straight * na), na);
+}
+]]
+
+--[[pixelshader@ps_matte_levels:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float black;
+    float white;
+    float matte_gamma;
+};
+float4 ps_matte_levels(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.SampleLevel(smp, uv, 0);
+    if (c.a <= 0.0001) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    float na = saturate((c.a - black) / max(white - black, 1e-4));
+    na = pow(max(na, 0.0), matte_gamma);
+    float3 straight = c.rgb / c.a;
+    return float4(saturate(straight * na), na);
+}
+]]
+
+local obj, math = obj, math
+
+local ow, oh = obj.w, obj.h
+if ow < 1 or oh < 1 then return end
+
+-- 実行するパスを先に決める。0 のパラメータのパスは飛ばす
+local choke_r = math.min(math.abs(choke), 16)
+local do_choke = choke_r > 0
+local blur_r = math.min(feather, 32)
+local do_blur = blur_r > 0
+-- 黒 >= 白 では (white - black) が 0 以下になり、α が全て 0 になって画像が消える。
+-- 値が交差している間はレベル補正そのものを行わない
+local levels_valid = black_level < white_level
+local do_levels = levels_valid and ((black_level > 0) or (white_level < 100) or (matte_gamma ~= 0))
+
+if not (do_choke or do_blur or do_levels) then return end
+
+-- v1.01: 膨張とエッジぼかしは輪郭の外へ α を運ぶ。v1.00 は領域を広げていなかったので、
+-- 外枠いっぱいまで不透明な素材では膨張もぼかしもオブジェクトの矩形で切れていた。
+-- α を外へ運ぶ最初のパスの直前に、各辺を
+--     ceil(膨張の半径) + ceil(ぼかしの半径) + PAD_MARGIN
+-- だけ透明で広げる。収縮（choke < 0）は内側へ削るだけなので数えず、広げる前に済ませる
+-- （収縮だけのときの絵は v1.00 と同じ。外枠の位置は削らない）。
+-- フィルタオブジェクトはフレームバッファの大きさを変えられないので広げない（au2-filter-object）。
+-- 何もしない設定・収縮だけ・レベル補正だけでも広げない（v1.00 と同じ絵・同じ大きさ）。
+-- 検証器: AI/scripts/キーイング_H/verify_keying.py（MX 項目）
+local PAD_MARGIN = 2
+local grow = 0
+if do_choke and choke > 0 then grow = grow + math.ceil(choke_r) end
+if do_blur then grow = grow + math.ceil(blur_r) end
+local pad_pending = grow > 0 and not obj.getinfo("filter")
+
+local function expand_once()
+  if not pad_pending then return end
+  pad_pending = false
+  -- 最大画像サイズを超えないよう、縦横それぞれで収める
+  local max_w, max_h = obj.getinfo("image_max")
+  max_w, max_h = max_w or 16384, max_h or 16384
+  local pad_x = math.max(0, math.min(grow + PAD_MARGIN, math.floor((max_w - ow) / 2)))
+  local pad_y = math.max(0, math.min(grow + PAD_MARGIN, math.floor((max_h - oh) / 2)))
+  if pad_x == 0 and pad_y == 0 then return end
+  local left, right, top, bottom = pad_x, pad_x, pad_y, pad_y
+  obj.effect("領域拡張", "上", top, "下", bottom, "左", left, "右", right, "塗りつぶし", 0)
+  -- 左右・上下を同じ量だけ広げるので中心は動かない。広げ方を変えたときのために
+  -- 光束_H と同じ補正を書いておく（今は常に 0）
+  obj.cx = obj.cx + (left - right) / 2
+  obj.cy = obj.cy + (top - bottom) / 2
+  ow, oh = obj.w, obj.h
+end
+
+-- 中間バッファ（cache:）は使わない。理由:
+--   ・キャッシュバッファは名前が全オブジェクトで共通で、1 フレームの描画毎に破棄される
+--     （lua.txt の「関数」の obj.copybuffer）ため、寿命と共有範囲がスクリプトの制御外にある
+--   ・4K のフィルタオブジェクトで pixelshader の書き込み先として実機に拒否された
+--     （invalid buffer type → invalid shader output parameter）
+-- resource がレンダーターゲットと同一なら、ホストが複製して t0 に設定する
+-- （lua.txt の「関数」の obj.pixelshader の resource）ので、
+-- ping-pong 用の中間バッファはそもそも要らない。全パスを object → object で回す。
+--
+-- sampler は近傍を舐めるパス（収縮／膨張・ぼかし）で "clamp" を指定する。
+-- 既定は未設定で、領域外のサンプルが透明として返ると画像の端が削れる／黒いフチが出る。
+
+if do_choke then
+  -- 膨張はアルファ最大のサンプルを RGB ごと拾う（黒フチを防ぐ）
+  -- 収縮は最小アルファを取り、RGB を new_a / old_a でスケールして premultiplied を保つ
+  local dilate = (choke > 0) and 1 or 0
+  if dilate == 1 then expand_once() end
+  obj.pixelshader("ps_matte_choke_h", "object", { "object" }, { 1 / ow, 0, choke_r, dilate }, "copy", "clamp")
+  obj.pixelshader("ps_matte_choke_v", "object", { "object" }, { 0, 1 / oh, choke_r, dilate }, "copy", "clamp")
+end
+
+if do_blur then
+  -- α のみをぼかし、RGB は中心画素の straight 値に新しい α を掛けて再乗算する
+  -- （中間結果も premultiplied のままなので、そのまま縦パスへ渡せる）
+  expand_once()
+  local sigma = math.max(blur_r * 0.5, 1e-3)
+  obj.pixelshader("ps_matte_blur_h", "object", { "object" }, { 1 / ow, 0, blur_r, sigma }, "copy", "clamp")
+  obj.pixelshader("ps_matte_blur_v", "object", { "object" }, { 0, 1 / oh, blur_r, sigma }, "copy", "clamp")
+end
+
+if do_levels then
+  -- マットコントラストは 2^(v/100)。0 で 1.0、+100 で 2.0、-100 で 0.5
+  -- 近傍を舐めないパスなので sampler の指定は不要
+  local gamma = 2 ^ (matte_gamma / 100)
+  obj.pixelshader("ps_matte_levels", "object", { "object" }, { black_level / 100, white_level / 100, gamma })
+end
+
+@スピル除去
+--information:スピル除去@キーイング_H v1.01 by HexBrowns
+--label:HexScript
+--filter
+--color@key_color:背景色,0x00ff00
+--track@strength:強度,0,100,100,0.1
+--track@tolerance:許容,-100,100,0,0.1
+--track@balance:バランス,0,100,50,0.1
+--check@keep_luma:明度を保つ,1
+
+--[[pixelshader@ps_spill:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float3 key_rgb;
+    float strength;
+    float tolerance;
+    float balance;
+    float keep_luma;
+};
+float4 ps_spill(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.SampleLevel(smp, uv, 0);
+    if (c.a <= 0.001) {
+        return c;
+    }
+    // premultiplied を解除してから RGB を触る
+    float3 rgb = c.rgb / c.a;
+    float lum_before = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    // 背景色の主チャンネルを判定し、残り 2ch から作った上限までその値を引き下げる
+    if (key_rgb.r >= key_rgb.g && key_rgb.r >= key_rgb.b) {
+        float lo = min(rgb.g, rgb.b);
+        float hi = max(rgb.g, rgb.b);
+        float limit = lerp(lo, hi, balance);
+        float val = min(rgb.r, limit + tolerance);
+        rgb.r = lerp(rgb.r, val, strength);
+    }
+    else if (key_rgb.g >= key_rgb.r && key_rgb.g >= key_rgb.b) {
+        float lo = min(rgb.r, rgb.b);
+        float hi = max(rgb.r, rgb.b);
+        float limit = lerp(lo, hi, balance);
+        float val = min(rgb.g, limit + tolerance);
+        rgb.g = lerp(rgb.g, val, strength);
+    }
+    else {
+        float lo = min(rgb.r, rgb.g);
+        float hi = max(rgb.r, rgb.g);
+        float limit = lerp(lo, hi, balance);
+        float val = min(rgb.b, limit + tolerance);
+        rgb.b = lerp(rgb.b, val, strength);
+    }
+    if (keep_luma > 0.5) {
+        float lum_after = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+        rgb = rgb * (lum_before / max(lum_after, 1e-4));
+    }
+    // straight のまま 0..1 に詰めてから再乗算する（v1.01）。
+    // 「明度を保つ」の倍率で straight の値は 1 を超えうる。v1.00 は再乗算の後で
+    // saturate していたので、半透明の画素で rgb > a（乗算済みとして不正な値）が残った
+    return float4(saturate(rgb) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+if strength <= 0 then return end
+
+-- --color@ の値は 0xRRGGBB。上位から順に取り出して 0..1 へ正規化する
+local kc = math.floor(tonumber(key_color) or 0x00ff00) % 0x1000000
+local kr = math.floor(kc / 0x10000) / 255
+local kg = math.floor((kc / 0x100) % 0x100) / 255
+local kb = math.floor(kc % 0x100) / 255
+
+obj.pixelshader("ps_spill", "object", { "object" }, {
+  kr, kg, kb,
+  strength / 100,
+  tolerance / 100,
+  balance / 100,
+  (keep_luma == 1) and 1 or 0,
+})
+
+@トラックマット
+--information:トラックマット@キーイング_H v1.03 by HexBrowns
+--label:HexScript
+--track@layer_rel:参照レイヤー,-10,10,-1,1
+--select@matte_src:マット元=0,輝度=0,アルファ=1
+--check@invert:反転,0
+--track@matte_strength:強度,0,100,100,0.1
+--check@use_effect:エフェクト適用後を使う,1
+--group:位置補正
+--track@offset_x:オフセットX,-4000,4000,0,0.1
+--track@offset_y:オフセットY,-4000,4000,0,0.1
+--group
+
+--[[pixelshader@ps_trackmatte:
+Texture2D src : register(t0);
+Texture2D matte : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 obj_draw_size;
+    float2 matte_size;
+    float2 obj_pos;
+    float2 matte_offset;
+    float matte_src;
+    float invert;
+    float strength;
+};
+float4 ps_trackmatte(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.SampleLevel(smp, uv, 0);
+    // 座標合わせ:
+    //   (1) オブジェクト uv(0..1) を画面座標へ。画面中心が原点、+X 右 / +Y 下
+    //       s = obj_pos + (uv - 0.5) * obj_draw_size
+    //       obj_pos は 標準描画の X/Y ＋ ここまでの効果の移動（obj.ox/oy）。
+    //       obj_draw_size は画面上での表示サイズ = (obj.w * sx * obj.sx, obj.h * sy * obj.sy)。
+    //       拡大率を織り込まないと等倍以外でマットの位置がズレる
+    //       （回転と中心は見ていない。回転させたオブジェクトではマットがズレる）
+    //   (2) 画面座標をマット uv へ。マットバッファは画面中心に等倍で置かれている前提
+    //       muv = (s - matte_offset) / matte_size + 0.5
+    //   matte_offset はズレの手動補正（正の値でマットを +X / +Y 方向へずらす）
+    float2 s = obj_pos + (uv - 0.5) * obj_draw_size;
+    float2 muv = (s - matte_offset) / matte_size + 0.5;
+    float4 m = matte.SampleLevel(smp, saturate(muv), 0);
+    float mv = m.a;
+    if (matte_src < 0.5) {
+        // 輝度マット: premultiplied を解除して輝度を取り、透過部は 0 になるよう α を掛ける
+        float3 mrgb = m.rgb / max(m.a, 1e-5);
+        mv = dot(mrgb, float3(0.2126, 0.7152, 0.0722)) * m.a;
+    }
+    // マットの範囲外は 0（saturate で端が引き伸ばされるのを打ち消す）。反転はこの後に掛ける
+    float inside = step(0.0, muv.x) * step(muv.x, 1.0) * step(0.0, muv.y) * step(muv.y, 1.0);
+    mv = saturate(mv) * inside;
+    if (invert > 0.5) {
+        mv = 1.0 - mv;
+    }
+    float k = lerp(1.0, mv, strength);
+    // premultiplied なので RGBA をまとめて掛ける
+    return float4(c.rgb * k, c.a * k);
+}
+]]
+
+local obj, math = obj, math
+
+if matte_strength <= 0 then return end
+
+local target_layer = math.floor(obj.layer + layer_rel + 0.5)
+if target_layer < 1 then return end
+
+-- obj.load("layer", ...) はオブジェクトの内容とサイズに加えて obj.* も読んだレイヤーの値で
+-- 置き換える（ルール au2-lua-pitfalls「別レイヤーの大きさを測るのに使える」）。
+-- 画像も変数も先に退避しておき、読んだ直後に戻す（v1.01。v1.00 は画像だけ戻していたので、
+-- 前に掛けた効果の移動・回転・拡大・不透明度が消えるおそれがあった。参照実装: 基準揃え_H）。
+-- 画像の退避先は "tempbuffer"（lua.txt の「関数」の obj.copybuffer: コピー先のサイズはコピー元に
+-- 合わせられる）。cache: は名前が全オブジェクト共通で 1 フレーム毎に破棄され、pixelshader の
+-- 書き込み先として実機に拒否された実績があるため使わない（@マット調整 と同じ理由）。
+local ow, oh = obj.w, obj.h
+local saved = {
+  obj.ox, obj.oy, obj.oz, obj.rx, obj.ry, obj.rz,
+  obj.cx, obj.cy, obj.cz, obj.sx, obj.sy, obj.sz, obj.alpha,
+}
+local function restore_vars()
+  obj.ox, obj.oy, obj.oz, obj.rx, obj.ry, obj.rz,
+  obj.cx, obj.cy, obj.cz, obj.sx, obj.sy, obj.sz, obj.alpha = unpack(saved)
+end
+
+-- obj.getvalue は値が無いと nil ではなく「戻り値なし」を返す（lua.txt の「返却無し」）。
+-- tonumber(obj.getvalue(...)) と唯一の引数に直接渡すと引数なしの tonumber になって止まるので、
+-- いったんローカルで受けてから数にする（v1.03。標準描画を持たない置き方、たとえばフィルタ
+-- オブジェクトの後続にフィルタ効果として置いたときに通りうる。ルール au2-lua-pitfalls）
+local function gv_num(target, default)
+  local v = obj.getvalue(target)
+  return tonumber(v) or default
+end
+
+-- 画面上の位置 = 標準描画の X/Y ＋ ここまでの効果の移動（obj.ox/oy）。
+-- lua.txt の「変数」: obj.ox 等は「出力項目(標準描画等)の設定値とは別のもの」なので両方を足す（v1.01）
+local ox = gv_num("x", 0) + (tonumber(obj.ox) or 0)
+local oy = gv_num("y", 0) + (tonumber(obj.oy) or 0)
+-- 画面上での表示サイズには基準拡大率が乗る。lua.txt の「関数」の obj.getvalue の "sx" / "sy"
+-- （基準拡大率。1.0=等倍）を使う。"zoom" は互換用の単一値で、X/Y で異なる拡大率を表せない。
+-- ここまでの効果の拡大（obj.sx/sy）も掛ける（v1.01）
+local sx = gv_num("sx", 1) * (tonumber(obj.sx) or 1)
+local sy = gv_num("sy", 1) * (tonumber(obj.sy) or 1)
+
+obj.copybuffer("tempbuffer", "object")
+
+local ok = obj.load("layer", target_layer, use_effect == 1)
+local mw, mh = obj.w, obj.h
+restore_vars()
+if (not ok) or mw < 1 or mh < 1 then
+  obj.copybuffer("object", "tempbuffer")
+  return
+end
+
+-- この時点で tempbuffer = 元画像 / object = マット。
+-- レンダーターゲットを tempbuffer にすると、同一名の resource はホストが複製して渡す
+-- （lua.txt の「関数」の obj.pixelshader の resource）ので、t0 = 元画像 / t1 = マット のまま
+-- 元画像サイズで出力できる。
+-- v1.02: マットは saturate(muv) で端へ寄せて読む（端の色で引き伸ばす前提）のに sampler を省いていた。
+-- 省くと範囲外は透明として補間され（実機 2026-09-27、ShapeDistort_H の SDX 2 周目）、マットの外周の半画素が
+-- 半分の濃さになる。"clamp" を渡す（元画像は画素の中心で読むので変わらない）。
+-- 検証器: AI/scripts/Filters_H/verify_edge_sampler.py / issue: AI/scripts/issues/20260927_self_made_edge_read_without_sampler.md
+obj.pixelshader("ps_trackmatte", "tempbuffer", { "tempbuffer", "object" }, {
+  ow * sx, oh * sy,
+  mw, mh,
+  ox, oy,
+  offset_x, offset_y,
+  matte_src,
+  (invert == 1) and 1 or 0,
+  matte_strength / 100,
+}, "copy", "clamp")
+obj.copybuffer("object", "tempbuffer")

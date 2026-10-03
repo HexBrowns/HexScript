@@ -1,0 +1,195 @@
+--information:検証パターン_H v1.01 by HexBrowns
+--label:HexScript
+--object
+
+--group:サイズ
+--track@width:幅,16,4000,1920,1
+--track@height:高さ,16,4000,1080,1
+--group
+
+--select@pattern:パターン=0,グレー階調=0,虹色=1,HSLチャート=2,肌色帯=3,飽和ランプ=4,硬マット=5,軟マット=6,グリーンバック=7,微グラデーション=8
+
+--group:補助
+--track@steps:段数(0で連続),0,64,0,1
+--track@amp:明度差,0.1,20.0,2.0,0.1
+--hide@amp:pattern~=8
+--track@soft:縁の柔らかさ,0,100,30,0.1
+--track@margin:余白,0,45,15,0.1
+--group
+
+-- 検証用のテストパターンを AviUtl2 の中だけで生成するカスタムオブジェクト。
+-- 外部 PNG を用意しなくても検証項目を再現できるようにするのが目的。
+--
+-- --object について: lua.txt に記載は無いが、自作で動作実績のある
+-- @ローポリ背景.obj2 / カウントアップ_H.obj2 / 枠内自動フィット_H.obj2 が
+-- どれも付けているので、動くと分かっている側に揃えて付けてある。
+--
+-- パターンと用途の対応:
+--   0 グレー階調       水平方向 0→1 の階調。LGG-02〜05 / LUT-08 / RNG
+--   1 虹色             色相 0→360、彩度・明度は一定。HSL-02〜05
+--   2 HSLチャート      色相 12 × 彩度 5 × 明度 5 のタイル。HSL / VIB
+--   3 肌色帯           肌トーン 6 帯＋低彩度 2 帯。VIB-04（肌色保護）
+--   4 飽和ランプ       両端が 0 と 1 に張り付く階調。RNG-01 / RNG-02
+--   5 硬マット         外周が完全不透明な矩形＋内側に穴。MAT-02/03/05
+--   6 軟マット         中心から外へアルファ 1→0、RGB は一様。MAT-06/07
+--   7 グリーンバック   緑背景＋半透明の縁を持つ前景。SPL / MAT
+--   8 微グラデーション ごく緩い明度差。バンディング確認用。LUT-08
+--
+-- 5 と 6 を分けているのは、エッジぼかし（feather）が「アルファに勾配がある
+-- 素材」でしか差を出せないため。不透明一色の素材だけで検証すると
+-- MAT-06/07 が「効いていない」ように見えるので、軟マットを必ず併用する。
+--
+-- 補助項目は各パターンで意味が変わる。--hide@ は条件を 1 つしか書けないので
+-- 「特定のパターンでだけ表示」を表現できるのは 明度差 だけ。他は常時表示。
+--
+-- 段数に --track@ の「ゼロ値名称」を使っていないのは、0 のときに .aup2 へ
+-- 数値と名称のどちらが保存されるか未確認のため。AI/tools/make_debug_project.py
+-- が値を書くので、保存形式が確定しているもの（数値）だけを使う。
+--
+-- 項目名に `=` を入れないこと。.aup2 は `項目名=値` の INI 形式なので、
+-- 項目名側に `=` があるとキーの切り出しが壊れる。だから「0で連続」と書く。
+
+--[[pixelshader@ps_verify_pattern:
+cbuffer Params : register(b0) {
+    float2 img_size;    // 0-1 出力サイズ(px)
+    float pattern;      // 2   パターン番号
+    float steps;        // 3   段数(0=連続)
+    float amp;          // 4   明度差(%)
+    float soft;         // 5   縁の柔らかさ(%)
+    float margin;       // 6   余白(%)
+    float pad0;         // 7   16バイト境界埋め
+};
+
+// n 段に量子化する（両端の 0 と 1 を含む）。n が 0 なら連続のまま、
+// 1 なら中間の 0.5 一色にする（v1.00 は 1 も連続扱いだった）。
+// 宣言と同時に初期化しないと strict モードで X4000 になる。
+float quant(float x, float n) {
+    float v = saturate(x);
+    float r = v;
+    if (n >= 1.5) {
+        r = saturate(floor(min(v * n, n - 1.0)) / (n - 1.0));
+    } else if (n >= 0.5) {
+        r = 0.5;
+    }
+    return r;
+}
+
+// 色相を n 段に量子化する。色相は環状で 1 が 0 と同じ色なので、両端を含めると
+// 最初と最後の段が同じ赤になる（v1.00 の虹色 4 段は 赤|緑|青|赤）。
+// 0, 1/n, ..., (n-1)/n に割り、n 色がすべて違う色相になるようにする。n が 1 なら赤一色。
+float quant_hue(float x, float n) {
+    float v = saturate(x);
+    float r = v;
+    if (n >= 0.5) {
+        r = floor(min(v * n, n - 1.0)) / n;
+    }
+    return r;
+}
+
+// HSV -> RGB。float3(単一値) は X3014 になるので各成分を明示する。
+float3 hsv2rgb(float h, float s, float v) {
+    float3 k = frac(float3(h, h, h) + float3(1.0, 0.66666667, 0.33333333));
+    float3 p = abs(k * 6.0 - float3(3.0, 3.0, 3.0)) - float3(1.0, 1.0, 1.0);
+    return v * lerp(float3(1.0, 1.0, 1.0), saturate(p), s);
+}
+
+float4 ps_verify_pattern(float4 sv_pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    int mode = (int)(pattern + 0.5);
+
+    // 短辺を 1 とする比率。円形の減衰が縦横比で潰れないようにする。
+    float short_side = max(min(img_size.x, img_size.y), 1.0);
+    float2 asp = float2(max(img_size.x, 1.0), max(img_size.y, 1.0)) / short_side;
+
+    float3 rgb = float3(0.0, 0.0, 0.0);
+    float a = 1.0;
+
+    if (mode == 0) {
+        // グレー階調
+        float g = quant(uv.x, steps);
+        rgb = float3(g, g, g);
+    } else if (mode == 1) {
+        // 虹色: 彩度・明度は 1 で固定し、色相だけを 0→360 動かす
+        float h = quant_hue(uv.x, steps);
+        rgb = hsv2rgb(h, 1.0, 1.0);
+    } else if (mode == 2) {
+        // HSLチャート: 横 12 色相 × 縦 25 行(彩度 5 × 明度 5)
+        // 名前は HSL だが内部は HSV。彩度・明度とも 0.2 刻みで 0 を含めない。
+        float hi = min(floor(saturate(uv.x) * 12.0), 11.0);
+        float ri = min(floor(saturate(uv.y) * 25.0), 24.0);
+        float si = floor(ri / 5.0);
+        float vi = fmod(ri, 5.0);
+        rgb = hsv2rgb((hi + 0.5) / 12.0, (si + 1.0) / 5.0, (vi + 1.0) / 5.0);
+    } else if (mode == 3) {
+        // 肌色帯: 上から 6 帯が肌トーン(暗→明)、下 2 帯が低彩度の参照色。
+        // 横方向は彩度 0→帯の彩度 のランプ。肌色保護が低彩度側まで
+        // 効きすぎていないかを 1 枚で見るための構成。
+        float bi = min(floor(saturate(uv.y) * 8.0), 7.0);
+        float t = bi / 5.0;
+        float h = lerp(0.045, 0.100, t);
+        float s = lerp(0.55, 0.22, t);
+        float v = lerp(0.42, 0.95, t);
+        if (bi > 5.5) {
+            float u = bi - 6.0;
+            h = lerp(0.50, 0.92, u);
+            s = lerp(0.15, 0.12, u);
+            v = lerp(0.60, 0.70, u);
+        }
+        rgb = hsv2rgb(h, s * saturate(uv.x), v);
+    } else if (mode == 4) {
+        // 飽和ランプ: 左 1/7 が 0、右 1/7 が 1 に張り付く
+        float g = quant(saturate(uv.x * 1.4 - 0.2), steps);
+        rgb = float3(g, g, g);
+    } else if (mode == 5) {
+        // 硬マット: step() だけで作りアンチエイリアスを掛けない。
+        // 収縮／膨張の効き方を、外向きの辺と内向きの辺の両方で見る。
+        float m = saturate(margin / 100.0);
+        float2 p = abs(uv - float2(0.5, 0.5));
+        float outer = 0.5 - m * 0.5;
+        float inner = outer * 0.5;
+        float e = max(p.x, p.y);
+        a = step(e, outer) * (1.0 - step(e, inner));
+        rgb = float3(1.0, 1.0, 1.0);
+    } else if (mode == 6) {
+        // 軟マット: RGB は一様。アルファだけが中心から外へ 1→0 になる。
+        // 縁の柔らかさ 0 で境界が硬くなる。
+        float d = length((uv - float2(0.5, 0.5)) * 2.0 * asp);
+        float r_out = max(1.0 - margin / 100.0, 0.02);
+        float w = max(soft / 100.0, 0.001);
+        a = saturate((r_out - d) / w);
+        rgb = float3(1.0, 1.0, 1.0);
+    } else if (mode == 7) {
+        // グリーンバック: 前景の縁で背景の緑が透けるので、
+        // スピル除去とマット調整の両方の素材になる。出力は不透明。
+        float d = length((uv - float2(0.5, 0.5)) * 2.0 * asp);
+        float r_out = max(1.0 - margin / 100.0, 0.02);
+        float w = max(soft / 100.0, 0.001);
+        float fa = saturate((r_out - d) / w);
+        rgb = lerp(float3(0.0, 1.0, 0.0), float3(0.85, 0.68, 0.55), fa);
+        a = 1.0;
+    } else {
+        // 微グラデーション: 中央 0.5 を基準に ±(明度差/2)%
+        float g = saturate(0.5 + (uv.x - 0.5) * (amp / 100.0));
+        rgb = float3(g, g, g);
+    }
+
+    // 内部フォーマットは Premultiplied Alpha。透過部は RGB も 0 になる。
+    return float4(rgb * a, a);
+}
+]]
+
+local max_x, max_y = obj.getinfo("image_max")
+local W = math.min(math.max(math.floor(width + 0.5), 1), max_x)
+local H = math.min(math.max(math.floor(height + 0.5), 1), max_y)
+
+-- clearbuffer はサイズ変更とクリアを同時に行う（obj.clear は存在しない）
+obj.clearbuffer("object", W, H)
+
+obj.pixelshader("ps_verify_pattern", "object", nil, {
+  W, H,
+  math.floor(pattern + 0.5),
+  math.floor(steps + 0.5),
+  amp,
+  soft,
+  margin,
+  0,
+})

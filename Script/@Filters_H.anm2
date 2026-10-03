@@ -1,0 +1,2314 @@
+--[[
+MIT No Attribution (MIT-0)
+Copyright (c) 2026 HexBrowns
+
+AviUtl2 Filter Effects - Unified multi-section script
+]]
+
+@グリッチ
+--information:グリッチ@Filters_H v1.31 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,50,0.1
+--track@block_size:ブロック幅,1,2000,10,0.1,,0.1
+--track@chromatic:色収差,0,100,20,0.1
+--check@animated:アニメーション,true
+--value@seed:シード,0
+--track@block_h:ブロック高さ,0,2000,0,0.1,幅と同じ,0.1
+--select@direction:ずれの向き=0,横=0,縦=1,両方=2
+--track@rate:発生率,0,100,50,0.1
+--track@interval:切り替え間隔,1,300,1,1
+--track@time_rate:時間方向の発生率,0,100,100,0.1
+--check@overflow:はみ出し,false
+-- v1.30: 項目を既存 5 つの後ろに足した。新しい項目が既定値なら v1.20 と同じ絵になる。
+-- 既存の項目名は保存キーなので変えない。検証器: AI/scripts/Filters_H/verify_glitch.py
+-- v1.31: はみ出し ON で、ずらした画素がオブジェクトの外枠で切れていたのを、ずれる向きに領域を広げて直した
+-- （通常のオブジェクトだけ。フィルタオブジェクトと はみ出し OFF は v1.30 と同じ）。
+-- 検証器: AI/scripts/Filters_H/verify_outer_spread.py / issue: AI/scripts/issues/20260927_blur_clipped_at_object_bounds.md
+--[[pixelshader@ps_glitch:
+Texture2D src : register(t0);
+Texture2D noise_tex : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float block_size;
+    float chromatic;
+    float noise_offset;
+    float2 img_size;
+    float block_h;
+    float rate;
+    float direction;
+    float overflow;
+    float2 pad;
+};
+float get_noise(float2 uv) {
+    int2 pos = int2(uint(uv.x) % 256, uint(uv.y) % 256);
+    return noise_tex.Load(int3(pos, 0)).r;
+}
+float4 ps_glitch(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 base = src.Sample(smp, uv);
+    // はみ出し OFF では透明な画素に触らない（形の内側だけで崩す。v1.20 と同じ）
+    if (overflow < 0.5 && base.a <= 0.001) return base;
+    // block_h は Lua 側で解決済み（ブロック高さ 0 なら ブロック幅 が入る）
+    float2 cell = float2(max(block_size, 1.0), max(block_h, 1.0));
+    // v1.31: img_size は元の画像の大きさ、pad は広げた余白（px）。バッファは img_size + 2 * pad。
+    // ブロックの区切りと乱数は元の画像の左上を原点に数える（広げても元の画像の上の崩れ方は同じ）
+    float2 block_pos = floor((pos.xy - pad) / cell);
+    // 余白のブロックは負の番号になる。uint() に負を渡さないよう 256 の倍数だけ底上げする（pad 0 なら 0）
+    float2 wrap = ceil(pad / cell / 256.0) * 256.0;
+    // get_noise は uint() で切り捨てるので、block_pos を縮小すると隣接ブロックが同じ乱数になる。
+    // ブロック1個を乱数1マスに対応させ、時間方向は 256 マス分をシフトさせる（@グレインと同じ流儀）。
+    float2 noise_uv = block_pos + wrap + noise_offset * 256.0;
+    float glitch_rnd = get_noise(noise_uv);
+    // 発生率: 乱数がしきい値 (1 - 発生率) を超えたブロックだけずらす。
+    // ずれ量はしきい値より上を 0〜1 に引き伸ばす。発生率 50% で v1.20 の (rnd - 0.5) * 2 と一致する
+    float threshold = 1.0 - rate;
+    float amount = (glitch_rnd - threshold) / max(rate, 0.0001);
+    // intensity(0~1)をオブジェクト幅の最大12%のズレ量に変換する（縦も同じ px 数）
+    float glitch_amt = amount * intensity * img_size.x * 0.12;
+    float amt_x = glitch_amt;
+    float amt_y = 0.0;
+    if (direction > 0.5 && direction < 1.5) {
+        amt_x = 0.0;
+        amt_y = glitch_amt;
+    }
+    if (direction > 1.5) {
+        // 両方: 横は「横」と同じ量、縦は別の乱数マスで上下どちらにも振る
+        float rnd_y = get_noise(noise_uv + float2(97.0, 181.0));
+        amt_y = (rnd_y - 0.5) * 2.0 * intensity * img_size.x * 0.12;
+    }
+    // ずれ量は元の画像の幅で決まる px。uv へはバッファ（広げた後）の大きさで直す
+    float2 offset_base = float2(amt_x, amt_y) / max(img_size + 2.0 * pad, float2(1,1));
+    float chroma_shift = chromatic * 0.02;
+    float2 offset_r = offset_base * (1.0 + chroma_shift);
+    float2 offset_g = offset_base;
+    float2 offset_b = offset_base * (1.0 - chroma_shift);
+    float4 c_r = src.Sample(smp, uv + offset_r);
+    float4 c_g = src.Sample(smp, uv + offset_g);
+    float4 c_b = src.Sample(smp, uv + offset_b);
+    float4 result = base;
+    if (glitch_rnd > threshold) {
+        // 色もアルファもずらした先から取る（乗算済みの色とアルファを同じ位置から取る）。
+        // 色収差で 3 か所から取るので、アルファは 3 つの最大を採る
+        float a_src = max(max(c_r.a, c_g.a), c_b.a);
+        // はみ出し OFF: 元の形より外へ出さない（アルファを元のアルファで頭打ちにする）。
+        // v1.20 は先の色に元のアルファをそのまま組み合わせ、RGB > A（明るい縁）や暗い欠けを作っていた
+        float a_out = (overflow > 0.5) ? a_src : min(a_src, base.a);
+        // アルファを下げた分だけ乗算済みの色も下げて RGB <= A を保つ。
+        // 先と元のアルファが同じなら係数はちょうど 1 で、v1.20 と同じ値になる
+        float k_r = (c_r.a > a_out) ? a_out / max(c_r.a, 0.00001) : 1.0;
+        float k_g = (c_g.a > a_out) ? a_out / max(c_g.a, 0.00001) : 1.0;
+        float k_b = (c_b.a > a_out) ? a_out / max(c_b.a, 0.00001) : 1.0;
+        result = float4(c_r.r * k_r, c_g.g * k_g, c_b.b * k_b, a_out);
+    }
+    return result;
+}
+]]
+
+local obj, math = obj, math
+local noise = require("EffectUtils_Noise")
+
+if intensity <= 0 or rate <= 0 then return end
+
+-- 切り替え間隔: この単位ごとに配置と「出すか」を引き直す（1 なら毎フレーム。v1.20 と同じ）
+local span = math.max(1, math.floor(interval + 0.5))
+local unit = math.floor(obj.frame / span)
+
+-- 時間方向の発生率: 単位ごとに 1 回引き、外れたらこの単位は何もしない。
+-- 配置の乱数（frame = unit）と重ならないよう frame を 2^20 ずらして引く。
+-- アニメーション OFF でも単位ごとに引く（固定の崩れ方をときどき出せる）
+if time_rate < 100 then
+  local r = noise.seed_random(tonumber(seed) or 0, unit + 1048576)
+  if r >= time_rate / 100 then return end
+end
+
+local offset = noise.noise_offset(seed, unit, animated)
+local cell_h = block_h > 0 and block_h or block_size
+
+-- v1.31: 領域を広げる量を決める（オブジェクトの外枠でずれた画素が切れないように）
+--   正本。@ハレーション / @アナモルフィックフレア / @リキッドディストーション / @シマー /
+--   @バレル歪みPremium の plan_pad は同じ複製（変更時は 6 つとも直す）。考え方は @光学系ボケ v1.02 と同じ
+--   - フィルタオブジェクトは大きさを変えられないので広げない（ルール au2-filter-object）
+--   - 上下・左右をそれぞれ同じだけ広げるので、元の画像は同じ位置に残る（中心はずれない）
+--   - 広げた画像は image_max に収める。cost は cache と tempbuffer に確保する合計ドット数を返す関数で、
+--     CACHE_BUDGET を超えない所まで縮める（1600 万ドットの枠を超えると古いものが黙って捨てられる）
+local CACHE_BUDGET = 15000000
+local PAD_MARGIN = 2
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+local function plan_pad(want_x, want_y, w, h, cost)
+  if is_filter then return 0, 0 end
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  if not cost then return px, py end
+  for k = 64, 0, -1 do
+    local sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if cost(sx, sy) <= CACHE_BUDGET then return sx, sy end
+  end
+  return 0, 0
+end
+
+if noise.as_bool(overflow, false) then
+  -- はみ出し: オブジェクト画像の外は透明として読む（"clip"）。
+  -- ずれ量はシェーダーの glitch_amt の最大（|amount| <= 1）× 色収差で最も遠くへ取る R の倍率。
+  -- 横はずらした先（右）から取るので左へ、縦・両方の縦は上下へ出る。向きの軸だけ両側を広げる
+  local W, H = obj.w, obj.h
+  local reach = math.ceil(intensity / 100 * W * 0.12 * (1 + chromatic / 100 * 0.02)) + PAD_MARGIN
+  local want_x = (direction == 1) and 0 or reach
+  local want_y = (direction == 0) and 0 or reach
+  local pad_x, pad_y = plan_pad(want_x, want_y, W, H, nil)
+  if pad_x > 0 or pad_y > 0 then
+    obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+  end
+  obj.pixelshader("ps_glitch", "object", {"object", "random"}, {
+    intensity / 100, block_size, chromatic / 100, offset, W, H,
+    cell_h, rate / 100, direction, 1, pad_x, pad_y,
+  }, "copy", "clip")
+else
+  obj.pixelshader("ps_glitch", "object", {"object", "random"}, {
+    intensity / 100, block_size, chromatic / 100, offset, obj.w, obj.h,
+    cell_h, rate / 100, direction, 0, 0, 0,
+  })
+end
+
+@グレイン
+--information:グレイン@Filters_H v1.21 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,10,0.1
+--track@grain_size:粒サイズ,0.1,10.0,1.0,0.1
+--track@softness:柔らかさ,0,100,0,0.1
+--check@color_mode:カラーモード,false
+--check@luminance_response:明暗対応,false
+--track@luminance_balance:明暗バランス,-100,100,-30,1
+--value@seed:シード値,0
+--check@animated:アニメーション,true
+--select@blend_mode:合成モード=0,加算=0,オーバーレイ=1,ソフトライト=2,乗算=3
+--track@loop:重ねがけ,1,100,1,1
+--[[pixelshader@grain:
+Texture2D src : register(t0);
+Texture2D noise_tex : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float grain_size;
+    float softness;
+    float color_mode;
+    float luminance_response;
+    float luminance_balance;
+    float blend_mode;
+    float noise_offset;
+};
+float4 grain(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 col = src.Load(int3(pos.xy, 0));
+    // x と y に同じ値を足すと、重ねがけの回ごとにノイズが対角へ平行移動し、
+    // 加算した結果に対角方向の相関（斜め縞）が出る。offset を x/y 独立に散らす。
+    float2 noff = frac(float2(noise_offset * 12.9898, noise_offset * 78.2331)) * 256.0;
+    float2 nuv = pos.xy * grain_size + noff;
+    float grain_int = intensity;
+    float s = softness * 10.0;
+    float2 nuv_r = nuv;
+    float2 nuv_g = nuv + float2(85.37, 127.91);
+    float2 nuv_b = nuv + float2(213.45, 67.23);
+    float noise_r = noise_tex.Load(int3(int2(uint(nuv_r.x) % 256, uint(nuv_r.y) % 256), 0)).r;
+    float noise_g = noise_tex.Load(int3(int2(uint(nuv_g.x) % 256, uint(nuv_g.y) % 256), 0)).r;
+    float noise_b = noise_tex.Load(int3(int2(uint(nuv_b.x) % 256, uint(nuv_b.y) % 256), 0)).r;
+    if (softness >= 0.01) {
+        noise_r = (
+            noise_tex.Load(int3(int2(uint((nuv_r + float2(-s, -s)).x) % 256, uint((nuv_r + float2(-s, -s)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv_r + float2( s, -s)).x) % 256, uint((nuv_r + float2( s, -s)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv_r + float2(-s,  s)).x) % 256, uint((nuv_r + float2(-s,  s)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv_r + float2( s,  s)).x) % 256, uint((nuv_r + float2( s,  s)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv_r + float2(-s,  0)).x) % 256, uint((nuv_r + float2(-s,  0)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv_r + float2( s,  0)).x) % 256, uint((nuv_r + float2( s,  0)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv_r + float2( 0, -s)).x) % 256, uint((nuv_r + float2( 0, -s)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv_r + float2( 0,  s)).x) % 256, uint((nuv_r + float2( 0,  s)).y) % 256), 0)).r +
+            noise_r
+        ) / 9.0;
+    }
+    if (color_mode < 0.5) {
+        float n = (noise_r - 0.5) * 2.0;
+        noise_r = noise_g = noise_b = n;
+    } else {
+        noise_r = (noise_r - 0.5) * 2.0;
+        noise_g = (noise_g - 0.5) * 2.0;
+        noise_b = (noise_b - 0.5) * 2.0;
+    }
+    float factor = 1.0;
+    if (luminance_response > 0.5 && col.a > 0.001) {
+        float3 rgb = col.rgb / col.a;
+        float lum = dot(rgb, float3(0.299, 0.587, 0.114));
+        float bal = luminance_balance;
+        factor = saturate(bal < 0 ? 1.0 + bal * lum : 1.0 + bal * (1.0 - lum));
+    }
+    float3 grain_val = float3(noise_r, noise_g, noise_b) * grain_int * factor;
+    float4 result = col;
+    if (blend_mode < 0.5) {
+        result = float4(saturate(col.rgb + grain_val * col.a), col.a);
+    } else if (blend_mode < 1.5) {
+        if (col.a > 0.001) {
+            float3 rgb = col.rgb / col.a;
+            float3 overlay = (grain_val + 1.0) * 0.5;
+            float3 out_rgb = rgb;
+            out_rgb.r = rgb.r < 0.5 ? 2.0 * rgb.r * overlay.r : 1.0 - 2.0 * (1.0 - rgb.r) * (1.0 - overlay.r);
+            out_rgb.g = rgb.g < 0.5 ? 2.0 * rgb.g * overlay.g : 1.0 - 2.0 * (1.0 - rgb.g) * (1.0 - overlay.g);
+            out_rgb.b = rgb.b < 0.5 ? 2.0 * rgb.b * overlay.b : 1.0 - 2.0 * (1.0 - rgb.b) * (1.0 - overlay.b);
+            result = float4(saturate(out_rgb * col.a), col.a);
+        } else result = col;
+    } else if (blend_mode < 2.5) {
+        if (col.a > 0.001) {
+            float3 rgb = col.rgb / col.a;
+            float3 soft = (grain_val + 1.0) * 0.5;
+            float3 out_rgb = rgb;
+            out_rgb.r = soft.r < 0.5 ? rgb.r - (1.0 - 2.0 * soft.r) * rgb.r * (1.0 - rgb.r) : rgb.r + (2.0 * soft.r - 1.0) * ((rgb.r < 0.25 ? ((16.0 * rgb.r - 12.0) * rgb.r + 4.0) * rgb.r : sqrt(rgb.r)) - rgb.r);
+            out_rgb.g = soft.g < 0.5 ? rgb.g - (1.0 - 2.0 * soft.g) * rgb.g * (1.0 - rgb.g) : rgb.g + (2.0 * soft.g - 1.0) * ((rgb.g < 0.25 ? ((16.0 * rgb.g - 12.0) * rgb.g + 4.0) * rgb.g : sqrt(rgb.g)) - rgb.g);
+            out_rgb.b = soft.b < 0.5 ? rgb.b - (1.0 - 2.0 * soft.b) * rgb.b * (1.0 - rgb.b) : rgb.b + (2.0 * soft.b - 1.0) * ((rgb.b < 0.25 ? ((16.0 * rgb.b - 12.0) * rgb.b + 4.0) * rgb.b : sqrt(rgb.b)) - rgb.b);
+            result = float4(saturate(out_rgb * col.a), col.a);
+        } else result = col;
+    } else {
+        if (col.a > 0.001) {
+            float3 rgb = col.rgb / col.a;
+            float3 mult = (grain_val + 1.0) * 0.5;
+            result = float4(saturate(rgb * lerp(float3(1,1,1), mult, grain_int) * col.a), col.a);
+        } else result = col;
+    }
+    return result;
+}
+]]
+
+local obj, math = obj, math
+local noise_util = require("EffectUtils_Noise")
+
+seed = tonumber(seed) or 0
+intensity = math.max(0, math.min(100, intensity))
+grain_size = math.max(0.1, math.min(10.0, grain_size))
+softness = math.max(0, math.min(100, softness))
+luminance_balance = math.max(-100, math.min(100, luminance_balance))
+loop = math.max(1, math.min(100, math.floor(loop + 0.5)))
+
+if intensity <= 0 then return end
+
+local is_color = noise_util.as_bool(color_mode, false)
+local is_lum = noise_util.as_bool(luminance_response, false)
+local is_anim = noise_util.as_bool(animated, true)
+local offset = noise_util.noise_offset(seed, obj.frame, is_anim)
+
+obj.setoption("drawtarget", "tempbuffer", obj.w, obj.h)
+obj.copybuffer("tempbuffer", "object")
+
+for i = 1, loop do
+  -- offset を固定すると毎回同じ粒を重ねるだけでコントラストが上がる。
+  -- シェーダー内で 256 倍されるので、回ごとに 0.137 (=約35マス) ずらして別の粒にする。
+  obj.pixelshader("grain", "tempbuffer", {"tempbuffer", "random"}, {
+    intensity / 100, grain_size, softness / 100,
+    is_color and 1 or 0, is_lum and 1 or 0, luminance_balance / 100,
+    blend_mode, offset + (i - 1) * 0.137,
+  })
+end
+
+obj.copybuffer("object", "tempbuffer")
+
+@ハレーション
+--information:ハレーション@Filters_H v1.31 by HexBrowns
+--label:HexScript
+--filter
+--track@threshold:しきい値,0,100,70,0.1
+--track@intensity:強度,0,200,100,0.1
+--track@spread:拡散,1,200,30,0.1
+--track@hue_shift:色相シフト,-180,180,15,0.1
+--track@saturation:彩度,0,200,120,0.1
+--color@tint:色合い,0xFF8866
+--select@blend_mode:合成=0,加算=0,オーバーレイ=1,スクリーン=2
+--select@blur_engine:ぼかし方式=0,標準=0,高品質(Basic_S)=1
+-- v1.31: ハロー（光）を形の外へもにじませる。v1.30 までは合成で元の α をそのまま使い、透明な画素では
+-- 元の画素を返していたので、光が形の内側にしか出ず、さらにオブジェクトの外枠で切れていた。
+-- 通常のオブジェクトでは、ハローの広がりのぶん領域を広げ、ハローの α を出力に反映する（合成=加算 / スクリーン）。
+-- フィルタオブジェクトと 合成=オーバーレイ は v1.30 と同じ（オーバーレイは下地を変調する合成で、下地の無い所には出さない）。
+-- 検証器: AI/scripts/Filters_H/verify_outer_spread.py / issue: AI/scripts/issues/20260927_blur_clipped_at_object_bounds.md
+--[[pixelshader@ps_halation_pure:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float threshold;
+    float intensity;
+    float hue_shift;
+    float saturation;
+    float tint_r;
+    float tint_g;
+    float tint_b;
+};
+float luminance(float3 rgb) { return dot(rgb, float3(0.2126, 0.7152, 0.0722)); }
+float3 rgb2hsv(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = c.g < c.b ? float4(c.bg, K.wz) : float4(c.gb, K.xy);
+    float4 q = c.r < p.x ? float4(p.xyw, c.r) : float4(c.r, p.yzx);
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * max(d, 1e-10))), d / max(q.x, 1e-10), q.x);
+}
+float3 hsv2rgb(float3 c) {
+    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+}
+float4 ps_halation_pure(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    if (c.a <= 0.001) return float4(0,0,0,0);
+    float3 rgb = c.rgb / c.a;
+    float lum = luminance(rgb);
+    if (lum < threshold) return float4(0,0,0,0);
+    float3 halo = (rgb - threshold) / max(1.0 - threshold, 0.001);
+    float3 hsv = rgb2hsv(halo);
+    hsv.x = frac(hsv.x + hue_shift);
+    hsv.y = saturate(hsv.y * saturation);
+    halo = hsv2rgb(hsv) * float3(tint_r, tint_g, tint_b);
+    return float4(halo * intensity * c.a, c.a);
+}
+]]
+--[[pixelshader@ps_halation_blend:
+Texture2D src : register(t0);
+Texture2D halo_tex : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float blend_mode;
+    float spill;
+};
+float4 ps_halation_blend(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 base = src.Sample(smp, uv);
+    float4 halo = halo_tex.Sample(smp, uv);
+    float3 halorgb = halo.rgb;
+    if (halo.a > 0.001) halorgb = halo.rgb / halo.a;
+    // 形の内側（v1.30 と同じ式）。透明な画素は元の画素のまま
+    float4 inner = base;
+    if (base.a > 0.001) {
+        float3 bgrgb = base.rgb / base.a;
+        float3 out_rgb = bgrgb;
+        if (blend_mode < 0.5) {
+            out_rgb = saturate(bgrgb + halorgb);
+        } else if (blend_mode < 1.5) {
+            float3 overlay = halorgb * 0.5 + 0.5;
+            out_rgb.r = bgrgb.r < 0.5 ? 2.0 * bgrgb.r * overlay.r : 1.0 - 2.0 * (1.0 - bgrgb.r) * (1.0 - overlay.r);
+            out_rgb.g = bgrgb.g < 0.5 ? 2.0 * bgrgb.g * overlay.g : 1.0 - 2.0 * (1.0 - bgrgb.g) * (1.0 - overlay.g);
+            out_rgb.b = bgrgb.b < 0.5 ? 2.0 * bgrgb.b * overlay.b : 1.0 - 2.0 * (1.0 - bgrgb.b) * (1.0 - overlay.b);
+        } else {
+            float3 screened = saturate(1.0 - (1.0 - bgrgb) * (1.0 - halorgb));
+            out_rgb = screened;
+        }
+        inner = float4(saturate(out_rgb * base.a), base.a);
+    }
+    if (spill < 0.5) return inner;
+    // v1.31: 形の外（α の足りない分）へハローを光として出す。色はハローの色、α はハローの α。
+    // 加算もスクリーンも、下地が無ければ光の色そのものになる。乗算済みで rgb <= a を保つ
+    float glow_a = saturate(halo.a);
+    float3 glow = saturate(halorgb) * glow_a;
+    float rest = 1.0 - inner.a;
+    return float4(inner.rgb + glow * rest, inner.a + glow_a * rest);
+}
+]]
+
+local obj, math = obj, math
+local color = require("EffectUtils_ColorGrade")
+
+if intensity <= 0 then return end
+
+-- Basic_S(小数ぼかし)の利用可否を最初に1回だけ判定する（未導入/エラー時は標準の「ぼかし」に自動フォールバック）
+-- ※「サイズ固定」を明示的にONにしないとぼかし範囲分バッファが拡張され、
+--   このフィルタ内で使っているcache退避＋再合成のサイズ前提が崩れてしまうため必須。
+local use_hq_blur = false
+if blur_engine == 1 then
+  use_hq_blur = pcall(obj.effect, "小数ぼかし@Basic_S", "範囲", 0, "分布", 2, "サイズ固定", 1)
+end
+local function apply_blur(range)
+  if use_hq_blur then
+    obj.effect("小数ぼかし@Basic_S", "範囲", range, "分布", 2, "サイズ固定", 1)
+  else
+    obj.effect("ぼかし", "範囲", range)
+  end
+end
+
+local th = threshold / 100
+local tr, tg, tb = color.color_from_hex(tint)
+
+-- v1.31: ハローが形の外へにじむぶん、領域を広げる（オブジェクトの外枠で光が切れないように）
+-- 正本: @グリッチ の plan_pad（同じ複製。変更時は 6 つとも直す）
+local CACHE_BUDGET = 15000000
+local PAD_MARGIN = 2
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+local function plan_pad(want_x, want_y, w, h, cost)
+  if is_filter then return 0, 0 end
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  if not cost then return px, py end
+  for k = 64, 0, -1 do
+    local sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if cost(sx, sy) <= CACHE_BUDGET then return sx, sy end
+  end
+  return 0, 0
+end
+
+-- 形の外へ光を出すのは 加算 / スクリーン の通常のオブジェクトだけ（オーバーレイは下地が要る合成なので出さない）
+local spill = (not is_filter and blend_mode ~= 1) and 1 or 0
+local sp0 = math.max(spread, 1)
+if spill == 1 then
+  -- ハローの届く距離は、コアの小ぼかしと大ぼかしの範囲の和（標準 0.12 + 0.4 × 3、高品質 0.12 + 1.2。どちらも 1.32 倍）
+  local reach = math.ceil(sp0 * 1.32) + PAD_MARGIN
+  local W0, H0 = obj.w, obj.h
+  -- 確保する cache 5 枚と tempbuffer 1 枚。標準の「ぼかし」は core / blur_a / blur_b を範囲のぶん膨らませる
+  local g1, g2, g3 = 0, 0, 0
+  if not use_hq_blur then
+    g1 = math.floor(sp0 * 0.12 + 0.5)
+    g2 = g1 + 2 * math.floor(sp0 * 0.25 + 0.5)
+    g3 = g1 + 3 * math.floor(sp0 * 0.4 + 0.5)
+  end
+  local function cost(px, py)
+    local bw, bh = W0 + 2 * px, H0 + 2 * py
+    return 3 * bw * bh + (bw + 2 * g1) * (bh + 2 * g1)
+      + (bw + 2 * g2) * (bh + 2 * g2) + (bw + 2 * g3) * (bh + 2 * g3)
+  end
+  local pad_x, pad_y = plan_pad(reach, reach, W0, H0, cost)
+  if pad_x > 0 or pad_y > 0 then
+    obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+  end
+end
+
+-- 標準の「ぼかし」には「サイズ固定」が無く、呼ぶたびにバッファが拡張される。
+-- 以降 obj.w/obj.h は拡張後の値になるので、元サイズを退避して tempbuffer の基準に使う。
+local ow, oh = obj.w, obj.h
+
+obj.copybuffer("cache:halation/src", "object")
+obj.setoption("drawtarget", "tempbuffer", ow, oh)
+obj.pixelshader("ps_halation_pure", "tempbuffer", "object", {
+  th, intensity / 100, hue_shift / 360, saturation / 100, tr, tg, tb,
+})
+obj.copybuffer("cache:halation/core", "tempbuffer")
+
+local sp = math.max(spread, 1)
+
+-- しきい値の境界はそのままだと1px単位の硬い段差になり、外側をどれだけぼかしても
+-- 「貼り付けたような浮いた境目」に見えてしまう。ごく小さいぼかしで段差自体を無くす。
+obj.copybuffer("object", "cache:halation/core")
+apply_blur(sp * 0.12)
+obj.copybuffer("cache:halation/core", "object")
+
+-- 締まったコア発光：高品質時は1回、標準時は角を目立たなくするため2回に分けてぼかす
+obj.copybuffer("object", "cache:halation/core")
+if use_hq_blur then
+  apply_blur(sp * 0.5)
+else
+  apply_blur(sp * 0.25)
+  apply_blur(sp * 0.25)
+end
+obj.copybuffer("cache:halation/blur_a", "object")
+
+-- 広がる柔らかい発光：高品質時は1回、標準時は3回に分けて大きくぼかし多角形状の角を平均化する
+obj.copybuffer("object", "cache:halation/core")
+if use_hq_blur then
+  apply_blur(sp * 1.2)
+else
+  apply_blur(sp * 0.4)
+  apply_blur(sp * 0.4)
+  apply_blur(sp * 0.4)
+end
+obj.copybuffer("cache:halation/blur_b", "object")
+
+-- コア + 小ぼかし + 大ぼかし を加算合成してハローを作る
+-- ここを obj.w にすると、ぼかしで膨らんだサイズで halo が作られ、
+-- 最後の合成で uv がずれてハローが内側に縮み、画面端に枠が出る。
+obj.setoption("drawtarget", "tempbuffer", ow, oh)
+obj.clearbuffer("tempbuffer")
+obj.setoption("blend", "add")
+
+obj.copybuffer("object", "cache:halation/blur_b")
+obj.draw(0, 0, 0, 1, 0.7)
+
+obj.copybuffer("object", "cache:halation/blur_a")
+obj.draw(0, 0, 0, 1, 0.85)
+
+obj.copybuffer("object", "cache:halation/core")
+obj.draw()
+
+obj.setoption("blend", "none")
+obj.copybuffer("cache:halation/halo", "tempbuffer")
+
+obj.copybuffer("object", "cache:halation/src")
+obj.pixelshader("ps_halation_blend", "object", {"object", "cache:halation/halo"}, {
+  blend_mode, spill,
+})
+
+@ライトリーク
+--information:ライトリーク@Filters_H v2.01 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,200,80,0.1
+--track@angle:角度,-180,180,35,0.1
+--track@width:帯幅,0,100,45,0.1
+--track@softness:柔らかさ,0,100,80,0.1
+--track@hue_spread:虹色幅,0,100,55,0.1
+--track@core_glow:コアの眩しさ,0,100,65,0.1
+--color@tint:色合い,0xFF8866
+--select@blend_mode:合成=0,加算=0,オーバーレイ=1,スクリーン=2
+--value@seed:シード,0
+-- v2.01: 帯のゆらぎの乱数を frac で折り返して読んでいるのに sampler を省いていた。省くと範囲外は透明として補間され
+-- （実機 2026-09-27、ShapeDistort_H の SDX 2 周目）、折り返しの継ぎ目で乱数が 0 側へ落ちて帯の縁に筋が出うる。
+-- "loop" を渡す（元の画像は画素の中心で読むので絵は変わらない）。
+-- 検証器: AI/scripts/Filters_H/verify_edge_sampler.py / issue: AI/scripts/issues/20260927_self_made_edge_read_without_sampler.md
+--[[pixelshader@ps_lightleak:
+Texture2D src : register(t0);
+Texture2D noise_tex : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float2 dir;
+    float width;
+    float softness;
+    float tint_r;
+    float tint_g;
+    float tint_b;
+    float noise_offset;
+    float blend_mode;
+    float hue_spread;
+    float core_glow;
+};
+float3 rgb2hsv_ll(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = c.g < c.b ? float4(c.bg, K.wz) : float4(c.gb, K.xy);
+    float4 q = c.r < p.x ? float4(p.xyw, c.r) : float4(c.r, p.yzx);
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * max(d, 1e-10))), d / max(q.x, 1e-10), q.x);
+}
+float3 hsv2rgb_ll(float3 c) {
+    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+}
+float get_noise_ll(float2 uv) {
+    return noise_tex.Sample(smp, frac(uv)).r;
+}
+float4 ps_lightleak(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 base = src.Sample(smp, uv);
+    if (base.a <= 0.001) return base;
+    float2 p = uv - 0.5;
+    float band = dot(p, dir);
+    float half_w = max(width, 0.001);
+    float n = get_noise_ll(float2(band * 1.5 + noise_offset * 6.0, 0.5)) * 2.0 - 1.0;
+    float jitter = n * half_w * 0.08 * softness;
+    float edge_in = half_w * (1.0 - softness);
+    float leak = 1.0 - smoothstep(edge_in, half_w, abs(band + jitter));
+    float t = saturate(1.0 - abs(band) / half_w);
+    float3 tint_hsv = rgb2hsv_ll(float3(tint_r, tint_g, tint_b));
+    float hue = frac(tint_hsv.x + (band / half_w) * hue_spread * 0.35);
+    float sat = saturate(tint_hsv.y * (1.0 - core_glow * t * 0.8));
+    float3 grad_col = hsv2rgb_ll(float3(hue, sat, 1.0));
+    grad_col = lerp(grad_col, float3(1.0, 1.0, 1.0), core_glow * t * t);
+    float3 leak_rgb = grad_col * leak * intensity;
+    float3 bgrgb = base.rgb / base.a;
+    float3 out_rgb = bgrgb;
+    if (blend_mode < 0.5) {
+        out_rgb = saturate(bgrgb + leak_rgb);
+    } else if (blend_mode < 1.5) {
+        float3 overlay = saturate(leak_rgb) * 0.5 + 0.5;
+        out_rgb.r = bgrgb.r < 0.5 ? 2.0 * bgrgb.r * overlay.r : 1.0 - 2.0 * (1.0 - bgrgb.r) * (1.0 - overlay.r);
+        out_rgb.g = bgrgb.g < 0.5 ? 2.0 * bgrgb.g * overlay.g : 1.0 - 2.0 * (1.0 - bgrgb.g) * (1.0 - overlay.g);
+        out_rgb.b = bgrgb.b < 0.5 ? 2.0 * bgrgb.b * overlay.b : 1.0 - 2.0 * (1.0 - bgrgb.b) * (1.0 - overlay.b);
+    } else {
+        float3 screened = saturate(1.0 - (1.0 - bgrgb) * (1.0 - leak_rgb));
+        out_rgb = screened;
+    }
+    return float4(saturate(out_rgb * base.a), base.a);
+}
+]]
+
+local obj, math = obj, math
+local noise = require("EffectUtils_Noise")
+local color = require("EffectUtils_ColorGrade")
+
+if intensity <= 0 then return end
+
+local rad = math.rad(angle)
+local dx, dy = math.cos(rad), math.sin(rad)
+local tr, tg, tb = color.color_from_hex(tint)
+tr = math.min(1.0, math.max(0.0, tr))
+tg = math.min(1.0, math.max(0.0, tg))
+tb = math.min(1.0, math.max(0.0, tb))
+local offset = noise.noise_offset(seed, obj.frame, true)
+
+-- v2.01: 乱数は frac で折り返して読むので "loop"（省くと継ぎ目が透明と混ざる）
+obj.pixelshader("ps_lightleak", "object", {"object", "random"}, {
+  intensity / 100, dx, dy, width / 100, softness / 100,
+  tr, tg, tb, offset, blend_mode, hue_spread / 100, core_glow / 100,
+}, "copy", "loop")
+
+@ビネット
+--information:ビネット@Filters_H v1.10 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,50,0.1
+--track@falloff:減衰,0,100,60,0.1
+--track@roundness:丸み,0,100,50,0.1
+--track@center_x:中心X,-100,100,0,0.1
+--track@center_y:中心Y,-100,100,0,0.1
+--select@blend_mode:合成=0,乗算=0,オーバーレイ=1
+--color@tint:色合い,0x000000
+--[[pixelshader@ps_vignette:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float falloff;
+    float roundness;
+    float blend_mode;
+    float2 center;
+    float2 img_size;
+    float3 tint;
+};
+float4 ps_vignette(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    if (c.a <= 0.001) return c;
+    float2 p = (pos.xy - center) / max(img_size, float2(1,1));
+    float aspect = img_size.x / max(img_size.y, 1.0);
+    p.x *= lerp(1.0, aspect, roundness);
+    float dist = length(p);
+    // falloff=0 だと smoothstep(a, a, x) に縮退するので下限を設ける
+    float v = 1.0 - smoothstep(0.2, 0.2 + max(falloff, 0.001), dist);
+    // intensity はここで一度だけ適用する。合成側で再度掛けない
+    v = lerp(1.0, v, intensity);
+    float3 rgb = c.rgb / c.a;
+    float3 shaded = lerp(rgb, rgb * tint, 1.0 - v);
+    if (blend_mode > 0.5) {
+        // オーバーレイ: 中心は無変化(0.5)、周辺ほど色合いを重ねる
+        float3 vig_col = lerp(float3(0.5, 0.5, 0.5), tint, 1.0 - v);
+        shaded.r = rgb.r < 0.5 ? 2.0 * rgb.r * vig_col.r : 1.0 - 2.0 * (1.0 - rgb.r) * (1.0 - vig_col.r);
+        shaded.g = rgb.g < 0.5 ? 2.0 * rgb.g * vig_col.g : 1.0 - 2.0 * (1.0 - rgb.g) * (1.0 - vig_col.g);
+        shaded.b = rgb.b < 0.5 ? 2.0 * rgb.b * vig_col.b : 1.0 - 2.0 * (1.0 - rgb.b) * (1.0 - vig_col.b);
+    }
+    return float4(saturate(shaded * c.a), c.a);
+}
+]]
+
+local obj, math = obj, math
+local color = require("EffectUtils_ColorGrade")
+
+if intensity <= 0 then return end
+
+local tr, tg, tb = color.color_from_hex(tint)
+local cx = obj.w * 0.5 + center_x
+local cy = obj.h * 0.5 + center_y
+
+obj.pixelshader("ps_vignette", "object", "object", {
+  intensity / 100, falloff / 100, roundness / 100, blend_mode,
+  cx, cy, obj.w, obj.h, tr, tg, tb,
+})
+
+@アナモルフィックフレア
+--information:アナモルフィックフレア@Filters_H v1.02 by HexBrowns
+--label:HexScript
+--filter
+--group:基本
+--track@threshold:しきい値,0,255,100,1
+--track@intensity:強度,0,200,100,0.1
+--group:フレア
+--track@direction:方向,0,360,0,1
+--track@width:拡散幅,1,100,30,0.1
+--track@spread:拡散距離,0.1,10,2,0.1
+--group:品質
+--track@sample_count:サンプル数,4,32,16,1
+--track@pass_count:パス数,1,3,2,1
+--check@quality_mode:高品質モード,false
+--group:色
+--color@tint:色合い,0xFF8866
+--track@hue_shift:色相シフト,-180,180,0,1
+--track@saturation:彩度,0,200,120,0.1
+--group:合成
+--select@blend_mode:合成モード=0,加算=0,スクリーン=1
+--check@animated:アニメーション,true
+--value@flare_seed:シード,0
+--group:
+-- v1.01: 光の筋を形の外へも伸ばす。v1.00 は合成の α に元の α をそのまま使い、筋が形の内側にしか出ず、
+-- さらにオブジェクトの外枠で切れていた。通常のオブジェクトでは、筋の長さ（拡散幅/100 × 拡散距離 px）のぶん
+-- 筋の向きに領域を広げ、筋の重なり具合（筋の上で明るい画素が占める重みの割合）を α として出力に反映する。
+-- フィルタオブジェクトは v1.00 と同じ。
+-- 検証器: AI/scripts/Filters_H/verify_outer_spread.py / issue: AI/scripts/issues/20260927_blur_clipped_at_object_bounds.md
+-- v1.02: 2 つの不具合を直した（通常のオブジェクトでもフィルタオブジェクトでも絵が変わる）。
+--   1. 標準（1 パス）で、筋の無い画素を透明にしていた（明るい所の近く以外の画像が消え、フィルタオブジェクトでは
+--      画面が透明になった）。筋の無い画素は元の画素をそのまま返す
+--   2. 高品質の複数パスが、最後のパスの筋しか残っていなかった。lua.txt の obj.pixelshader の blend は既定 "copy"
+--      （obj.setoption("blend") は obj.draw の合成）なので、各パスの pixelshader に "add" を渡して足し込む
+--[[pixelshader@ps_anamorphic:
+Texture2D src : register(t0);
+Texture2D flare_tex : register(t1);
+Texture2D noise_tex : register(t2);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float threshold;
+    float intensity;
+    float hue_shift;
+    float saturation;
+    float tint_r;
+    float tint_g;
+    float tint_b;
+    float sample_count;
+    float dir_mx;
+    float dir_my;
+    float dir_s1x;
+    float dir_s1y;
+    float dir_s2x;
+    float dir_s2y;
+    float width_factor;
+    float spread_factor;
+    float blend_mode;
+    float pass_mode;
+    float noise_amount;
+    float noise_offset;
+    float2 img_size;
+    float2 pad;
+    float spill;
+};
+float luminance(float3 rgb) {
+    return dot(rgb, float3(0.2126, 0.7152, 0.0722));
+}
+float3 rgb2hsv(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = c.g < c.b ? float4(c.bg, K.wz) : float4(c.gb, K.xy);
+    float4 q = c.r < p.x ? float4(p.xyw, c.r) : float4(c.r, p.yzx);
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * max(d, 1e-10))), d / max(q.x, 1e-10), q.x);
+}
+float3 hsv2rgb(float3 c) {
+    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+}
+// cov には「筋の上で明るい画素が占める重みの割合」（0〜1、重みの総和は n）を足し込む（v1.01。形の外の α に使う）
+float3 streak_along(float2 uv, float2 dir, float th, int n, float wf, float sp, inout float cov) {
+    float3 acc = float3(0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    float2 step_px = dir * wf;
+    float2 pixel_uv = uv * img_size;
+    for (int i = -32; i <= 32; ++i) {
+        if (i < -n || i > n) continue;
+        float t = (float(i) / max((float)n, 1.0)) * sp;
+        float2 spx = pixel_uv + step_px * t;
+        int2 ipx = int2(spx);
+        if (ipx.x < 0 || ipx.x >= (int)img_size.x || ipx.y < 0 || ipx.y >= (int)img_size.y) continue;
+        float4 s = src.Load(int3(ipx, 0));
+        if (s.a <= 0.001) continue;
+        float3 rgb = s.rgb / s.a;
+        float lum = luminance(rgb);
+        if (lum < th) continue;
+        float w = 1.0 - abs((float)i) / max((float)n, 1.0);
+        float excess = (lum - th) / max(1.0 - th, 0.001);
+        acc += rgb * excess * w;
+        wsum += w;
+    }
+    if (wsum > 0.001) {
+        acc /= wsum;
+    } else {
+        acc = float3(0.0, 0.0, 0.0);
+    }
+    cov += wsum / max((float)n, 1.0);
+    return acc;
+}
+float3 apply_tint(float3 streak) {
+    float3 hsv = rgb2hsv(streak);
+    hsv.x = frac(hsv.x + hue_shift);
+    hsv.y = saturate(hsv.y * saturation);
+    streak = hsv2rgb(hsv);
+    streak.r *= tint_r;
+    streak.g *= tint_g;
+    streak.b *= tint_b;
+    return streak;
+}
+float4 ps_anamorphic(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    if (pass_mode > 3.5) {
+        float4 base = src.Sample(smp, uv);
+        float4 flare = flare_tex.Sample(smp, uv);
+        if (base.a <= 0.001 && spill < 0.5) return base;
+        float3 fgrgb = flare.rgb;
+        if (flare.a > 0.001) fgrgb = flare.rgb / flare.a;
+        float4 inner = base;
+        if (base.a > 0.001) {
+            float3 bgrgb = base.rgb / base.a;
+            float3 out_rgb = bgrgb;
+            if (blend_mode < 0.5) {
+                out_rgb = saturate(bgrgb + fgrgb * intensity);
+            } else {
+                float3 fscaled = saturate(fgrgb * intensity);
+                out_rgb = saturate(1.0 - (1.0 - bgrgb) * (1.0 - fscaled));
+            }
+            inner = float4(saturate(out_rgb * base.a), base.a);
+        }
+        if (spill < 0.5) return inner;
+        // v1.01: 形の外（α の足りない分）へ筋を光として出す。α はフレアのバッファの α
+        //（形の外では 筋の重なり × 明るさ を各パスで足したもの）。乗算済みで rgb <= a を保つ
+        float glow_a = saturate(flare.a);
+        float3 glow = saturate(fgrgb * intensity) * glow_a;
+        float rest = 1.0 - inner.a;
+        return float4(inner.rgb + glow * rest, inner.a + glow_a * rest);
+    }
+    float wf = width_factor;
+    if (noise_amount > 0.001) {
+        // 乱数の位置は元の画像の左上を原点に数える（v1.01。広げても元の画像の上の筋は同じ。pad 0 なら v1.00 と同じ）
+        float2 wrap = ceil(pad / 256.0) * 256.0;
+        int2 npos = int2(uint(pos.x - pad.x + wrap.x) % 256, uint(pos.y - pad.y + wrap.y) % 256);
+        float n = noise_tex.Load(int3(npos, 0)).r;
+        wf *= 1.0 + (n - 0.5) * noise_amount;
+    }
+    int n = (int)max(sample_count, 1.0);
+    float3 streak = float3(0.0, 0.0, 0.0);
+    float cov = 0.0;
+    if (pass_mode < 0.5) {
+        streak += streak_along(uv, float2(dir_mx, dir_my), threshold, n, wf, spread_factor, cov);
+        streak += streak_along(uv, float2(dir_s1x, dir_s1y), threshold, n, wf, spread_factor, cov);
+        streak += streak_along(uv, float2(dir_s2x, dir_s2y), threshold, n, wf, spread_factor, cov);
+    } else if (pass_mode < 1.5) {
+        streak = streak_along(uv, float2(dir_mx, dir_my), threshold, n, wf, spread_factor, cov);
+    } else if (pass_mode < 2.5) {
+        streak = streak_along(uv, float2(dir_s1x, dir_s1y), threshold, n, wf, spread_factor, cov);
+    } else {
+        streak = streak_along(uv, float2(dir_s2x, dir_s2y), threshold, n, wf, spread_factor, cov);
+    }
+    float lum_s = luminance(streak);
+    // v1.02: 筋が無い画素は、1 パス（合成まで行う）なら元の画素のまま、フレアだけを描くパス（1〜3）なら透明。
+    // v1.01 までは 1 パスでも透明を返していて、筋の届かない画素がすべて消えていた
+    if (lum_s < 0.0001) return (pass_mode < 0.5) ? src.Sample(smp, uv) : float4(0.0, 0.0, 0.0, 0.0);
+    streak = apply_tint(streak);
+    float4 base = src.Sample(smp, uv);
+    float a = base.a;
+    // 1 パスは常に元の画素との合成を返す（v1.02。透明な画素は元の透明のまま。v1.01 までは α 0.001 のフレアを返していた）
+    if (pass_mode < 0.5) {
+        float3 fgrgb = streak * intensity;
+        float4 inner = base;
+        if (a > 0.001) {
+            float3 bgrgb = base.rgb / a;
+            float3 out_rgb = bgrgb;
+            if (blend_mode < 0.5) {
+                out_rgb = saturate(bgrgb + fgrgb);
+            } else {
+                float3 fscaled = saturate(fgrgb);
+                out_rgb = saturate(1.0 - (1.0 - bgrgb) * (1.0 - fscaled));
+            }
+            inner = float4(saturate(out_rgb * a), a);
+        }
+        if (spill < 0.5) return inner;
+        // v1.01: 形の外へ筋を光として出す。α は 筋の重なり × 明るさ（加算もスクリーンも下地が無ければ光の色そのもの）
+        float glow_a = saturate(cov * saturate(lum_s));
+        float3 glow = saturate(fgrgb) * glow_a;
+        float rest = 1.0 - inner.a;
+        return float4(inner.rgb + glow * rest, inner.a + glow_a * rest);
+    }
+    float flare_a = max(a, 0.001) * saturate(lum_s);
+    // v1.01: 形の外では 筋の重なり を α の元にする（形の内側は v1.00 と同じ）
+    if (spill > 0.5) flare_a = max(a, saturate(cov)) * saturate(lum_s);
+    return float4(saturate(streak * flare_a), flare_a);
+}
+]]
+
+local obj, math = obj, math
+local color = require("EffectUtils_ColorGrade")
+local noise = require("EffectUtils_Noise")
+
+intensity = math.max(0, math.min(200, intensity or 0))
+threshold = math.max(0, math.min(255, threshold or 100))
+sample_count = math.max(4, math.min(32, math.floor((sample_count or 16) + 0.5)))
+pass_count = math.max(1, math.min(3, math.floor((pass_count or 2) + 0.5)))
+width = math.max(1, math.min(100, width or 30))
+spread = math.max(0.1, math.min(10, spread or 2))
+saturation = math.max(0, math.min(200, saturation or 120))
+
+if intensity <= 0 then return end
+
+local is_quality = noise.as_bool(quality_mode, false)
+local is_anim = noise.as_bool(animated, true)
+local tr, tg, tb = color.color_from_hex(tint)
+local th = threshold / 255
+local inten = intensity / 100
+local sat = saturation / 100
+local wf = width / 100
+local sp = spread
+local sc = sample_count
+local n_off = noise.noise_offset(flare_seed, obj.frame, is_anim)
+local rad = math.rad(direction or 0)
+local dm_x, dm_y = math.cos(rad), math.sin(rad)
+local r1 = rad + math.rad(120)
+local r2 = rad + math.rad(240)
+local d1_x, d1_y = math.cos(r1), math.sin(r1)
+local d2_x, d2_y = math.cos(r2), math.sin(r2)
+
+-- v1.01: 筋が形の外へ伸びるぶん、筋の向きに領域を広げる（オブジェクトの外枠で筋が切れないように）
+-- 正本: @グリッチ の plan_pad（同じ複製。変更時は 6 つとも直す）
+local CACHE_BUDGET = 15000000
+local PAD_MARGIN = 2
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+local function plan_pad(want_x, want_y, w, h, cost)
+  if is_filter then return 0, 0 end
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  if not cost then return px, py end
+  for k = 64, 0, -1 do
+    local sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if cost(sx, sy) <= CACHE_BUDGET then return sx, sy end
+  end
+  return 0, 0
+end
+
+local spill = is_filter and 0 or 1
+local multi = is_quality and pass_count >= 2
+local pad_x, pad_y = 0, 0
+if spill == 1 then
+  -- 筋の最も遠いサンプルは 拡散幅/100 × 拡散距離 px（乱数で幅が最大 1.04 倍になる。noise_amount 0.08 の半分）。
+  -- 使う向き（高品質の複数パスはパス数ぶん、それ以外は 3 本とも）の成分の最大だけ、その軸の両側を広げる
+  local reach = wf * sp * 1.04
+  local dirs = { { dm_x, dm_y }, { d1_x, d1_y }, { d2_x, d2_y } }
+  local used = multi and pass_count or 3
+  local mx, my = 0, 0
+  for i = 1, used do
+    mx = math.max(mx, math.abs(dirs[i][1]))
+    my = math.max(my, math.abs(dirs[i][2]))
+  end
+  local want_x = (reach * mx >= 0.5) and (math.ceil(reach * mx) + PAD_MARGIN) or 0
+  local want_y = (reach * my >= 0.5) and (math.ceil(reach * my) + PAD_MARGIN) or 0
+  -- 高品質の複数パスは cache 2 枚と tempbuffer 1 枚を広げた大きさで確保する
+  local W0, H0 = obj.w, obj.h
+  local cost = nil
+  if multi then
+    cost = function(px, py) return 3 * (W0 + 2 * px) * (H0 + 2 * py) end
+  end
+  pad_x, pad_y = plan_pad(want_x, want_y, W0, H0, cost)
+  if pad_x > 0 or pad_y > 0 then
+    obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+  end
+end
+
+local function shader_params(pmode)
+  return {
+    th, inten, (hue_shift or 0) / 360, sat,
+    tr, tg, tb, sc,
+    dm_x, dm_y, d1_x, d1_y, d2_x, d2_y,
+    wf, sp, blend_mode, pmode, 0.08, n_off,
+    obj.w, obj.h, pad_x, pad_y, spill,
+  }
+end
+
+if multi then
+  obj.copybuffer("cache:anamorphic/src", "object")
+  obj.setoption("drawtarget", "tempbuffer", obj.w, obj.h)
+  obj.clearbuffer("tempbuffer")
+  -- v1.02: パスごとの筋を tempbuffer へ足し込む。pixelshader の書き込みの合成は第 5 引数の blend で決まり、
+  -- 既定は "copy"（lua.txt の「関数」の obj.pixelshader）。v1.01 までは obj.setoption("blend", "add") だけで、
+  -- パスごとに上書きされて最後のパスしか残らなかった
+  for p = 1, pass_count do
+    obj.pixelshader("ps_anamorphic", "tempbuffer", {"cache:anamorphic/src", "cache:anamorphic/src", "random"},
+      shader_params(p), "add")
+  end
+  obj.copybuffer("cache:anamorphic/flare", "tempbuffer")
+  obj.copybuffer("object", "cache:anamorphic/src")
+  obj.pixelshader("ps_anamorphic", "object", {"object", "cache:anamorphic/flare", "random"}, shader_params(4))
+else
+  obj.pixelshader("ps_anamorphic", "object", {"object", "object", "random"}, shader_params(0))
+end
+
+@リキッドディストーション
+--information:リキッドディストーション@Filters_H v1.12 by HexBrowns
+--label:HexScript
+--filter
+--track@amount:強さ,0,100,25,0.1
+--track@scale:スケール,0.1,20,2.5,0.1
+--track@speed:速度,0,100,20,0.1
+--track@detail:詳細,1,8,4,0.1
+--select@blend_mode:合成=0,標準=0,透過クランプ=1
+--value@seed:シード,0
+-- v1.10: 歪みの模様が毎フレーム別物に入れ替わっていた（ちらつき）のを、速度どおりに流れるよう直した。
+-- ノイズの読み取り位置をシードだけで決め（v1.00 はフレームごとの乱数でずらしていた）、
+-- ノイズを補間付きの値ノイズにした（v1.00 は乱数バッファを点で読んでいて段が出た）。
+-- **既存プロジェクトの絵が変わる**（強さ・スケールの目盛りは同じ）。
+-- 検証器: AI/scripts/Filters_H/verify_filters.py / issue: AI/scripts/issues/20260916_filters_liquid_distortion_per_frame_jump.md
+-- v1.11: 外へずれた画素がオブジェクトの外枠で切れていたのを、ずれの最大（強さ/100 × 40 px）だけ領域を広げて直した。
+-- 元の画像の範囲の中は v1.10 と同じ絵で、範囲の外には「元の画像からずれてきた画素」だけが出る
+-- （合成=標準 でも外側は引き伸ばさない）。フィルタオブジェクトは v1.10 と同じ。
+-- 検証器: AI/scripts/Filters_H/verify_outer_spread.py / issue: AI/scripts/issues/20260927_blur_clipped_at_object_bounds.md
+-- v1.12: 余白が 0（フィルタオブジェクト・広げられなかったとき）は uv をちょうど 0 / 1 に寄せて読むのに sampler を省いていた。
+-- 省くと範囲外は透明として補間され、画面の端が α 0.5 の半透明になった（実機 2026-09-27 の ShapeDistort_H と同じ形）。
+-- "clamp" を渡す（余白がある通常のオブジェクトは端の画素の中心より内側しか読まないので絵は変わらない）。
+-- 検証器: AI/scripts/Filters_H/verify_edge_sampler.py / issue: AI/scripts/issues/20260927_self_made_edge_read_without_sampler.md
+--[[pixelshader@ps_liquid:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float amount;
+    float scale;
+    float time;
+    float detail;
+    float2 img_size;
+    float noise_offset;
+    float blend_mode;
+    float2 pad;
+};
+// 格子点ごとの整数ハッシュ（0〜1）と、それを smoothstep で補間した値ノイズ（v1.10）。
+// 組み込みの乱数バッファ（"random"）を点で読む v1.00 は、読み取り位置が整数を越えるたびに
+// 値が跳び、さらに位置を毎フレーム乱数でずらしていたので、模様が毎フレーム入れ替わっていた。
+// 乱数バッファの中身がフレームで変わるかは lua.txt に無いので、それにも頼らない。
+float hash_cell_lq(int2 c) {
+    uint h = ((uint)c.x * 1597334677u) ^ ((uint)c.y * 3812015801u);
+    h = h ^ (h >> 16);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16);
+    return (float)(h & 0x00ffffffu) / 16777216.0;
+}
+float value_noise_lq(float2 p) {
+    float2 i = floor(p);
+    float2 f = p - i;
+    float2 u = f * f * (3.0 - 2.0 * f);
+    int2 c = (int2)i;
+    float a = hash_cell_lq(c);
+    float b = hash_cell_lq(c + int2(1, 0));
+    float e = hash_cell_lq(c + int2(0, 1));
+    float d = hash_cell_lq(c + int2(1, 1));
+    return lerp(lerp(a, b, u.x), lerp(e, d, u.x), u.y);
+}
+float fbm(float2 p, float d) {
+    float v = 0.0, a = 0.5;
+    for (int i = 0; i < 8; ++i) {
+        if (i >= (int)d) break;
+        v += a * (value_noise_lq(p) * 2.0 - 1.0);
+        p *= 2.0;
+        a *= 0.5;
+    }
+    return v;
+}
+float4 ps_liquid(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    // v1.11: img_size は元の画像の大きさ、pad は広げた余白（px）。バッファは img_size + 2 * pad。
+    // 模様は元の画像の左上を原点に数える（広げても元の画像の上の歪み方は同じ。pad 0 なら v1.10 と同じ式）
+    float2 buf = max(img_size + 2.0 * pad, float2(1,1));
+    float2 p = (pos.xy - pad) / max(img_size, float2(1,1));
+    float2 npos = p * scale * 100.0 + float2(time, -time) + noise_offset * 10.0;
+    float nx = fbm(npos, detail), ny = fbm(npos + float2(17.3, 9.1), detail);
+    float2 offset = float2(nx, ny) * amount * 40.0 / buf;
+    float2 sample_uv = uv + offset;
+    // 元の画像の範囲（バッファの uv）。pad 0 なら 0〜1
+    float2 lo = pad / buf;
+    float2 hi = (pad + img_size) / buf;
+    bool src_in = !(sample_uv.x < lo.x || sample_uv.x > hi.x || sample_uv.y < lo.y || sample_uv.y > hi.y);
+    bool dst_in = !(uv.x < lo.x || uv.x > hi.x || uv.y < lo.y || uv.y > hi.y);
+    // 標準: 範囲の中は v1.10 と同じく端へ寄せる。範囲の外（広げた余白）は元の画像から来た画素だけを出す
+    if (blend_mode < 0.5) {
+        if (!dst_in && !src_in) return float4(0,0,0,0);
+    } else {
+        if (!src_in) return float4(0,0,0,0);
+    }
+    // 端の画素の中心より外を読まない（余白の透明と混ぜない）。pad 0 なら saturate と同じ
+    float2 e = min(pad, float2(0.5, 0.5)) / buf;
+    sample_uv = clamp(sample_uv, lo + e, hi - e);
+    return src.Sample(smp, sample_uv);
+}
+]]
+
+local obj, math = obj, math
+local noise = require("EffectUtils_Noise")
+
+if amount <= 0 then return end
+
+-- 読み取り位置のずらしはシードだけで決める（フレームで変えない）。時間の変化は time の項だけが担う
+local offset = noise.noise_offset(seed, 0, false)
+local time = obj.frame * speed * 0.01
+
+-- v1.11: 外へずれる画素が切れないよう、ずれの最大だけ上下左右を広げる
+-- 正本: @グリッチ の plan_pad（同じ複製。変更時は 6 つとも直す）
+local CACHE_BUDGET = 15000000
+local PAD_MARGIN = 2
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+local function plan_pad(want_x, want_y, w, h, cost)
+  if is_filter then return 0, 0 end
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  if not cost then return px, py end
+  for k = 64, 0, -1 do
+    local sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if cost(sx, sy) <= CACHE_BUDGET then return sx, sy end
+  end
+  return 0, 0
+end
+
+-- fbm は振幅 0.5 + 0.25 + … の和なので |nx|, |ny| < 1。ずれは各軸 強さ/100 × 40 px 未満
+local W, H = obj.w, obj.h
+local reach = math.ceil(amount / 100 * 40) + PAD_MARGIN
+local pad_x, pad_y = plan_pad(reach, reach, W, H, nil)
+if pad_x > 0 or pad_y > 0 then
+  obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+end
+
+-- v1.12: 端へ寄せた uv は端の色で読む（"clamp"。省くと範囲外の透明と半々に混ざる）
+obj.pixelshader("ps_liquid", "object", {"object"}, {
+  amount / 100, scale, time, detail, W, H, offset, blend_mode, pad_x, pad_y,
+}, "copy", "clamp")
+
+@シマー
+--information:シマー@Filters_H v1.22 by HexBrowns
+--label:HexScript
+--filter
+--track@amount:強さ,0.001,10.000,0.1,0.001
+--track@scale:スケール,0.001,10.000,1.0,0.001
+--track@speed:速度,0,100,25,0.1
+--track@angle:角度,-180,180,0,0.1
+--value@seed:シード,0
+-- v1.10: 変位の単位を画素に直した。v1.00 は ±0.05 に clamp した値をさらに img_size で割っており、
+-- 強さ・スケールを最大にしても 0.05px しか動かなかった（＝何も起きない）。
+-- いまは 強さ 1.0 で ±10px、上限は短辺の 5%（強さ最大でも 1080p なら ±54px）。
+-- **既存プロジェクトの絵が変わる**（いままで動いていなかったものが動き出す）。
+-- 検証器: AI/scripts/Filters_H/verify_filters.py / issue: AI/scripts/issues/20260923_filters_shimmer_displacement_too_small.md
+-- v1.20: ノイズの成分が毎フレーム別物に入れ替わっていたのを、速度どおりに流れるよう直した
+-- （@リキッドディストーション v1.10 と同じ直し方。issue: AI/scripts/issues/20260916_filters_liquid_distortion_per_frame_jump.md）。
+-- v1.21: 外へずれた画素がオブジェクトの外枠で切れていたのを、ずれの最大（強さ × 10 px、短辺の 5% まで）だけ
+-- 角度の向きに領域を広げて直した。元の画像の範囲の中は v1.20 と同じ絵。フィルタオブジェクトは v1.20 と同じ。
+-- 検証器: AI/scripts/Filters_H/verify_outer_spread.py / issue: AI/scripts/issues/20260927_blur_clipped_at_object_bounds.md
+-- v1.22: 余白が 0（フィルタオブジェクト・広げられなかったとき）は端の画素の中心より外（端から半画素）を読むのに
+-- sampler を省いていた。省くと範囲外は透明として補間され、画面の端の列が半透明になった。"clamp" を渡す
+-- （余白がある通常のオブジェクトは端の画素の中心より内側しか読まないので絵は変わらない）。
+-- 検証器: AI/scripts/Filters_H/verify_edge_sampler.py / issue: AI/scripts/issues/20260927_self_made_edge_read_without_sampler.md
+--[[pixelshader@ps_shimmer:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float amount;
+    float scale;
+    float time;
+    float2 dir;
+    float2 img_size;
+    float noise_offset;
+    float2 pad;
+};
+// 格子点ごとの整数ハッシュ（0〜1）と、それを smoothstep で補間した値ノイズ（v1.10）。
+// 組み込みの乱数バッファ（"random"）を点で読む v1.00 は、読み取り位置が整数を越えるたびに
+// 値が跳び、さらに位置を毎フレーム乱数でずらしていたので、模様が毎フレーム入れ替わっていた。
+// 乱数バッファの中身がフレームで変わるかは lua.txt に無いので、それにも頼らない。
+float hash_cell_sh(int2 c) {
+    uint h = ((uint)c.x * 1597334677u) ^ ((uint)c.y * 3812015801u);
+    h = h ^ (h >> 16);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16);
+    return (float)(h & 0x00ffffffu) / 16777216.0;
+}
+float value_noise_sh(float2 p) {
+    float2 i = floor(p);
+    float2 f = p - i;
+    float2 u = f * f * (3.0 - 2.0 * f);
+    int2 c = (int2)i;
+    float a = hash_cell_sh(c);
+    float b = hash_cell_sh(c + int2(1, 0));
+    float e = hash_cell_sh(c + int2(0, 1));
+    float d = hash_cell_sh(c + int2(1, 1));
+    return lerp(lerp(a, b, u.x), lerp(e, d, u.x), u.y);
+}
+float4 ps_shimmer(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    // v1.21: img_size は元の画像の大きさ、pad は広げた余白（px）。バッファは img_size + 2 * pad。
+    // 模様と上限は元の画像で決める（広げても元の画像の上の揺れ方は同じ。pad 0 なら v1.20 と同じ式）
+    float2 buf = max(img_size + 2.0 * pad, float2(1,1));
+    float2 p = (pos.xy - pad) / max(img_size, float2(1,1));
+    float wave = sin(dot(p, dir) * scale * 20.0 + time * 6.28318);
+    float n = value_noise_sh(p * scale * 80.0 + float2(time, noise_offset * 10.0)) * 2.0 - 1.0;
+    // disp は**画素**。強さ 1.0 で ±10px になるようにし、上限は短辺の 5% に収める。
+    // v1.00 は uv 相当の ±0.05 に clamp してから img_size で割っていたため、
+    // どの設定でも 0.05px しか動かなかった。
+    float disp = (wave * 0.6 + n * 0.4) * amount * 10.0;
+    float limit = max(min(img_size.x, img_size.y) * 0.05, 1.0);
+    disp = clamp(disp, -limit, limit);
+    float2 offset = dir * disp / buf;
+    float2 sample_uv = uv + offset;
+    // 元の画像の範囲（バッファの uv）。pad 0 なら 0〜1。範囲の外を読むなら動かさない（余白ではもともと透明）
+    float2 lo = pad / buf;
+    float2 hi = (pad + img_size) / buf;
+    if (sample_uv.x < lo.x || sample_uv.x > hi.x || sample_uv.y < lo.y || sample_uv.y > hi.y) {
+        return src.Sample(smp, uv);
+    }
+    // 端の画素の中心より外を読まない（余白の透明と混ぜない）。pad 0 なら何もしない
+    float2 e = min(pad, float2(0.5, 0.5)) / buf;
+    sample_uv = clamp(sample_uv, lo + e, hi - e);
+    return src.Sample(smp, sample_uv);
+}
+]]
+
+local obj, math = obj, math
+local noise = require("EffectUtils_Noise")
+
+if amount <= 0 then return end
+
+local rad = math.rad(angle)
+local dx, dy = math.cos(rad), math.sin(rad)
+-- 読み取り位置のずらしはシードだけで決める（v1.20）。時間の変化は time の項だけが担う
+local offset = noise.noise_offset(seed, 0, false)
+local time = obj.frame * speed * 0.01
+
+-- v1.21: 外へずれる画素が切れないよう、ずれの最大だけ角度の向きに広げる
+-- 正本: @グリッチ の plan_pad（同じ複製。変更時は 6 つとも直す）
+local CACHE_BUDGET = 15000000
+local PAD_MARGIN = 2
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+local function plan_pad(want_x, want_y, w, h, cost)
+  if is_filter then return 0, 0 end
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  if not cost then return px, py end
+  for k = 64, 0, -1 do
+    local sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if cost(sx, sy) <= CACHE_BUDGET then return sx, sy end
+  end
+  return 0, 0
+end
+
+-- シェーダーの disp は |wave*0.6 + n*0.4| <= 1 に 強さ × 10 を掛け、短辺の 5%（最小 1）で頭打ち。
+-- 向き (dx, dy) の成分ごとに、その軸の両側を広げる（0.5 px 未満の軸は広げない）
+local W, H = obj.w, obj.h
+local reach = math.min(amount * 10, math.max(math.min(W, H) * 0.05, 1))
+local want_x = (reach * math.abs(dx) >= 0.5) and (math.ceil(reach * math.abs(dx)) + PAD_MARGIN) or 0
+local want_y = (reach * math.abs(dy) >= 0.5) and (math.ceil(reach * math.abs(dy)) + PAD_MARGIN) or 0
+local pad_x, pad_y = plan_pad(want_x, want_y, W, H, nil)
+if pad_x > 0 or pad_y > 0 then
+  obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+end
+
+-- float2 dir は 16 バイト境界をまたぐためスロット4へ押し出される。
+-- スロット3にダミーを詰めないと dir/img_size/noise_offset が1つずつずれる。
+-- pad（float2）は noise_offset の後ろのスロット 9-10（同じ 16 バイトに収まる）。
+-- v1.22: 端の半画素は端の色で読む（"clamp"。省くと範囲外の透明と混ざる）
+obj.pixelshader("ps_shimmer", "object", {"object"}, {
+  amount, scale, time, 0, dx, dy, W, H, offset, pad_x, pad_y,
+}, "copy", "clamp")
+
+@フォグヘイズ
+--information:フォグヘイズ@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@density:密度,0,100,35,0.1
+--track@fog_start:開始深度,0,100,20,0.1
+--track@fog_end:終了深度,0,100,80,0.1
+--track@scatter:散乱,0,100,40,0.1
+--color@fog_color:フォグ色,0xCCCCDD
+--select@blend_mode:合成=0,加算=0,オーバーレイ=1,スクリーン=2
+--[[pixelshader@ps_fog:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float density;
+    float fog_start;
+    float fog_end;
+    float scatter;
+    float fog_r;
+    float fog_g;
+    float fog_b;
+    float blend_mode;
+};
+float luminance(float3 rgb) { return dot(rgb, float3(0.2126, 0.7152, 0.0722)); }
+float4 ps_fog(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    if (c.a <= 0.001) return c;
+    float3 rgb = c.rgb / c.a;
+    float depth = 1.0 - luminance(rgb);
+    float fog = smoothstep(fog_start, fog_end, depth) * density;
+    float3 lit = float3(fog_r, fog_g, fog_b) * (1.0 + scatter * luminance(rgb));
+    float3 out_rgb = rgb;
+    if (blend_mode < 0.5) {
+        out_rgb = lerp(rgb, rgb + lit, fog);
+    } else if (blend_mode < 1.5) {
+        float3 overlay = lit * 0.5 + 0.5;
+        out_rgb.r = rgb.r < 0.5 ? 2.0 * rgb.r * overlay.r : 1.0 - 2.0 * (1.0 - rgb.r) * (1.0 - overlay.r);
+        out_rgb.g = rgb.g < 0.5 ? 2.0 * rgb.g * overlay.g : 1.0 - 2.0 * (1.0 - rgb.g) * (1.0 - overlay.g);
+        out_rgb.b = rgb.b < 0.5 ? 2.0 * rgb.b * overlay.b : 1.0 - 2.0 * (1.0 - rgb.b) * (1.0 - overlay.b);
+        out_rgb = lerp(rgb, out_rgb, fog);
+    } else {
+        float3 screened = saturate(1.0 - (1.0 - rgb) * (1.0 - lit));
+        out_rgb = lerp(rgb, screened, fog);
+    }
+    return float4(saturate(out_rgb * c.a), c.a);
+}
+]]
+
+local obj, math = obj, math
+local color = require("EffectUtils_ColorGrade")
+
+if density <= 0 then return end
+
+local fr, fg, fb = color.color_from_hex(fog_color)
+local fog_start_v = fog_start / 100
+local fog_end_v = math.max(fog_end / 100, fog_start_v + 0.01)
+
+obj.pixelshader("ps_fog", "object", "object", {
+  density / 100, fog_start_v, fog_end_v, scatter / 100, fr, fg, fb, blend_mode,
+})
+
+@フィルムバーン
+--information:フィルムバーン@Filters_H v1.21 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,50,0.1
+--track@edge:エッジ,0,100,70,0.1
+--track@spread:拡散,1,200,35,0.1
+--track@burn_seed:シード,0,10000,0,1
+--color@burn_color:焼色,0xFF6622
+--select@edge_side:位置=0,右=0,左=1,上=2,下=3
+-- v1.20: edge_mask の x の 2 分岐が入れ替わっており、位置=右 で左端が焼けていた
+-- （上/下は正しかった）。選択肢のラベルは保存キーなので動かさず、式の側を直した。
+-- **既存プロジェクトで焼ける側が反転する。**
+-- 検証器: AI/scripts/Filters_H/verify_filters.py / issue: AI/scripts/issues/20260923_filters_filmburn_side_swapped.md
+-- v1.21: 拡散 > 1 のぼかしを、通常のオブジェクトでは元の大きさへ切り戻さない（外枠で切れていた）。
+--[[pixelshader@ps_filmburn:
+Texture2D src : register(t0);
+Texture2D noise_tex : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float edge;
+    float edge_side;
+    float3 burn_color;
+    float noise_offset;
+    float2 img_size;
+};
+float get_noise(float2 uv) {
+    int2 pos = int2(uint(uv.x) % 256, uint(uv.y) % 256);
+    return noise_tex.Load(int3(pos, 0)).r;
+}
+float edge_mask(float2 uv) {
+    // uv の 0 側が「左」「上」。`1 - smoothstep(1-edge, 1, t)` は t=0 側を焼くので、
+    // 右を焼くなら `1 - smoothstep(edge, 0, t)` の方を使う（v1.00〜v1.10 は x だけ逆だった）。
+    if (edge_side < 0.5) return 1.0 - smoothstep(edge, 0.0, uv.x);         // 右
+    if (edge_side < 1.5) return 1.0 - smoothstep(1.0 - edge, 1.0, uv.x);   // 左
+    if (edge_side < 2.5) return 1.0 - smoothstep(1.0 - edge, 1.0, uv.y);   // 上
+    return 1.0 - smoothstep(edge, 0.0, uv.y);                              // 下
+}
+float4 ps_filmburn(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    float n = get_noise(pos.xy * 0.1 + noise_offset * 256.0);
+    float mask = edge_mask(uv) * (0.5 + n * 0.5);
+    float3 burn = burn_color * mask * intensity;
+    float3 rgb = c.a > 0.001 ? c.rgb / c.a : c.rgb;
+    rgb = rgb + burn;
+    return float4(saturate(rgb * c.a), c.a);
+}
+]]
+
+local obj, math = obj, math
+local color = require("EffectUtils_ColorGrade")
+local noise = require("EffectUtils_Noise")
+
+if intensity <= 0 then return end
+
+local br, bg, bb = color.color_from_hex(burn_color)
+local offset = noise.noise_offset(burn_seed, obj.frame, true)
+
+-- float3 burn_color は 16 バイト境界をまたぐためスロット4へ押し出される。
+-- スロット3にダミーを詰めないと burn_color/noise_offset/img_size が1つずつずれる。
+obj.pixelshader("ps_filmburn", "object", {"object", "random"}, {
+  intensity / 100, edge / 100, edge_side, 0, br, bg, bb, offset, obj.w, obj.h,
+})
+
+if spread > 1 then
+  -- 組み込みの「ぼかし」はバッファを範囲のぶん広げる。
+  -- v1.21: 元の大きさへ切り戻すのはフィルタオブジェクトのときだけにした。v1.20 までは通常の
+  -- オブジェクトでも切り戻していたので、ぼけがオブジェクトの外枠で切れていた。
+  -- フィルタオブジェクトは終了時にサイズが変わっていると different frame buffer size になるため、
+  -- 元サイズの tempbuffer へ描画して戻す（au2-filter-object）。
+  -- 検証器: AI/scripts/Filters_H/verify_filmburn_spread.py
+  if obj.getinfo("filter") then
+    local ow, oh = obj.w, obj.h
+    obj.effect("ぼかし", "範囲", spread * 0.3)
+    obj.setoption("drawtarget", "tempbuffer", ow, oh)
+    obj.clearbuffer("tempbuffer")
+    obj.draw()
+    obj.copybuffer("object", "tempbuffer")
+  else
+    obj.effect("ぼかし", "範囲", spread * 0.3)
+  end
+end
+
+@カラーグレード
+--information:カラーグレード@Filters_H v1.10 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,100,0.1
+--track@contrast:コントラスト,-100,100,0,0.1
+--track@saturation:彩度,-100,100,0,0.1
+--track@temperature:色温度,-100,100,0,0.1
+--track@tint_shift:ティント,-100,100,0,0.1
+--track@shadows:シャドウ,-100,100,0,0.1
+--track@highlights:ハイライト,-100,100,0,0.1
+--select@preset:プリセット=0,ニュートラル=0,シネマ=1,ウォーム=2,クール=3,ヴィンテージ=4
+--[[pixelshader@ps_colorgrade:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float contrast;
+    float saturation;
+    float temperature;
+    float tint_shift;
+    float shadows;
+    float highlights;
+    float preset;
+};
+float luminance(float3 rgb) { return dot(rgb, float3(0.2126, 0.7152, 0.0722)); }
+float4 ps_colorgrade(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    if (c.a <= 0.001) return c;
+    float3 rgb = c.rgb / c.a;
+    float3 orig_rgb = rgb;
+    float lum = luminance(rgb);
+    float sh = smoothstep(0.0, 0.5, 1.0 - lum);
+    float hi = smoothstep(0.5, 1.0, lum);
+    rgb = rgb + shadows * sh * float3(0.02, 0.02, 0.03);
+    // シャドウと符号を揃える（正の値で明るくなる）。ハイライト側はマスク hi が狭いぶん係数を大きく取る
+    rgb = rgb + highlights * hi * float3(0.12, 0.12, 0.10);
+    rgb.r = rgb.r + temperature * 0.5;
+    rgb.b = rgb.b - temperature * 0.5;
+    rgb.g = rgb.g + tint_shift * 0.25;
+    if (preset > 3.5) {
+        float preset_lum = luminance(rgb);
+        rgb = lerp(rgb, float3(preset_lum, preset_lum, preset_lum) * float3(1.05, 0.95, 0.85), 0.35);
+    }
+    else if (preset > 2.5) { rgb.b = rgb.b + 0.03; rgb.r = rgb.r - 0.01; }
+    else if (preset > 1.5) { rgb.r = rgb.r + 0.03; rgb.g = rgb.g + 0.01; }
+    else if (preset > 0.5) { rgb = lerp(rgb, float3(lum, lum, lum), -0.05); rgb.g = rgb.g + 0.01; }
+    float gray = luminance(rgb);
+    rgb = lerp(float3(gray, gray, gray), rgb, 1.0 + saturation);
+    rgb = (rgb - 0.5) * (1.0 + contrast) + 0.5;
+    float3 final_rgb = lerp(orig_rgb, rgb, intensity);
+    return float4(saturate(final_rgb * c.a), c.a);
+}
+]]
+
+local obj = obj
+
+if intensity <= 0 then return end
+
+obj.pixelshader("ps_colorgrade", "object", "object", {
+  intensity / 100, contrast / 100, saturation / 100,
+  temperature / 100, tint_shift / 100, shadows / 100, highlights / 100, preset,
+})
+
+@リフト・ガンマ・ゲイン
+--information:リフト・ガンマ・ゲイン@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,100,0.1
+--group:リフト（暗部）
+--track@lift_all:リフト全体,-100,100,0,0.1
+--track@lift_r:リフトR,-100,100,0,0.1
+--track@lift_g:リフトG,-100,100,0,0.1
+--track@lift_b:リフトB,-100,100,0,0.1
+--group
+--group:ガンマ（中間調）
+--track@gamma_all:ガンマ全体,-100,100,0,0.1
+--track@gamma_r:ガンマR,-100,100,0,0.1
+--track@gamma_g:ガンマG,-100,100,0,0.1
+--track@gamma_b:ガンマB,-100,100,0,0.1
+--group
+--group:ゲイン（明部）
+--track@gain_all:ゲイン全体,-100,100,0,0.1
+--track@gain_r:ゲインR,-100,100,0,0.1
+--track@gain_g:ゲインG,-100,100,0,0.1
+--track@gain_b:ゲインB,-100,100,0,0.1
+--group
+
+--[[pixelshader@ps_liftgammagain:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float lift_r;
+    float lift_g;
+    float lift_b;
+    float gamma_r;
+    float gamma_g;
+    float gamma_b;
+    float gain_r;
+    float gain_g;
+    float gain_b;
+};
+float4 ps_liftgammagain(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    if (c.a <= 0.001) return c;
+    float3 rgb = c.rgb / c.a;
+    float3 orig_rgb = rgb;
+    float3 lift = float3(lift_r, lift_g, lift_b);
+    float3 gam  = float3(gamma_r, gamma_g, gamma_b);
+    float3 gain = float3(gain_r, gain_g, gain_b);
+    // リフト: 暗部を持ち上げる。白（1.0）は動かさないので上端が飽和しない
+    rgb = rgb + lift * (float3(1.0, 1.0, 1.0) - rgb);
+    // pow は負の底で NaN になるのでここで下限を切る
+    rgb = max(rgb, float3(0.0, 0.0, 0.0));
+    // ガンマ: 1.0 より大きいほど明るい（中間調のみが動く）
+    rgb = pow(rgb, float3(1.0, 1.0, 1.0) / gam);
+    // ゲイン: 明部ほど大きく動く
+    rgb = rgb * gain;
+    float3 final_rgb = lerp(orig_rgb, rgb, intensity);
+    return float4(saturate(final_rgb * c.a), c.a);
+}
+]]
+
+local obj = obj
+
+if intensity <= 0 then return end
+
+-- リフトは ±0.5 の範囲に収める（全体とチャンネルの和 ±200 を ±1.0 とみなして半分にする）
+local function lift_of(ch) return (lift_all + ch) / 200 end
+-- ガンマ・ゲインは 2^(v/100)。±100 で 2 倍／半分になり、0 で 1.0 になる
+local function pow2_of(all, ch) return 2 ^ ((all + ch) / 100) end
+
+obj.pixelshader("ps_liftgammagain", "object", "object", {
+  intensity / 100,
+  lift_of(lift_r), lift_of(lift_g), lift_of(lift_b),
+  pow2_of(gamma_all, gamma_r), pow2_of(gamma_all, gamma_g), pow2_of(gamma_all, gamma_b),
+  pow2_of(gain_all, gain_r), pow2_of(gain_all, gain_g), pow2_of(gain_all, gain_b),
+})
+
+@バレル歪みPremium
+--information:バレル歪みPremium@Filters_H v1.02 by HexBrowns
+--label:HexScript
+--filter
+--track@amount:強さ,-100,100,0,0.1
+--track@chromatic:色収差,0,100,0,0.1
+--track@vignette:周辺減光,0,100,0,0.1
+--check@transparent:範囲外を透明,true
+--value@anchor_pos:中心点,{}
+-- v1.01: 強さ > 0（糸巻き型。外ほど大きく引き伸ばし、画像を外へ押し出す）で、押し出された画素が
+-- オブジェクトの外枠で切れていたのを、押し出される分だけ領域を広げて直した。元の画像の範囲の中は v1.00 と同じ絵。
+-- 範囲の外には押し出されてきた画素だけを出し、写像が折り返す半径（それより外は画像が裏返って映る）の外は出さない。
+-- 強さ <= 0（樽型。内へ縮む）とフィルタオブジェクトは広げない（v1.00 と同じ）。
+-- 検証器: AI/scripts/Filters_H/verify_outer_spread.py / issue: AI/scripts/issues/20260927_blur_clipped_at_object_bounds.md
+-- v1.02: 余白が 0（フィルタオブジェクト・強さ <= 0・広げられなかったとき）は、範囲外を透明 OFF で uv をちょうど 0 / 1 に
+-- 寄せて読むのに sampler を省いていた。省くと範囲外は透明として補間され、画面の端が α 0.5 の半透明になった。
+-- "clamp" を渡す（範囲外を透明 ON の外側は従来どおり透明。余白がある通常のオブジェクトは絵が変わらない）。
+-- 検証器: AI/scripts/Filters_H/verify_edge_sampler.py / issue: AI/scripts/issues/20260927_self_made_edge_read_without_sampler.md
+--[[pixelshader@ps_barrel_premium:
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 center;
+    float amount;
+    float chromatic;
+    float vignette;
+    float transparent;
+    float2 img_size;
+    float2 pad;
+    float fold_r;
+    float fold_g;
+    float fold_b;
+};
+// v1.01: img_size は元の画像の大きさ、pad は広げた余白（px）。バッファは img_size + 2 * pad。
+// center はバッファ上の中心（px）。距離は元の画像の大きさで正規化する（pad 0 なら v1.00 と同じ式）
+bool inside_image(float2 pos) {
+    return !(pos.x < pad.x || pos.x > pad.x + img_size.x || pos.y < pad.y || pos.y > pad.y + img_size.y);
+}
+float4 sample_tex(float2 pos, float channel_shift, float fold) {
+    float2 rel = pos - center;
+    float dist = length(rel / max(img_size, float2(1,1)));
+    float k = amount * (1.0 + channel_shift * chromatic * dist);
+    float scale = 1.0 + k * dist * dist;
+    float2 buf = max(img_size + 2.0 * pad, float2(1,1));
+    float2 uv = (center + rel / max(scale, 0.001)) / buf;
+    // 元の画像の範囲（バッファの uv）。pad 0 なら 0〜1
+    float2 lo = pad / buf;
+    float2 hi = (pad + img_size) / buf;
+    bool src_in = !(uv.x < lo.x || uv.x > hi.x || uv.y < lo.y || uv.y > hi.y);
+    if (!inside_image(pos)) {
+        // 広げた余白: 押し出されてきた画素だけを出す。写像が最初に折り返す半径 fold より外は出さない
+        if (!src_in || dist >= fold) return float4(0,0,0,0);
+    } else if (transparent > 0.5) {
+        if (!src_in) return float4(0,0,0,0);
+    }
+    // 範囲の外を読むなら端へ寄せる（範囲外を透明 OFF の v1.00 と同じ）。端の画素の中心より外を読まない
+    float2 e = min(pad, float2(0.5, 0.5)) / buf;
+    uv = clamp(uv, lo + e, hi - e);
+    return tex.Sample(smp, uv);
+}
+float4 ps_barrel_premium(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float2 pixel = pos.xy;
+    float4 c;
+    c.r = sample_tex(pixel, -1.0, fold_r).r;
+    c.g = sample_tex(pixel, 0.0, fold_g).g;
+    c.b = sample_tex(pixel, 1.0, fold_b).b;
+    c.a = sample_tex(pixel, 0.0, fold_g).a;
+    if (c.a > 0.001 && vignette > 0) {
+        float dist = length((pixel - center) / max(img_size, float2(1,1)));
+        float v = 1.0 - smoothstep(0.3, 1.0, dist) * vignette;
+        c.rgb = c.rgb * float3(v, v, v);
+    }
+    // 広げた余白では色を α 以下に収める（色収差で R / B だけが α の外へ出ても、乗算済みで rgb <= a を保つ）
+    if (!inside_image(pixel)) c.rgb = min(c.rgb, float3(c.a, c.a, c.a));
+    return c;
+}
+]]
+
+local obj, math = obj, math
+
+if amount == 0 and chromatic == 0 and vignette == 0 then return end
+
+obj.setanchor("anchor_pos", 1, "line")
+local ax = anchor_pos[1] or 0
+local ay = anchor_pos[2] or 0
+local W, H = obj.w, obj.h
+local cx = W * 0.5 + ax
+local cy = H * 0.5 + ay
+local is_transparent = (transparent == 1 or transparent == true)
+
+-- v1.01: 押し出された画素が切れないよう、押し出される分だけ上下・左右を広げる
+-- 正本: @グリッチ の plan_pad（同じ複製。変更時は 6 つとも直す）
+local CACHE_BUDGET = 15000000
+local PAD_MARGIN = 2
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+local function plan_pad(want_x, want_y, w, h, cost)
+  if is_filter then return 0, 0 end
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  if not cost then return px, py end
+  for k = 64, 0, -1 do
+    local sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if cost(sx, sy) <= CACHE_BUDGET then return sx, sy end
+  end
+  return 0, 0
+end
+
+-- シェーダーの写像: 出力の点（中心からの距離 t、元の画像の大きさで正規化）は、同じ向きの距離
+-- g(t) = t / (1 + k t^2)、k = 強さ/100 × (1 + s × 色収差/100 × t)（s は R=-1 / G・α=0 / B=+1）の点を読む。
+-- 強さ > 0 では g(t) < t なので画像は外へ押し出される。g は t が増えると増え、ある半径で折り返す
+-- （d/dt の符号は 1 - a t^2 (1 + 2 s c t)）。折り返した先は画像が裏返って映るので、余白には出さない
+local T_MAX = 8
+local amt, chr = amount / 100, chromatic / 100
+local function src_radius(t, s)
+  local k = amt * (1 + s * chr * t)
+  return t / math.max(1 + k * t * t, 0.001)
+end
+local function fold_radius(s)
+  local dt = 1 / 2048
+  local t = 0
+  while t < T_MAX do
+    local tn = t + dt
+    if 1 - amt * tn * tn * (1 + 2 * s * chr * tn) <= 0 then return t end
+    t = tn
+  end
+  return T_MAX
+end
+local fold_r, fold_g, fold_b = T_MAX, T_MAX, T_MAX
+local pad_x, pad_y = 0, 0
+if amount > 0 and not is_filter then
+  fold_r, fold_g, fold_b = fold_radius(-1), fold_radius(0), fold_radius(1)
+  -- α（s=0）が届く範囲を、元の画像の外周の各点が押し出される先から求める。
+  -- 外周の点（中心からの距離 r）は g(t) = r となる t（折り返しより内側）へ移る。g(fold) < r なら fold まで届く
+  local g_fold = src_radius(fold_g, 0)
+  local over_x, over_y = 0, 0
+  local N = 256
+  local function push(bx, by)
+    local nx, ny = (bx - cx) / W, (by - cy) / H
+    local r = math.sqrt(nx * nx + ny * ny)
+    if r < 1e-9 then return end
+    local t
+    if r >= g_fold then
+      t = fold_g
+    else
+      local lo_t, hi_t = r, fold_g
+      for _ = 1, 40 do
+        local mid = (lo_t + hi_t) * 0.5
+        if src_radius(mid, 0) < r then lo_t = mid else hi_t = mid end
+      end
+      t = hi_t
+    end
+    local dx, dy = cx + nx / r * t * W, cy + ny / r * t * H
+    over_x = math.max(over_x, -dx, dx - W)
+    over_y = math.max(over_y, -dy, dy - H)
+  end
+  for i = 0, N do
+    local f = i / N
+    push(f * W, 0)
+    push(f * W, H)
+    push(0, f * H)
+    push(W, f * H)
+  end
+  local want_x = (over_x > 0) and (math.ceil(over_x) + PAD_MARGIN) or 0
+  local want_y = (over_y > 0) and (math.ceil(over_y) + PAD_MARGIN) or 0
+  pad_x, pad_y = plan_pad(want_x, want_y, W, H, nil)
+  if pad_x > 0 or pad_y > 0 then
+    obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+  end
+end
+
+-- v1.02: 端へ寄せた uv は端の色で読む（"clamp"。省くと範囲外の透明と半々に混ざる）
+obj.pixelshader("ps_barrel_premium", "object", "object", {
+  cx + pad_x, cy + pad_y, amount / 100, chromatic / 100, vignette / 100,
+  is_transparent and 1 or 0, W, H, pad_x, pad_y, fold_r, fold_g, fold_b,
+}, "copy", "clamp")
+
+@ノイズオーバーレイ
+--information:ノイズオーバーレイ@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,20,0.1
+--track@scale:スケール,0.1,20,1.5,0.1
+--track@softness:柔らかさ,0,100,0,0.1
+--check@color_mode:カラーノイズ,false
+--check@animated:アニメーション,true
+--select@blend_mode:合成=0,加算=0,オーバーレイ=1,乗算=2
+--value@seed:シード,0
+--[[pixelshader@ps_noise_overlay:
+Texture2D src : register(t0);
+Texture2D noise_tex : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float scale;
+    float softness;
+    float color_mode;
+    float blend_mode;
+    float noise_offset;
+};
+float4 ps_noise_overlay(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    float2 nuv = pos.xy * scale + noise_offset * 256.0;
+    float s = softness * 8.0;
+    float base_noise = noise_tex.Load(int3(int2(uint(nuv.x) % 256, uint(nuv.y) % 256), 0)).r;
+    if (softness >= 0.01) {
+        base_noise = (
+            noise_tex.Load(int3(int2(uint((nuv + float2(-s, 0)).x) % 256, uint((nuv + float2(-s, 0)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv + float2( s, 0)).x) % 256, uint((nuv + float2( s, 0)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv + float2(0, -s)).x) % 256, uint((nuv + float2(0, -s)).y) % 256), 0)).r +
+            noise_tex.Load(int3(int2(uint((nuv + float2(0,  s)).x) % 256, uint((nuv + float2(0,  s)).y) % 256), 0)).r +
+            base_noise
+        ) * 0.2;
+    }
+    float noise_val = (base_noise - 0.5) * 2.0 * intensity;
+    float3 noise_rgb = float3(noise_val, noise_val, noise_val);
+    if (color_mode > 0.5) {
+        float2 nuv_g = nuv + float2(23.7, 9.9);
+        float2 nuv_b = nuv + float2(37.5, 15.2);
+        float noise_g = noise_tex.Load(int3(int2(uint(nuv_g.x) % 256, uint(nuv_g.y) % 256), 0)).r;
+        float noise_b = noise_tex.Load(int3(int2(uint(nuv_b.x) % 256, uint(nuv_b.y) % 256), 0)).r;
+        noise_rgb = float3(noise_val, (noise_g - 0.5) * 2.0 * intensity, (noise_b - 0.5) * 2.0 * intensity);
+    }
+    float3 rgb = c.a > 0.001 ? c.rgb / c.a : c.rgb;
+    float3 out_rgb = rgb;
+    if (blend_mode < 0.5) {
+        out_rgb = saturate(rgb + noise_rgb);
+    } else if (blend_mode < 1.5) {
+        float3 overlay = noise_rgb * 0.5 + 0.5;
+        out_rgb.r = rgb.r < 0.5 ? 2.0 * rgb.r * overlay.r : 1.0 - 2.0 * (1.0 - rgb.r) * (1.0 - overlay.r);
+        out_rgb.g = rgb.g < 0.5 ? 2.0 * rgb.g * overlay.g : 1.0 - 2.0 * (1.0 - rgb.g) * (1.0 - overlay.g);
+        out_rgb.b = rgb.b < 0.5 ? 2.0 * rgb.b * overlay.b : 1.0 - 2.0 * (1.0 - rgb.b) * (1.0 - overlay.b);
+    } else {
+        out_rgb = saturate(rgb * (1.0 + noise_rgb));
+    }
+    return float4(saturate(out_rgb * c.a), c.a);
+}
+]]
+
+local obj = obj
+local noise = require("EffectUtils_Noise")
+
+if intensity <= 0 then return end
+
+local is_color = noise.as_bool(color_mode, false)
+local is_anim = noise.as_bool(animated, true)
+local offset = noise.noise_offset(seed, obj.frame, is_anim)
+
+obj.pixelshader("ps_noise_overlay", "object", {"object", "random"}, {
+  intensity / 100, scale, softness / 100, is_color and 1 or 0, blend_mode, offset,
+})
+
+@バイブランス
+--information:バイブランス@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,100,0.1
+--track@vibrance:バイブランス,-100,100,50,0.1
+--track@skin_protect:肌色を保護,0,100,70,0.1
+--track@saturation_base:基本彩度,-100,100,0,0.1
+--[[pixelshader@ps_vibrance:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float vibrance;
+    float skin_protect;
+    float saturation_base;
+};
+float3 rgb2hsv_vb(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = c.g < c.b ? float4(c.bg, K.wz) : float4(c.gb, K.xy);
+    float4 q = c.r < p.x ? float4(p.xyw, c.r) : float4(c.r, p.yzx);
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * max(d, 1e-10))), d / max(q.x, 1e-10), q.x);
+}
+float4 ps_vibrance(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    if (c.a <= 0.001) return c;
+    float3 rgb = c.rgb / c.a;
+    float3 orig_rgb = rgb;
+    // 基本彩度: グレーと元色の lerp。重み無しで全ピクセルに一律に効く（標準の「彩度」相当）
+    float base_lum = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    rgb = saturate(lerp(float3(base_lum, base_lum, base_lum), rgb, 1.0 + saturation_base));
+    // 現在の彩度 (max - min)。低いピクセルほど重み w が大きい ＝ くすんだ色ほど強く上がる
+    float mx = max(rgb.r, max(rgb.g, rgb.b));
+    float mn = min(rgb.r, min(rgb.g, rgb.b));
+    float sat = saturate(mx - mn);
+    float w = 1.0 - sat;
+    // 肌色保護: 色相が橙〜赤の帯（中心 25 度・幅 ±25 度 ＝ おおよそ 0〜50 度）に
+    // 近いほど w を減衰させる。skin_protect が 0 なら保護なし
+    if (skin_protect > 0.001) {
+        float hue_deg = rgb2hsv_vb(rgb).x * 360.0;
+        float hd = abs(hue_deg - 25.0);
+        hd = min(hd, 360.0 - hd);
+        float skin = 1.0 - smoothstep(0.0, 25.0, hd);
+        w = w * (1.0 - skin * skin_protect);
+    }
+    // 処理前の rgb を orig_rgb に残して lerp する（両辺に処理後を渡すと強度が効かない）
+    float lum = dot(rgb, float3(0.2126, 0.7152, 0.0722));
+    float3 vib_rgb = saturate(lerp(float3(lum, lum, lum), rgb, 1.0 + vibrance * w));
+    float3 final_rgb = lerp(orig_rgb, vib_rgb, intensity);
+    return float4(saturate(final_rgb * c.a), c.a);
+}
+]]
+
+local obj = obj
+
+if intensity <= 0 then return end
+
+obj.pixelshader("ps_vibrance", "object", "object", {
+  intensity / 100, vibrance / 100, skin_protect / 100, saturation_base / 100,
+})
+
+@HSL選択補正
+--information:HSL選択補正@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@intensity:強度,0,100,100,0.1
+--group:赤,false
+--track@red_h:赤::色相,-100,100,0,0.1
+--track@red_s:赤::彩度,-100,100,0,0.1
+--track@red_l:赤::輝度,-100,100,0,0.1
+--group
+--group:橙・黄,false
+--track@orange_h:橙黄::色相,-100,100,0,0.1
+--track@orange_s:橙黄::彩度,-100,100,0,0.1
+--track@orange_l:橙黄::輝度,-100,100,0,0.1
+--group
+--group:緑,false
+--track@green_h:緑::色相,-100,100,0,0.1
+--track@green_s:緑::彩度,-100,100,0,0.1
+--track@green_l:緑::輝度,-100,100,0,0.1
+--group
+--group:水色,false
+--track@cyan_h:水色::色相,-100,100,0,0.1
+--track@cyan_s:水色::彩度,-100,100,0,0.1
+--track@cyan_l:水色::輝度,-100,100,0,0.1
+--group
+--group:青,false
+--track@blue_h:青::色相,-100,100,0,0.1
+--track@blue_s:青::彩度,-100,100,0,0.1
+--track@blue_l:青::輝度,-100,100,0,0.1
+--group
+--group:マゼンタ,false
+--track@magenta_h:マゼンタ::色相,-100,100,0,0.1
+--track@magenta_s:マゼンタ::彩度,-100,100,0,0.1
+--track@magenta_l:マゼンタ::輝度,-100,100,0,0.1
+--group
+--[[pixelshader@ps_hsl_select:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float intensity;
+    float red_h;
+    float red_s;
+    float red_l;
+    float orange_h;
+    float orange_s;
+    float orange_l;
+    float green_h;
+    float green_s;
+    float green_l;
+    float cyan_h;
+    float cyan_s;
+    float cyan_l;
+    float blue_h;
+    float blue_s;
+    float blue_l;
+    float magenta_h;
+    float magenta_s;
+    float magenta_l;
+};
+// 全フィールドを float で宣言しているので 16 バイト境界の穴は生じない（19 スロット）
+float3 rgb2hsl_sel(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float d = mx - mn;
+    float l = (mx + mn) * 0.5;
+    float h = 0.0;
+    float s = 0.0;
+    if (d > 1e-5) {
+        s = d / max(1.0 - abs(2.0 * l - 1.0), 1e-5);
+        // mx <= c.X は「c.X が最大値」の意（浮動小数の == 比較を避ける）
+        float hv = 4.0 + (c.r - c.g) / d;
+        if (mx <= c.r) hv = (c.g - c.b) / d;
+        else if (mx <= c.g) hv = 2.0 + (c.b - c.r) / d;
+        h = frac(hv / 6.0);
+    }
+    return float3(h, saturate(s), saturate(l));
+}
+float hue2rgb_sel(float p, float q, float t) {
+    float tt = frac(t);
+    float r = p;
+    if (tt < 1.0 / 6.0) r = p + (q - p) * 6.0 * tt;
+    else if (tt < 0.5) r = q;
+    else if (tt < 2.0 / 3.0) r = p + (q - p) * (2.0 / 3.0 - tt) * 6.0;
+    return r;
+}
+float3 hsl2rgb_sel(float3 hsl) {
+    float h = hsl.x;
+    float s = hsl.y;
+    float l = hsl.z;
+    float3 res = float3(l, l, l);
+    if (s > 1e-5) {
+        float q = l < 0.5 ? l * (1.0 + s) : l + s - l * s;
+        float p = 2.0 * l - q;
+        res = float3(hue2rgb_sel(p, q, h + 1.0 / 3.0), hue2rgb_sel(p, q, h), hue2rgb_sel(p, q, h - 1.0 / 3.0));
+    }
+    return res;
+}
+// 帯の中心からの距離で滑らかな重みを作る。半径を帯幅 1/6 に取ることで隣の帯と重なり、
+// 中心間の中点では両方が 0.5 になる（正規化後に合計 1.0）
+float band_weight_sel(float hue, float center) {
+    float d = abs(hue - center);
+    d = min(d, 1.0 - d);
+    return 1.0 - smoothstep(0.0, 1.0 / 6.0, d);
+}
+float4 ps_hsl_select(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    if (c.a <= 0.001) return c;
+    float3 rgb = c.rgb / c.a;
+    float3 orig_rgb = rgb;
+    float3 hsl = rgb2hsl_sel(saturate(rgb));
+    // 6 色域の中心色相: 赤 0 / 橙黄 60 / 緑 120 / 水色 180 / 青 240 / マゼンタ 300 度
+    float w0 = band_weight_sel(hsl.x, 0.0);
+    float w1 = band_weight_sel(hsl.x, 1.0 / 6.0);
+    float w2 = band_weight_sel(hsl.x, 2.0 / 6.0);
+    float w3 = band_weight_sel(hsl.x, 3.0 / 6.0);
+    float w4 = band_weight_sel(hsl.x, 4.0 / 6.0);
+    float w5 = band_weight_sel(hsl.x, 5.0 / 6.0);
+    float inv = 1.0 / max(w0 + w1 + w2 + w3 + w4 + w5, 1e-5);
+    float dh = (red_h * w0 + orange_h * w1 + green_h * w2 + cyan_h * w3 + blue_h * w4 + magenta_h * w5) * inv;
+    float ds = (red_s * w0 + orange_s * w1 + green_s * w2 + cyan_s * w3 + blue_s * w4 + magenta_s * w5) * inv;
+    float dl = (red_l * w0 + orange_l * w1 + green_l * w2 + cyan_l * w3 + blue_l * w4 + magenta_l * w5) * inv;
+    // 無彩色は色相が定義できない。彩度が低いほど調整を弱めてグレーが色付くのを防ぐ
+    float chroma_gate = smoothstep(0.0, 0.05, hsl.y);
+    dh = dh * chroma_gate;
+    ds = ds * chroma_gate;
+    dl = dl * chroma_gate;
+    hsl.x = frac(hsl.x + dh * (60.0 / 360.0));
+    hsl.y = saturate(hsl.y * (1.0 + ds));
+    hsl.z = saturate(hsl.z + dl * 0.5);
+    float3 graded = saturate(hsl2rgb_sel(hsl));
+    float3 final_rgb = lerp(orig_rgb, graded, intensity);
+    return float4(saturate(final_rgb * c.a), c.a);
+}
+]]
+
+local obj = obj
+
+if intensity <= 0 then return end
+
+obj.pixelshader("ps_hsl_select", "object", "object", {
+  intensity / 100,
+  red_h / 100, red_s / 100, red_l / 100,
+  orange_h / 100, orange_s / 100, orange_l / 100,
+  green_h / 100, green_s / 100, green_l / 100,
+  cyan_h / 100, cyan_s / 100, cyan_l / 100,
+  blue_h / 100, blue_s / 100, blue_l / 100,
+  magenta_h / 100, magenta_s / 100, magenta_l / 100,
+})
+
+@LUT適用
+--information:LUT適用@Filters_H v1.23 by HexBrowns
+--label:HexScript
+--file@lut_file:LUT画像
+--track@intensity:強度,0,100,100,0.1
+--track@lut_size:格子サイズ,2,64,8,1
+--select@lut_layout:LUT配置=0,HALD(標準)=0,正方タイル=1
+--track@max_mpx:画素数上限(Mpx),0,64,4,0.1,制限なし
+--[[pixelshader@ps_hald_lut:
+Texture2D src : register(t0);
+Texture2D lut : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 lut_img_size;
+    float intensity;
+    float grid_n;
+    float cell_px;
+    float layout_mode;
+};
+// LUT を画素座標で引き、Premultiplied Alpha を解除して返す。
+// 分岐を持つヘルパーは strict モードで X4000 を誘発しやすいので三項演算子で書く
+float3 fetch_lut_px(float2 px) {
+    float2 luv = px / max(lut_img_size, float2(1.0, 1.0));
+    float4 s = lut.Sample(smp, luv);
+    float inv_a = (s.a > 0.001) ? (1.0 / s.a) : 1.0;
+    return saturate(s.rgb * inv_a);
+}
+float4 ps_hald_lut(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+    float4 c = src.Sample(smp, uv);
+    if (c.a <= 0.001) return c;
+    float3 rgb = saturate(c.rgb / c.a);
+    float3 orig_rgb = rgb;
+    // 階調数 L = N^2。恒等 HALD の画像は 1 辺 W = L*N = N^3 の正方形になる
+    // （N=8 なら L=64 の 512x512、N=4 なら L=16 の 64x64）
+    float levels = max(grid_n * grid_n, 2.0);
+    float last = levels - 1.0;
+    // セル内はピクセル中心（+0.5）に合わせる。端が半ピクセルずれると色が浅くなる
+    float span = max(cell_px - 1.0, 1.0);
+    float rx = saturate(rgb.r) * span + 0.5;
+    // 青は両配置とも隣接 2 スライスを線形補間する
+    float bz = saturate(rgb.b) * last;
+    float z0 = floor(bz);
+    float z1 = min(z0 + 1.0, last);
+    float fz = bz - z0;
+    float3 graded = orig_rgb;
+    if (layout_mode < 0.5) {
+        // === HALD 標準（ImageMagick hald:N が出す並び）===
+        // 定義: ラスター順 p = y*W + x に対し R = p % L, G = (p/L) % L, B = p / L^2
+        //   W = L*N は L の倍数なので y*W % L = 0 → R = x % L
+        //   q = p / L = y*N + x/L と置くと G = q % L, B = q / L
+        //   q の最大は (W-1)*N + (N-1) = L*N^2 - 1 = L^2 - 1 なので (G,B) を過不足なく張る
+        // 逆写像（格子点 (R,G,B) → 画素）:
+        //   q = B*L + G,  x = (q % N)*L + R,  y = q / N
+        //   x < N*L = W、y <= (L^2-1)/N = L*N - 1 = W-1 で画像内に収まり、サイズと矛盾しない
+        // R だけサンプラーの線形補間に任せる。R*(L-1)+0.5 は [0.5, L-0.5] なので
+        // 同じ L 画素のブロック内で完結し、隣のブロックへはみ出さない。
+        // G は y 方向に連続していない（q が N 進んで初めて y が 1 進む）ので手で補間する
+        float gy = saturate(rgb.g) * last;
+        float g0 = floor(gy);
+        float g1 = min(g0 + 1.0, last);
+        float fg = gy - g0;
+        float q00 = z0 * levels + g0;
+        float q01 = z0 * levels + g1;
+        float q10 = z1 * levels + g0;
+        float q11 = z1 * levels + g1;
+        float3 s00 = fetch_lut_px(float2(fmod(q00, grid_n) * cell_px + rx, floor(q00 / grid_n) + 0.5));
+        float3 s01 = fetch_lut_px(float2(fmod(q01, grid_n) * cell_px + rx, floor(q01 / grid_n) + 0.5));
+        float3 s10 = fetch_lut_px(float2(fmod(q10, grid_n) * cell_px + rx, floor(q10 / grid_n) + 0.5));
+        float3 s11 = fetch_lut_px(float2(fmod(q11, grid_n) * cell_px + rx, floor(q11 / grid_n) + 0.5));
+        graded = lerp(lerp(s00, s01, fg), lerp(s10, s11, fg), fz);
+    } else {
+        // === 正方タイル（v1.00 までの並び。生成済みの検証用画像との互換のため残す）===
+        // スライス z を N 個ずつ横に並べ、タイル内は R が横・G が縦。G もサンプラー任せ
+        float gy = saturate(rgb.g) * span + 0.5;
+        float2 t0 = float2(fmod(z0, grid_n), floor(z0 / grid_n)) * cell_px + float2(rx, gy);
+        float2 t1 = float2(fmod(z1, grid_n), floor(z1 / grid_n)) * cell_px + float2(rx, gy);
+        graded = lerp(fetch_lut_px(t0), fetch_lut_px(t1), fz);
+    }
+    float3 final_rgb = lerp(orig_rgb, graded, intensity);
+    return float4(saturate(final_rgb * c.a), c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- --filter を付けていない理由:
+-- obj.load("image", ...) はオブジェクトのサイズを LUT 画像のサイズへ変えてしまう。
+-- フィルタオブジェクトの「オブジェクトのサイズを変更しない」制限（lua.txt）を満たせないので、
+-- 通常のアニメーション効果としてのみ提供する。
+--
+-- ※ 画像を obj.load で読み込み cache 経由で resource に渡す経路は、このプロジェクト内に
+--    実績が無く実機未確認（2026-09-02 時点）。obj.load 後に obj.w/obj.h が LUT 画像の
+--    サイズへ更新されることを前提にしている。
+
+if intensity <= 0 then return end
+if lut_file == nil or lut_file == "" then return end
+
+local n = math.floor((lut_size or 8) + 0.5)
+n = math.max(2, math.min(64, n))
+
+-- 0 = HALD 標準（配布 LUT はこちら）/ 1 = 正方タイル（v1.00 までの自作画像）
+local layout = (lut_layout == 1) and 1 or 0
+
+-- === 大きすぎる LUT 画像を弾く（v1.20） ===
+-- 4096x4096 の HALD を指定すると**そのフレームの描画全体**が黒くなる。適用していない
+-- オブジェクトも地色も消える。実測（2026-09-23、LUT-17〜21）では 3375x3375 (11.4 Mpx) まで
+-- 通り、4096x4096 (16.8 Mpx) で、ホストが LUT の cache への複製を
+-- `invalid buffer type. name=cache:lut_H/lut` で拒んだ。v1.22 から LUT を cache に置かない
+-- （下の pixelshader）。追跡: AI/scripts/issues/20260902_lut_large_hald_black_frame.md
+--
+-- 既定の 4 Mpx は速度の目安。実測で 1728x1728 (3.0 Mpx) が 1 フレーム 36.5ms、
+-- 2197x2197 (4.8 Mpx) が 57.5ms、3375x3375 (11.4 Mpx) が 136ms（1080p、読み込み込み）で、
+-- 30fps の予算 33.3ms にほぼ収まるのがここまで。0（制限なし）にすると画素数では弾かない。
+local limit_px = math.floor(math.max(max_mpx or 0, 0) * 1000000 + 0.5)
+
+-- 本体の最大画像サイズ。これを超える画像は上限の設定に関わらず読み込めない。
+-- 取れなかったら（両方そろわなければ）この判定そのものを使わない
+local img_max_w, img_max_h = obj.getinfo("image_max")
+if type(img_max_w) ~= "number" or type(img_max_h) ~= "number"
+    or img_max_w < 1 or img_max_h < 1 then
+  img_max_w, img_max_h = 0, 0
+end
+
+-- 同じ理由のログを毎フレーム出さない。.anm2 はフレーム毎に実行されるので、素直に
+-- print するとログが LUT のエラーで埋まって他が読めなくなる（global は lua.txt:263）
+local function warn_once(key, message)
+  local k = "Filters_H:LUT:" .. key
+  if global[k] == nil then
+    global[k] = "1"
+    print("@error", message)
+  end
+end
+
+-- 大きすぎる理由を返す（通るなら nil）
+local function reject_reason(w, h)
+  if img_max_w > 0 and (w > img_max_w or h > img_max_h) then
+    return string.format("本体の最大画像サイズ %dx%d を超えています。",
+                         img_max_w, img_max_h)
+  end
+  if limit_px > 0 and w * h > limit_px then
+    return string.format("画素数上限 %.1f Mpx を超えています（項目「画素数上限(Mpx)」で変えられます）。",
+                         limit_px / 1000000)
+  end
+  return nil
+end
+
+-- ファイルの先頭 count バイトを ffi で読む（v1.23）。**io.open は日本語を含むパスを開けない**
+-- （CP932 で表せる名前でも開けなかった。UTF-8 のパスを ANSI の API に渡しているとみられる。
+-- 実機 2026-09-23、検証 LUT-23: 前検査が素通りして 4096x4096 の読み込みまで走り 240ms）。
+-- kernel32 の CreateFileW に UTF-16 で渡す。ffi.C は除外されているが ffi.load は使える
+-- （Script/RtAv2/RtAv2.lua と同じ経路）。どこで失敗しても nil（読み込んだ後の判定に任せる）
+local function read_head_ffi(path, count)
+  local ok, head = pcall(function()
+    local ffi = require("ffi")
+    -- 宣言は 1 つずつ pcall する。同じ Lua の状態で宣言済み（2 回目の評価や、同じ宣言を持つ
+    -- 他のスクリプト）なら redefine のエラーになるが、先の宣言が残っているのでそのまま呼べる
+    local decls = {
+      "int MultiByteToWideChar(unsigned int CodePage, unsigned long dwFlags, const char * lpMultiByteStr, int cbMultiByte, wchar_t * lpWideCharStr, int cchWideChar);",
+      "void * CreateFileW(const wchar_t * lpFileName, unsigned long dwDesiredAccess, unsigned long dwShareMode, void * lpSecurityAttributes, unsigned long dwCreationDisposition, unsigned long dwFlagsAndAttributes, void * hTemplateFile);",
+      "int ReadFile(void * hFile, void * lpBuffer, unsigned long nNumberOfBytesToRead, unsigned long * lpNumberOfBytesRead, void * lpOverlapped);",
+      "int CloseHandle(void * hObject);",
+    }
+    for i = 1, #decls do pcall(ffi.cdef, decls[i]) end
+    local k32 = ffi.load("kernel32")
+    local CP_UTF8 = 65001
+    local wlen = k32.MultiByteToWideChar(CP_UTF8, 0, path, -1, nil, 0)
+    if wlen <= 0 then return nil end
+    local wpath = ffi.new("wchar_t[?]", wlen)
+    if k32.MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, wlen) <= 0 then return nil end
+    -- GENERIC_READ / FILE_SHARE_READ + FILE_SHARE_WRITE / OPEN_EXISTING
+    local h = k32.CreateFileW(wpath, 0x80000000, 3, nil, 3, 0, nil)
+    if h == nil or ffi.cast("intptr_t", h) == -1 then return nil end   -- INVALID_HANDLE_VALUE
+    local buf = ffi.new("uint8_t[?]", count)
+    local got = ffi.new("unsigned long[1]")
+    local read_ok = k32.ReadFile(h, buf, count, got, nil)
+    k32.CloseHandle(h)
+    if read_ok == 0 then return nil end
+    return ffi.string(buf, tonumber(got[0]))
+  end)
+  if ok then return head end
+  return nil
+end
+
+-- ファイルの先頭 count バイト。ASCII のパスは io.open で読み、開けなければ ffi で読む
+local function read_head(path, count)
+  if type(io) == "table" and io.open ~= nil then
+    local f = io.open(path, "rb")
+    if f ~= nil then
+      local head = f:read(count)
+      f:close()
+      return head
+    end
+  end
+  return read_head_ffi(path, count)
+end
+
+-- PNG のヘッダーから寸法を読む。**obj.load を呼ぶ前に大きさを知る唯一の手段**で、
+-- 読み込みそのものが破綻する大きさでも手前で弾ける。IHDR は PNG の先頭に必ず置かれ、
+-- 幅・高さは 17〜24 バイト目のビッグエンディアン 4 バイト。
+-- PNG 以外と、読めなかったファイルは nil を返し、読み込んだ後の判定に任せる
+local function png_size(path)
+  local head = read_head(path, 24)
+  if type(head) ~= "string" or #head < 24 then return nil end
+  local b1, b2, b3, b4 = head:byte(1, 4)
+  if b1 ~= 137 or b2 ~= 80 or b3 ~= 78 or b4 ~= 71 then return nil end
+  if head:sub(13, 16) ~= "IHDR" then return nil end
+  local function be32(i)
+    local a, b, c, d = head:byte(i, i + 3)
+    return ((a * 256 + b) * 256 + c) * 256 + d
+  end
+  return be32(17), be32(21)
+end
+
+local pw, ph = png_size(lut_file)
+if pw then
+  local why = reject_reason(pw, ph)
+  if why then
+    warn_once("pre:" .. pw .. "x" .. ph .. ":" .. lut_file,
+              string.format("[LUT適用] %dx%d の LUT画像は%s効果を適用しません: %s",
+                            pw, ph, why, lut_file))
+    return
+  end
+end
+
+-- === LUT を cache に置かない（v1.22） ===
+-- 大きい LUT（実測 4096x4096）は cache に置けない。ホストは
+-- `invalid buffer type. name=cache:lut_H/lut` を出してフレーム全体を黒くし、
+-- obj.copybuffer は false を返さない（v1.21 で戻り値を見たが検知できなかった。
+-- 実機 2026-09-23、LUT-21）。そこで**小さい元画像のほうを cache に置き**、
+-- LUT は読み込んだ object のまま resource に渡して、cache の元画像へ描く。
+-- 同じバッファを target と resource に渡すとホストが複製して渡す（lua.txt の obj.pixelshader）
+obj.copybuffer("cache:lut_H/src", "object")
+
+-- pcall は Lua のエラーしか捕まえない。**読み込み失敗は戻り値 false** で返る
+-- （lua.txt:388「戻り値: true=成功 / false=読み込み失敗」）ので両方を見る。
+-- 戻り値を捨てていた v1.10 までは、読めなかったときに素材そのものを LUT として
+-- 引いていた（無変化ではなく絵が壊れる）
+local called, result = pcall(obj.load, "image", lut_file)
+local loaded = called and result ~= false
+local lw, lh = 0, 0
+local reject = nil
+if loaded then
+  lw, lh = obj.w, obj.h
+  reject = reject_reason(lw, lh)
+end
+
+-- 1セルの1辺（ピクセル）。どちらの配置でも画像は n^3 x n^3 の正方形なので
+-- lw / n = n^2 = 階調数 L になる。格子サイズを間違えるとここがズレて絵が破綻する
+local cell_px = math.floor(lw / n)
+local usable = loaded and reject == nil and lw == lh and cell_px >= 2
+
+if usable then
+  -- t0 = 元画像（cache）/ t1 = LUT（object）。並びは v1.21 までと同じなのでシェーダーは変えない
+  obj.pixelshader("ps_hald_lut", "cache:lut_H/src", {"cache:lut_H/src", "object"}, {
+    lw, lh, intensity / 100, n, cell_px, layout,
+  }, "copy", "clamp")
+end
+
+-- どの経路でも最後に cache から object へ戻す（適用したなら結果、しなければ元画像）
+obj.copybuffer("object", "cache:lut_H/src")
+
+if not loaded then
+  warn_once("load:" .. lut_file,
+            "[LUT適用] LUT画像を読み込めません: " .. lut_file)
+  return
+end
+if reject then
+  warn_once("post:" .. lw .. "x" .. lh .. ":" .. lut_file,
+            string.format("[LUT適用] %dx%d の LUT画像は%s効果を適用しません: %s",
+                          lw, lh, reject, lut_file))
+  return
+end

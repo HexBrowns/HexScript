@@ -1,0 +1,501 @@
+--[[
+ローポリ化.anm2 v3.10
+
+  通常 : ジッター格子 → Bowyer-Watson Delaunay → cbuffer バッチで HLSL 塗り。
+         メッシュは EffectUtils_Lowpoly 側でメモ化されるので、アニメ OFF なら再計算は初回のみ。
+  高速 : 三角形分割も色決定も HLSL 内で完結する 1 パス版。
+         セルごとに対角の向きをハッシュで振るので、格子固定対角のような縞バイアスは出ない。
+
+どちらも drawpoly / obj.getpixeldata を使わない（後続フィルタを維持し、VRAM 読み戻しを避ける）。
+
+v3.10 で乱数を作り直した（ローポリ背景 v3.10 と同じ）。「通常」は共有モジュールの
+EffectUtils_Lowpoly.hash21 が等差数列だったのを PCG に替えた影響を受ける。「高速」の hash21f は
+シードが大きいと float32 で潰れて、メッシュが規則格子に戻り色のばらつきも消えていた。
+**どちらもメッシュと色のばらつきが v3.01 から変わる（シード 0 でも変わる）。**
+
+※このコメント内で行頭に @ を置かないこと。ホストはブロックコメントの中も走査し、
+  行頭 @ をセクション区切りとして扱うため、偽のスクリプトがエフェクト一覧に並ぶ。
+]]
+
+@通常
+--information:通常@ローポリ化 v3.11 by HexBrowns
+--label:HexScript
+--filter
+
+--check@keep_silhouette:シルエット維持,1
+
+--group:メッシュの設定
+--track@cell_size:セルサイズ,10,500,50,1
+--track@jitter:揺らぎ,0,100,30,0.1
+--track@seed:シード,-9999,9999,0,1
+--separator:※CPU分割のためセルは点数上限で自動的に粗くなります
+--group
+
+--group:色調整,0
+--track@hue_var:色相変化(±度),0,60,0,1
+--track@sat_var:彩度変化(±%),0,100,0,1
+--track@val_var:明度変化(±%),0,100,0,1
+--group
+
+--group:アニメ,0
+--check@animate:メッシュ,0
+--check@anim_hue:色相,0
+--check@anim_val:明度,0
+--track@loop_count:ループ回数,1,64,1,1
+--group
+
+--group:エッジ,0
+--check@show_edges:エッジ表示,0
+--track@edge_width:エッジ幅,0.5,5,1,0.1
+--hide@edge_width:show_edges==0
+--color@edge_color:エッジ色,0x000000
+--hide@edge_color:show_edges==0
+--group
+
+--[[pixelshader@ps_lp_fill:
+// 1 パス 256 三角形。Lua 側 EffectUtils_Lowpoly.BATCH_SIZE と必ず一致させること。
+cbuffer Params : register(b0) {
+    float4 meta;      // w, h, tri_count, show_edges
+    float4 edge;      // r, g, b, edge_width
+    float4 opt;       // has_hsv, 0, 0, 0
+    float4 tri[768];  // 256 tris * 3 float4
+};
+
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+
+float sign2d(float2 p1, float2 p2, float2 p3) {
+    return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+}
+
+bool point_in_tri(float2 pt, float2 v0, float2 v1, float2 v2) {
+    float d1 = sign2d(pt, v0, v1);
+    float d2 = sign2d(pt, v1, v2);
+    float d3 = sign2d(pt, v2, v0);
+    bool has_neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    bool has_pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    return !(has_neg && has_pos);
+}
+
+float dist_seg(float2 p, float2 a, float2 b) {
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float denom = dot(ba, ba);
+    float h = (denom > 1e-8) ? saturate(dot(pa, ba) / denom) : 0.0;
+    return length(pa - ba * h);
+}
+
+// 分岐なしの HSV 変換。strict モードでは条件分岐入りヘルパーが X4000 を誘発するため。
+float3 rgb_to_hsv(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = lerp(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+    float4 q = lerp(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * d + 1e-10)), d / (q.x + 1e-10), q.x);
+}
+
+float3 hsv_to_rgb(float3 c) {
+    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+}
+
+// 元画像を 1 点サンプルしてアルファ加重で累積する。
+// 旧版は obj.getpixeldata で全画素を CPU へ読み戻していたが、
+// VRAM 読み戻しは HLSL より遅いのでシェーダー側でサンプルする。
+void add_tap(float2 p, float2 inv, inout float3 acc, inout float asum, inout float wsum) {
+    float4 c = src.Sample(smp, p * inv);
+    float wt = (c.a > 0.01) ? c.a : 0.0;
+    float3 straight = (c.a > 1e-5) ? c.rgb / c.a : float3(0.0, 0.0, 0.0);
+    acc += straight * wt;
+    asum += c.a * wt;
+    wsum += wt;
+}
+
+float4 ps_lp_fill(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target {
+    float2 pos = sv_pos.xy;
+    int count = (int)meta.z;
+    float2 inv = float2(1.0 / max(meta.x, 1.0), 1.0 / max(meta.y, 1.0));
+
+    float2 v0 = float2(0.0, 0.0);
+    float2 v1 = float2(0.0, 0.0);
+    float2 v2 = float2(0.0, 0.0);
+    float3 hsv_off = float3(0.0, 0.0, 0.0);
+    bool found = false;
+
+    // 属する三角形を先に確定させてからサンプルする（タップを 1 三角形分に抑える）
+    [loop]
+    for (int i = 0; i < 256; i++) {
+        if (i >= count) break;
+        int base = i * 3;
+        float2 a = tri[base].xy;
+        float2 b = tri[base].zw;
+        float2 c = tri[base + 1].xy;
+        if (point_in_tri(pos, a, b, c)) {
+            v0 = a;
+            v1 = b;
+            v2 = c;
+            hsv_off = float3(tri[base + 1].z, tri[base + 1].w, tri[base + 2].x);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float2 cen = (v0 + v1 + v2) / 3.0;
+    float3 acc = float3(0.0, 0.0, 0.0);
+    float asum = 0.0;
+    float wsum = 0.0;
+    add_tap(cen, inv, acc, asum, wsum);
+    add_tap(cen * 0.4 + v0 * 0.6, inv, acc, asum, wsum);
+    add_tap(cen * 0.4 + v1 * 0.6, inv, acc, asum, wsum);
+    add_tap(cen * 0.4 + v2 * 0.6, inv, acc, asum, wsum);
+    add_tap((v0 + v1) * 0.5, inv, acc, asum, wsum);
+    add_tap((v1 + v2) * 0.5, inv, acc, asum, wsum);
+    add_tap((v2 + v0) * 0.5, inv, acc, asum, wsum);
+    if (wsum < 1e-6) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float3 rgb = saturate(acc / wsum);
+    float alpha = saturate(asum / wsum);
+
+    if (opt.x > 0.5) {
+        float3 hsv = rgb_to_hsv(rgb);
+        hsv.x = frac(hsv.x + hsv_off.x);
+        hsv.y = saturate(hsv.y + hsv_off.y);
+        hsv.z = saturate(hsv.z + hsv_off.z);
+        rgb = hsv_to_rgb(hsv);
+    }
+
+    if (meta.w > 0.5) {
+        float d = min(min(dist_seg(pos, v0, v1), dist_seg(pos, v1, v2)), dist_seg(pos, v2, v0));
+        float ea = 1.0 - smoothstep(edge.w * 0.5, edge.w * 0.5 + 1.0, d);
+        rgb = lerp(rgb, edge.rgb, ea);
+    }
+
+    return float4(rgb * alpha, alpha);
+}
+]]
+
+--[[pixelshader@ps_lp_silhouette:
+Texture2D filled : register(t0);
+Texture2D srcimg : register(t1);
+
+float4 ps_lp_silhouette(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target {
+    float4 f = filled.Load(int3(sv_pos.xy, 0));
+    float4 s = srcimg.Load(int3(sv_pos.xy, 0));
+    float a = s.a;
+    // 塗りが乗らなかった画素は元の色へ戻す。
+    // 旧版は無条件に黒 (0,0,0) を返していたため、シルエット境界に黒縁が出ていた。
+    float3 rgb = (s.a > 1e-5) ? s.rgb / s.a : float3(0.0, 0.0, 0.0);
+    if (f.a > 1e-5) {
+        rgb = f.rgb / f.a;
+    }
+    return float4(rgb * a, a);
+}
+]]
+
+local ok_lp, lp = pcall(require, "EffectUtils_Lowpoly")
+if not ok_lp or not lp then
+  return
+end
+
+local img_w, img_h = obj.w, obj.h
+if img_w < 1 or img_h < 1 then
+  return
+end
+
+local keep_sil = lp.as_bool(keep_silhouette, true)
+local is_edges = lp.as_bool(show_edges, false)
+
+-- ループ位相は全て loop_count 基準の整数周回なので、端が必ず繋がる
+local mesh_phase = lp.loop_phase(animate, loop_count, obj)
+local hue_phase = lp.loop_phase(anim_hue, loop_count, obj)
+local val_phase = lp.loop_phase(anim_val, loop_count, obj)
+
+local points, tris = lp.get_mesh(img_w, img_h, cell_size, jitter, seed, mesh_phase)
+if #tris < 1 then
+  return
+end
+
+local has_hsv = (hue_var > 0 or sat_var > 0 or val_var > 0 or hue_phase ~= 0) and 1 or 0
+local recs = lp.build_tri_records(points, tris, function(i)
+  if has_hsv == 0 then
+    return 0, 0, 0, 0
+  end
+  return lp.hsv_offsets(i, seed, hue_var, sat_var, val_var, hue_phase, val_phase)
+end)
+
+-- 色は塗りシェーダーが SRC_CACHE から直接サンプルする
+obj.copybuffer(lp.SRC_CACHE, "object")
+obj.clearbuffer("object", img_w, img_h)
+
+local er, eg, eb = lp.color_to_rgb01(edge_color)
+local batch = lp.BATCH_SIZE
+for start = 1, #recs, batch do
+  local consts = {
+    img_w, img_h, 0, is_edges and 1 or 0,
+    er, eg, eb, edge_width,
+    has_hsv, 0, 0, 0,
+  }
+  local n = lp.append_tri_batch(consts, recs, start, batch)
+  consts[3] = n
+  obj.pixelshader("ps_lp_fill", "object", lp.SRC_CACHE, consts, "draw", "clamp")
+end
+
+if keep_sil then
+  obj.pixelshader("ps_lp_silhouette", "object", { "object", lp.SRC_CACHE }, {})
+end
+
+@高速
+--information:高速@ローポリ化 v3.11 by HexBrowns
+--label:HexScript
+--filter
+
+--check@keep_silhouette:シルエット維持,1
+
+--group:メッシュの設定
+--track@cell_size:セルサイズ,10,500,50,1
+--track@jitter:揺らぎ,0,100,30,0.1
+--track@seed:シード,-9999,9999,0,1
+--group
+
+--group:色調整,0
+--track@hue_var:色相変化(±度),0,60,0,1
+--track@sat_var:彩度変化(±%),0,100,0,1
+--track@val_var:明度変化(±%),0,100,0,1
+--group
+
+--group:アニメ,0
+--check@animate:メッシュ,0
+--check@anim_hue:色相,0
+--check@anim_val:明度,0
+--track@loop_count:ループ回数,1,64,1,1
+--group
+
+--group:エッジ,0
+--check@show_edges:エッジ表示,0
+--track@edge_width:エッジ幅,0.5,5,1,0.1
+--hide@edge_width:show_edges==0
+--color@edge_color:エッジ色,0x000000
+--hide@edge_color:show_edges==0
+--group
+
+--[[pixelshader@ps_lp_grid:
+cbuffer Params : register(b0) {
+    float4 size;    // w, h, step_x, step_y
+    float4 grid;    // nx, ny, max_jit, seed
+    float4 anim;    // cos(mesh_phase), sin(mesh_phase), has_hsv, keep_silhouette
+    float4 vari;    // hue_phase/2pi, hue_var/360, sat_var/100, val_var/100
+    float4 opt;     // cos(val_phase), show_edges, edge_width, 0
+    float4 edgec;   // r, g, b, 0
+};
+
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+
+// 正本: @通常 の ps_lp_fill（セクションをまたいでヘルパーは共有できないので複製。直すときは両方直す）
+float sign2d(float2 p1, float2 p2, float2 p3) {
+    return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+}
+
+bool point_in_tri(float2 pt, float2 v0, float2 v1, float2 v2) {
+    float d1 = sign2d(pt, v0, v1);
+    float d2 = sign2d(pt, v1, v2);
+    float d3 = sign2d(pt, v2, v0);
+    bool has_neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    bool has_pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    return !(has_neg && has_pos);
+}
+
+float dist_seg(float2 p, float2 a, float2 b) {
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float denom = dot(ba, ba);
+    float h = (denom > 1e-8) ? saturate(dot(pa, ba) / denom) : 0.0;
+    return length(pa - ba * h);
+}
+
+float3 rgb_to_hsv(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = lerp(float4(c.bg, K.wz), float4(c.gb, K.xy), step(c.b, c.g));
+    float4 q = lerp(float4(p.xyw, c.r), float4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * d + 1e-10)), d / (q.x + 1e-10), q.x);
+}
+
+float3 hsv_to_rgb(float3 c) {
+    float4 K = float4(1.0, 2.0 / 3.0, 1.0 / 3.0, 3.0);
+    float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
+}
+
+// シードは frac で [0,1) に畳んでから混ぜる（v3.10。@ローポリ背景 v3.10 と同じ直し方）。
+// 生の s を dot の中へ足すと p3 が s に比例して膨らみ、(p3.x+p3.y)*p3.z が float32 の
+// 整数刻み（2^24 以上は刻み 1 以上）に入って frac() が 0 へ潰れる。実測（float32 の写し）:
+// シード 9999 で相異なる値が 2000 件中 4 件、メッシュが規則格子に戻り色のばらつきも消えていた。
+// 呼び出しは s = seed / +7 / +91 / +100 / +200 / +300 の 6 通りで、s = 0 のときだけ従来と一致する。
+// シード 0 でも他の経路は値が変わるので、絵は変わる。
+// 追跡: AI/scripts/ローポリ/issues/20260923_lowpoly_ize_fast_hash_collapses.md
+// 元の形: Dave Hoskins "Hash without Sine" (MIT, Copyright (c) 2014 David Hoskins) https://www.shadertoy.com/view/4djSRW
+float hash21f(float2 p, float s) {
+    float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031 + frac(s * 0.1031));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+// 格子点。外周は固定し、内側はハッシュで振ったオフセットを phase で回転させる
+// （回転なので点が円軌道を描き、ループ端が連続する）。
+float2 mesh_point(int ix, int iy) {
+    float2 base = float2(ix * size.z, iy * size.w);
+    bool border = (ix <= 0) || (iy <= 0) || (ix >= (int)grid.x - 1) || (iy >= (int)grid.y - 1);
+    float2 fp = float2(ix, iy);
+    float ox = (hash21f(fp, grid.w) - 0.5) * 2.0;
+    float oy = (hash21f(fp, grid.w + 91.0) - 0.5) * 2.0;
+    float2 rot = float2(ox * anim.x - oy * anim.y, ox * anim.y + oy * anim.x);
+    float2 p = base + (border ? float2(0.0, 0.0) : rot * grid.z);
+    return clamp(p, float2(0.0, 0.0), float2(size.x, size.y));
+}
+
+void add_tap(float2 p, float2 inv, inout float3 acc, inout float asum, inout float wsum) {
+    float4 c = src.Sample(smp, p * inv);
+    float wt = (c.a > 0.01) ? c.a : 0.0;
+    float3 straight = (c.a > 1e-5) ? c.rgb / c.a : float3(0.0, 0.0, 0.0);
+    acc += straight * wt;
+    asum += c.a * wt;
+    wsum += wt;
+}
+
+float4 ps_lp_grid(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target {
+    float2 pos = sv_pos.xy;
+    int nx = (int)grid.x;
+    int ny = (int)grid.y;
+    int cx0 = clamp((int)floor(pos.x / max(size.z, 1e-4)), 0, nx - 2);
+    int cy0 = clamp((int)floor(pos.y / max(size.w, 1e-4)), 0, ny - 2);
+
+    float2 v0 = float2(0.0, 0.0);
+    float2 v1 = float2(0.0, 0.0);
+    float2 v2 = float2(0.0, 0.0);
+    float tri_id = 0.0;
+    bool found = false;
+
+    // ジッターは 0.45*step までなので、属する三角形は基準セルの 3x3 近傍に必ず入る
+    [loop]
+    for (int dy = -1; dy <= 1; dy++) {
+        [loop]
+        for (int dx = -1; dx <= 1; dx++) {
+            int cx = cx0 + dx;
+            int cy = cy0 + dy;
+            if (found || cx < 0 || cy < 0 || cx > nx - 2 || cy > ny - 2) continue;
+
+            float2 p00 = mesh_point(cx, cy);
+            float2 p10 = mesh_point(cx + 1, cy);
+            float2 p01 = mesh_point(cx, cy + 1);
+            float2 p11 = mesh_point(cx + 1, cy + 1);
+            // 対角の向きをセルごとに振る（固定対角だと格子状の縞バイアスが出る）
+            bool diag = hash21f(float2(cx, cy), grid.w + 7.0) < 0.5;
+            float2 ta2 = diag ? p11 : p01;
+            float2 tb0 = diag ? p00 : p10;
+            float cell_id = (float)(cy * nx + cx) * 2.0;
+
+            if (point_in_tri(pos, p00, p10, ta2)) {
+                v0 = p00; v1 = p10; v2 = ta2;
+                tri_id = cell_id;
+                found = true;
+            } else if (point_in_tri(pos, tb0, p11, p01)) {
+                v0 = tb0; v1 = p11; v2 = p01;
+                tri_id = cell_id + 1.0;
+                found = true;
+            }
+        }
+    }
+    if (!found) {
+        // 数値誤差で取りこぼした場合の保険。基準セルの片側を使って穴を作らない
+        v0 = mesh_point(cx0, cy0);
+        v1 = mesh_point(cx0 + 1, cy0);
+        v2 = mesh_point(cx0 + 1, cy0 + 1);
+        tri_id = (float)(cy0 * nx + cx0) * 2.0;
+    }
+
+    float2 inv = float2(1.0 / max(size.x, 1.0), 1.0 / max(size.y, 1.0));
+    float2 cen = (v0 + v1 + v2) / 3.0;
+    float3 acc = float3(0.0, 0.0, 0.0);
+    float asum = 0.0;
+    float wsum = 0.0;
+    add_tap(cen, inv, acc, asum, wsum);
+    add_tap(cen * 0.4 + v0 * 0.6, inv, acc, asum, wsum);
+    add_tap(cen * 0.4 + v1 * 0.6, inv, acc, asum, wsum);
+    add_tap(cen * 0.4 + v2 * 0.6, inv, acc, asum, wsum);
+    add_tap((v0 + v1) * 0.5, inv, acc, asum, wsum);
+    add_tap((v1 + v2) * 0.5, inv, acc, asum, wsum);
+    add_tap((v2 + v0) * 0.5, inv, acc, asum, wsum);
+    if (wsum < 1e-6) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    float3 rgb = saturate(acc / wsum);
+    float alpha = saturate(asum / wsum);
+
+    if (anim.z > 0.5) {
+        float hue_off = (hash21f(float2(tri_id, 1.0), grid.w + 100.0) - 0.5) * 2.0 * vari.y + vari.x;
+        float sat_off = (hash21f(float2(tri_id, 2.0), grid.w + 200.0) - 0.5) * 2.0 * vari.z;
+        float val_off = (hash21f(float2(tri_id, 3.0), grid.w + 300.0) - 0.5) * 2.0 * vari.w * opt.x;
+        float3 hsv = rgb_to_hsv(rgb);
+        hsv.x = frac(hsv.x + hue_off);
+        hsv.y = saturate(hsv.y + sat_off);
+        hsv.z = saturate(hsv.z + val_off);
+        rgb = hsv_to_rgb(hsv);
+    }
+
+    if (opt.y > 0.5) {
+        float d = min(min(dist_seg(pos, v0, v1), dist_seg(pos, v1, v2)), dist_seg(pos, v2, v0));
+        float ea = 1.0 - smoothstep(opt.z * 0.5, opt.z * 0.5 + 1.0, d);
+        rgb = lerp(rgb, edgec.rgb, ea);
+    }
+
+    // シルエット維持 ON なら元画像のアルファをそのまま使う（1 パスで完結する）
+    if (anim.w > 0.5) {
+        alpha = src.Sample(smp, pos * inv).a;
+    }
+    return float4(rgb * alpha, alpha);
+}
+]]
+
+local ok_lp, lp = pcall(require, "EffectUtils_Lowpoly")
+if not ok_lp or not lp then
+  return
+end
+
+local img_w, img_h = obj.w, obj.h
+if img_w < 1 or img_h < 1 then
+  return
+end
+
+local keep_sil = lp.as_bool(keep_silhouette, true)
+local is_edges = lp.as_bool(show_edges, false)
+
+local mesh_phase = lp.loop_phase(animate, loop_count, obj)
+local hue_phase = lp.loop_phase(anim_hue, loop_count, obj)
+local val_phase = lp.loop_phase(anim_val, loop_count, obj)
+
+-- CPU 側は点を持たないので点数上限は掛けない（セルサイズのスライダーが全域そのまま効く）
+local nx, ny, step_x, step_y, max_jit = lp.grid_params(img_w, img_h, cell_size, jitter, false)
+
+local has_hsv = (hue_var > 0 or sat_var > 0 or val_var > 0 or hue_phase ~= 0) and 1 or 0
+local er, eg, eb = lp.color_to_rgb01(edge_color)
+local val_scale = (val_phase ~= 0) and math.cos(val_phase) or 1
+
+local consts = {
+  img_w, img_h, step_x, step_y,
+  nx, ny, max_jit, seed,
+  math.cos(mesh_phase), math.sin(mesh_phase), has_hsv, keep_sil and 1 or 0,
+  hue_phase / (math.pi * 2), hue_var / 360, sat_var / 100, val_var / 100,
+  val_scale, is_edges and 1 or 0, edge_width, 0,
+  er, eg, eb, 0,
+}
+
+obj.copybuffer(lp.SRC_CACHE, "object")
+obj.pixelshader("ps_lp_grid", "object", lp.SRC_CACHE, consts, "copy", "clamp")

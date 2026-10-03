@@ -1,0 +1,735 @@
+--[[
+ShapeDistort_H.anm2 v1.04
+
+図形変形フィルタ 4 種（回転 / 放射 / 方向 / ジグザグ）を HLSL 1 パスで実装したもの。
+
+成り立ち
+  - ShapeDistort.anm2（HLSL・モード切替式）と @ShapeDistort.anm2（ZigzagModule.mod2 依存の
+    CPU 処理）の 2 系統が併存していたため、機能を統合して GPU 実装に一本化した
+  - @ShapeDistort.anm2 は obj.getpixeldata / putpixeldata で全画素を CPU へ読み戻していた。
+    VRAM 読み戻しは HLSL より遅いので、変位計算をシェーダー側へ移した
+  - ZigzagModule.mod2 への依存が無くなった
+
+旧 2 本から引き継いだもの
+  - ShapeDistort.anm2 から: 中心X/Y、背景を合成、サイズの自動補正
+  - @ShapeDistort.anm2 から: ランダム割合 / ランダムシード / ラップ / ジグザグ
+
+絵は旧 2 本のどちらとも一致しない。ZigzagModule.mod2 はソースが無く内部実装を追えないため、
+ランダム・ラップ・ジグザグは同じパラメータ名で作り直したもの。旧版から乗り換える場合は
+見た目を調整し直すこと。
+
+作者: HexBrowns。旧 2 本（--author:Gemini）も HexBrowns が Gemini に指示して書かせたもの。
+sd_hash は Dave Hoskins「Hash without Sine」（MIT, Copyright (c) 2014 David Hoskins,
+https://www.shadertoy.com/view/4djSRW）の hash12 と同じ形。
+
+v1.01（2026-09-27）
+  - 縦横比の補正の向きを直した（4 セクション共通）。v1.00 は横の効き方が (幅/高さ)^2 倍ずれ、
+    回転・放射の範囲が横長の楕円になっていた。正方形の素材では v1.00 と同じ絵になる
+  - 放射の「サイズの自動補正」が絵を拡大していたのを、縮める向きに直した
+  - 旧 2 本から引き継いだ誤り。検証器: AI/scripts/ShapeDistort_H/verify_aspect.py
+
+v1.02（2026-09-27）
+  - ラップ OFF のとき、外へずれた画素がオブジェクトの外枠で切れていたのを、領域を広げて外まで描くようにした
+    （4 セクション共通）。ラップ ON（既定）とフィルタオブジェクトでは広げない（絵は v1.01 と同じ）。
+    検証器: AI/scripts/ShapeDistort_H/verify_outer_spread.py
+
+v1.03（2026-09-27）
+  - ラップ OFF のとき、元の画像の範囲の中でも、範囲の外を読んだ画素を透明にした（4 セクション共通）。
+    v1.02 までは中だけ端の画素で埋めていて、中身が内側へずれて空くはずの所が埋まり、
+    元の輪郭がまっすぐ残った（縦横に同時に歪んで見えなかった）。広げていないとき（大きすぎて打ち切った等）も同じ
+  - 「背景を合成」の既定値を OFF にした（ON は歪める前の画像を下に重ねるので、元の輪郭が透けて見える）。
+    保存済みのプロジェクトは保存値のまま読まれる
+  - ラップ ON は sampler "loop"、フィルタオブジェクトのラップ OFF は "clamp" を渡すようにした。v1.02 までは sampler を
+    省いていて、範囲外を透明として補間するため、ちょうど端を読んだ画素が半透明になっていた（ラップ ON の継ぎ目の線、
+    フィルタオブジェクトの画面の端の暗い帯）。背景を合成 ON（v1.02 までの既定）では下の画像で隠れていた
+
+v1.04（2026-09-27、ジグザグだけ）
+  - 横のずれと縦のずれを、元の位置から同時に足すのをやめ、順に重ねる（1 つ目でずらした位置で 2 つ目のずれを決める）。
+    同時に足す写し方は、ずれが波の間隔に対して大きいと画像が折り返し、四隅がちぎれた破片になっていた
+    （正方形・リッジ数 8 なら量 10 前後から）。順に重ねると、行や列を滑らせるだけの写しを 2 回重ねるので裂けない
+    （方向を角度 0 と 90 で 2 回掛けたのと同じ仕組み。ずれの大きさと波の間隔は元の画像で数える）
+  - 「重ねる順」（横→縦 / 縦→横）を足した。順番で絵が変わる
+
+※このコメント内で行頭に @ を置かないこと。ホストはブロックコメントの中も走査し、
+  行頭 @ をセクション区切りとして扱うため、偽のスクリプトがエフェクト一覧に並ぶ。
+]]
+
+@回転
+--information:回転@ShapeDistort_H v1.03 by HexBrowns
+--label:HexScript
+--filter
+
+--group:変形
+--track@amount:ねじれ角,-720,720,90,1
+--track@extra:半径,1,2000,300,1
+--track@ridges:リッジ数,0,50,0,1
+--select@wave:波形=0,正弦波=0,三角波=1
+--group
+
+--group:中心
+--track@center_x:中心X,-4000,4000,0,0.1
+--track@center_y:中心Y,-4000,4000,0,0.1
+--trackgroup@center_x,center_y:中心
+--group
+
+--group:ゆらぎ,0
+--track@randomness:ランダム割合,0,100,0,0.1
+--track@random_seed:ランダムシード,0,10000,0,1
+--group
+
+--group:表示,0
+--check@wrap:ラップ,1
+--check@compose_bg:背景を合成,0
+--group
+
+--[[pixelshader@ps_sd_swirl:
+cbuffer P : register(b0) {
+    float2 center;       // 0-1  uv 座標での中心（元の画像の uv）
+    float2 resolution;   // 2-3  元の画像の大きさ
+    float amount;        // 4    ねじれ角（度）
+    float ridges;        // 5
+    float wave_shape;    // 6    0=正弦波 1=三角波
+    float randomness;    // 7    0-1
+    float random_seed;   // 8
+    float wrap_mode;     // 9
+    float compose_bg;    // 10
+    float extra;         // 11   半径（ピクセル）
+    float2 pad;          // 12-13 広げた画像の中の、元の画像の左上（px）。広げていなければ 0
+    float2 buf_size;     // 14-15 広げた画像の大きさ
+    float clip_out;      // 16   1 = 元の画像の外を透明として読む（通常のオブジェクトでラップ OFF）
+};
+
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+
+float sd_hash(float2 p) {
+    p = frac(p * float2(443.897, 441.423));
+    p += dot(p, p.yx + 19.19);
+    return frac((p.x + p.y) * p.x);
+}
+
+// 0=正弦波 / 1=三角波 を連続的に混ぜる
+float sd_wave(float x, float shape) {
+    float s = sin(x * 6.28318530718);
+    float t = abs(frac(x) * 2.0 - 1.0) * 2.0 - 1.0;
+    return lerp(s, t, saturate(shape));
+}
+
+// リッジごとに振幅を散らす
+float sd_jitter(float x, float rnd, float seed) {
+    float r = sd_hash(float2(floor(x), seed));
+    return lerp(1.0, r * 2.0, saturate(rnd));
+}
+
+float4 ps_sd_swirl(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    // v1.02: 広げた画像では uv を元の画像の uv に直してから計算する（中心・半径・模様は元の画像で数える）。
+    // 広げていなければ（pad = 0）v1.01 と同じ式を通る
+    // v1.03: clip_out なら、元の画像の外を読んだ画素は中でも外でも透明（sampler "clip"）。
+    // v1.02 は中だけ端の画素で埋めていて、内側へずれて空く所が埋まり、元の輪郭がまっすぐ残った
+    float2 buf_uv = uv;
+    bool expanded = (pad.x + pad.y) > 0.0;
+    if (expanded) {
+        uv = (buf_uv * buf_size - pad) / resolution;
+    }
+
+    // 縦横比: uv を「高さ = 1」の等方な空間へ直す係数（横の uv に 幅/高さ を掛ける）。
+    // v1.00 は 高さ/幅 を掛けていて、横の効き方が (幅/高さ)^2 倍ずれていた（1920x1080 で約 3.2 倍）。
+    // 変位を uv に戻すときは同じ係数で割る（offset.x /= aspect）
+    float aspect = resolution.x / max(resolution.y, 1.0);
+    float2 d = uv - center;
+    d.x *= aspect;
+    float dist = length(d);
+
+    // 半径はピクセル指定。縦解像度基準で uv 空間へ直す
+    float r_uv = max(extra / max(resolution.y, 1.0), 1e-5);
+    float falloff = saturate(1.0 - dist / r_uv);
+    float twist = radians(amount) * falloff * falloff;
+
+    if (ridges > 0.5) {
+        float phase = dist / r_uv * ridges;
+        twist *= sd_wave(phase, wave_shape) * sd_jitter(phase, randomness, random_seed);
+    }
+
+    float sn = sin(twist);
+    float cs = cos(twist);
+    float2 rot = float2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+    float2 offset = rot - d;
+    offset.x /= max(aspect, 1e-5);
+
+    float2 suv = uv + offset;
+    if (wrap_mode > 0.5) {
+        suv = frac(suv);
+    } else if (clip_out < 0.5) {
+        suv = saturate(suv);
+    }
+    // 広げた画像の uv へ戻す
+    float2 tuv = expanded ? (suv * resolution + pad) / buf_size : suv;
+
+    float4 fg = tex.Sample(smp, tuv);
+    if (compose_bg > 0.5) {
+        // 内部フォーマットは Premultiplied Alpha。over 合成は fg + bg*(1-fg.a)。
+        // 旧版は lerp(bg, fg, fg.a) としており、乗算済みの fg にさらに α を掛けていた。
+        float4 bg = tex.Sample(smp, buf_uv);
+        return fg + bg * (1.0 - fg.a);
+    }
+    return fg;
+}
+]]
+
+-- v1.02: ラップ OFF のとき、外へずれた画素が外枠で切れないように領域を広げる
+--   正本。@放射 / @方向 / @ジグザグ の expand は同じ複製（変更時は 4 つとも直す）
+--   - ラップ ON はずれた画素が反対側から戻るので外へ出ない。広げない（v1.01 と同じ絵）
+--   - フィルタオブジェクトは大きさを変えられないので広げない（ルール au2-filter-object）
+--   - 上下・左右をそれぞれ同じだけ広げる（元の画像は同じ位置に残り、中心はずれない）
+--   - 広げた画像は image_max に収め、総ドット数を SIZE_BUDGET 以下に抑える（重さの上限）
+--   - シェーダーには元の大きさと元の画像の左上（pad）を渡す。中心・半径・模様は元の画像で数える
+local PAD_MARGIN = 2
+local SIZE_BUDGET = 15000000
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+-- 広げる量を決めて領域拡張まで行い、広げた量を返す（広げなければ 0, 0）
+local function expand(want_x, want_y, w, h)
+  if is_filter or wrap == 1 then return 0, 0 end
+  want_x = (want_x > 0) and (math.ceil(want_x) + PAD_MARGIN) or 0
+  want_y = (want_y > 0) and (math.ceil(want_y) + PAD_MARGIN) or 0
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  local sx, sy = 0, 0
+  for k = 64, 0, -1 do
+    sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if (w + 2 * sx) * (h + 2 * sy) <= SIZE_BUDGET then break end
+    sx, sy = 0, 0
+  end
+  if sx > 0 or sy > 0 then
+    obj.effect("領域拡張", "上", sy, "下", sy, "左", sx, "右", sx, "塗りつぶし", 0)
+  end
+  return sx, sy
+end
+
+local W0, H0 = obj.w, obj.h
+-- 中心（元の画像の左上から px）。回転は中心からの距離を変えず、効くのは半径の内側だけなので、
+-- 外へ出るのは中心から min(半径, 最も遠い角までの距離) の円の中まで
+local cx, cy = W0 / 2 + center_x, H0 / 2 + center_y
+local far = math.max(math.sqrt(cx * cx + cy * cy), math.sqrt((W0 - cx) ^ 2 + cy * cy),
+                     math.sqrt(cx * cx + (H0 - cy) ^ 2), math.sqrt((W0 - cx) ^ 2 + (H0 - cy) ^ 2))
+local reach = (amount ~= 0) and math.min(extra, far) or 0
+local pad_x, pad_y = expand(math.max(reach - cx, cx + reach - W0, 0),
+                            math.max(reach - cy, cy + reach - H0, 0), W0, H0)
+
+-- 通常のオブジェクトでラップ OFF なら、広げていなくても元の画像の外は透明として読む（v1.03）
+if not is_filter and wrap ~= 1 then
+  obj.pixelshader("ps_sd_swirl", "object", "object", {
+    0.5 + center_x / math.max(W0, 1), 0.5 + center_y / math.max(H0, 1),
+    W0, H0,
+    amount, ridges, wave, randomness / 100,
+    random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, extra,
+    pad_x, pad_y, obj.w, obj.h, 1,
+  }, "copy", "clip")
+else
+  -- 端を読む経路は sampler を明示する（v1.03）。省くと範囲外を透明として補間し、
+  -- ちょうど端（uv 0 / 1）を読んだ画素が半透明になる（ラップ ON の継ぎ目・フィルタオブジェクトの画面の端）
+  obj.pixelshader("ps_sd_swirl", "object", "object", {
+    0.5 + center_x / math.max(W0, 1), 0.5 + center_y / math.max(H0, 1),
+    W0, H0,
+    amount, ridges, wave, randomness / 100,
+    random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, extra,
+    0, 0, obj.w, obj.h, 0,
+  }, "copy", (wrap == 1) and "loop" or "clamp")
+end
+
+@放射
+--information:放射@ShapeDistort_H v1.03 by HexBrowns
+--label:HexScript
+--filter
+
+--group:変形
+--track@amount:量,-200,200,20,0.1
+--track@ridges:放射リッジ数,1,50,8,1
+--select@wave:波形=0,正弦波=0,三角波=1
+--group
+
+--group:中心
+--track@center_x:中心X,-4000,4000,0,0.1
+--track@center_y:中心Y,-4000,4000,0,0.1
+--trackgroup@center_x,center_y:中心
+--check@extra:サイズの自動補正,1
+--group
+
+--group:ゆらぎ,0
+--track@randomness:ランダム割合,0,100,0,0.1
+--track@random_seed:ランダムシード,0,10000,0,1
+--group
+
+--group:表示,0
+--check@wrap:ラップ,1
+--check@compose_bg:背景を合成,0
+--group
+
+--[[pixelshader@ps_sd_radial:
+cbuffer P : register(b0) {
+    float2 center;       // 0-1
+    float2 resolution;   // 2-3
+    float amount;        // 4
+    float ridges;        // 5
+    float wave_shape;    // 6
+    float randomness;    // 7
+    float random_seed;   // 8
+    float wrap_mode;     // 9
+    float compose_bg;    // 10
+    float extra;         // 11  サイズの自動補正 ON/OFF
+    float2 pad;          // 12-13
+    float2 buf_size;     // 14-15
+    float clip_out;      // 16
+};
+
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+
+// 正本: @回転 の ps_sd_swirl（セクションをまたいでヘルパーは共有できないので複製。直すときは全部直す）
+float sd_hash(float2 p) {
+    p = frac(p * float2(443.897, 441.423));
+    p += dot(p, p.yx + 19.19);
+    return frac((p.x + p.y) * p.x);
+}
+
+float sd_wave(float x, float shape) {
+    float s = sin(x * 6.28318530718);
+    float t = abs(frac(x) * 2.0 - 1.0) * 2.0 - 1.0;
+    return lerp(s, t, saturate(shape));
+}
+
+float sd_jitter(float x, float rnd, float seed) {
+    float r = sd_hash(float2(floor(x), seed));
+    return lerp(1.0, r * 2.0, saturate(rnd));
+}
+
+float4 ps_sd_radial(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    // 広げた画像の扱いは正本 @回転 の ps_sd_swirl の説明
+    float2 buf_uv = uv;
+    bool expanded = (pad.x + pad.y) > 0.0;
+    if (expanded) {
+        uv = (buf_uv * buf_size - pad) / resolution;
+    }
+
+    // 縦横比: 横の uv に 幅/高さ を掛けて等方な空間へ直す（正本 @回転 の ps_sd_swirl の説明）
+    float aspect = resolution.x / max(resolution.y, 1.0);
+
+    // 変位で画像がはみ出す分を先に縮めておく（旧 ShapeDistort の「サイズの自動補正」）。
+    // 読み取り位置を中心から遠ざけると絵が縮む。v1.00 は中心へ寄せていて、絵が拡大していた
+    float2 base_uv = uv;
+    if (extra > 0.5) {
+        float expand = 1.0 + abs(amount) * 0.002;
+        base_uv = (uv - center) * expand + center;
+    }
+
+    float2 d = base_uv - center;
+    d.x *= aspect;
+    float dist = length(d);
+    float ang = atan2(d.y, d.x);
+
+    float phase = (ang / 6.28318530718 + 0.5) * ridges;
+    float w = sd_wave(phase, wave_shape) * sd_jitter(phase, randomness, random_seed);
+
+    float2 dir = (dist > 1e-5) ? (d / dist) : float2(0.0, 0.0);
+    float2 offset = dir * w * dist * (amount / 200.0);
+    offset.x /= max(aspect, 1e-5);
+
+    float2 suv = base_uv + offset;
+    if (wrap_mode > 0.5) {
+        suv = frac(suv);
+    } else if (clip_out < 0.5) {
+        suv = saturate(suv);
+    }
+    float2 tuv = expanded ? (suv * resolution + pad) / buf_size : suv;
+
+    float4 fg = tex.Sample(smp, tuv);
+    if (compose_bg > 0.5) {
+        float4 bg = tex.Sample(smp, buf_uv);
+        return fg + bg * (1.0 - fg.a);
+    }
+    return fg;
+}
+]]
+
+-- 正本: @回転 の expand（同じ複製。変更時は 4 つとも直す）
+local PAD_MARGIN = 2
+local SIZE_BUDGET = 15000000
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+-- 広げる量を決めて領域拡張まで行い、広げた量を返す（広げなければ 0, 0）
+local function expand(want_x, want_y, w, h)
+  if is_filter or wrap == 1 then return 0, 0 end
+  want_x = (want_x > 0) and (math.ceil(want_x) + PAD_MARGIN) or 0
+  want_y = (want_y > 0) and (math.ceil(want_y) + PAD_MARGIN) or 0
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  local sx, sy = 0, 0
+  for k = 64, 0, -1 do
+    sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if (w + 2 * sx) * (h + 2 * sy) <= SIZE_BUDGET then break end
+    sx, sy = 0, 0
+  end
+  if sx > 0 or sy > 0 then
+    obj.effect("領域拡張", "上", sy, "下", sy, "左", sx, "右", sx, "塗りつぶし", 0)
+  end
+  return sx, sy
+end
+
+local W0, H0 = obj.w, obj.h
+-- 放射は中心からの向きを変えず、距離だけを倍率 g = 補正 x (1 + 波 x 量/200) で読む。
+-- 距離 r の画素は r / g の位置に出るので、|g| の最小 m で割った倍率まで広がる。
+-- 波（波形 x リッジごとの振れ）の絶対値は 1 + ランダム割合 未満。m が 0 以下なら向きが反転する画素もあるので、
+-- 点対称に写した側も含める。倍率は SCALE_MAX で打ち切る（量 150 付近から先はいちばん遠い所が切れる）
+local SCALE_MAX = 4
+local cx, cy = W0 / 2 + center_x, H0 / 2 + center_y
+local corr = (extra == 1) and (1 + math.abs(amount) * 0.002) or 1
+local m = 1 - (1 + randomness / 100) * math.abs(amount) / 200
+local scale = (m > 0) and math.min(1 / (corr * m), SCALE_MAX) or SCALE_MAX
+local want_x, want_y = 0, 0
+if amount ~= 0 and scale > 1 then
+  local l, r = cx - scale * cx, cx + scale * (W0 - cx)
+  local t, b = cy - scale * cy, cy + scale * (H0 - cy)
+  if m <= 0 then
+    l, r = math.min(l, cx - scale * (W0 - cx)), math.max(r, cx + scale * cx)
+    t, b = math.min(t, cy - scale * (H0 - cy)), math.max(b, cy + scale * cy)
+  end
+  want_x = math.max(-l, r - W0, 0)
+  want_y = math.max(-t, b - H0, 0)
+end
+local pad_x, pad_y = expand(want_x, want_y, W0, H0)
+
+-- 通常のオブジェクトでラップ OFF なら、広げていなくても元の画像の外は透明として読む（v1.03）
+if not is_filter and wrap ~= 1 then
+  obj.pixelshader("ps_sd_radial", "object", "object", {
+    0.5 + center_x / math.max(W0, 1), 0.5 + center_y / math.max(H0, 1),
+    W0, H0,
+    amount, ridges, wave, randomness / 100,
+    random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0,
+    (extra == 1) and 1 or 0,
+    pad_x, pad_y, obj.w, obj.h, 1,
+  }, "copy", "clip")
+else
+  -- 端を読む経路は sampler を明示する（v1.03）。省くと範囲外を透明として補間し、
+  -- ちょうど端（uv 0 / 1）を読んだ画素が半透明になる（ラップ ON の継ぎ目・フィルタオブジェクトの画面の端）
+  obj.pixelshader("ps_sd_radial", "object", "object", {
+    0.5 + center_x / math.max(W0, 1), 0.5 + center_y / math.max(H0, 1),
+    W0, H0,
+    amount, ridges, wave, randomness / 100,
+    random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0,
+    (extra == 1) and 1 or 0,
+    0, 0, obj.w, obj.h, 0,
+  }, "copy", (wrap == 1) and "loop" or "clamp")
+end
+
+@方向
+--information:方向@ShapeDistort_H v1.03 by HexBrowns
+--label:HexScript
+--filter
+
+--group:変形
+--track@amount:量,-200,200,15,0.1
+--track@ridges:リッジ数,1,50,8,1
+--track@extra:角度,0,360,0,1
+--select@wave:波形=0,正弦波=0,三角波=1
+--group
+
+--group:ゆらぎ,0
+--track@randomness:ランダム割合,0,100,0,0.1
+--track@random_seed:ランダムシード,0,10000,0,1
+--group
+
+--group:表示,0
+--check@wrap:ラップ,1
+--check@compose_bg:背景を合成,0
+--group
+
+--[[pixelshader@ps_sd_direction:
+cbuffer P : register(b0) {
+    float2 center;       // 0-1  未使用（レイアウトを 4 セクションで揃えている）
+    float2 resolution;   // 2-3
+    float amount;        // 4
+    float ridges;        // 5
+    float wave_shape;    // 6
+    float randomness;    // 7
+    float random_seed;   // 8
+    float wrap_mode;     // 9
+    float compose_bg;    // 10
+    float extra;         // 11  波の向き（度）
+    float2 pad;          // 12-13
+    float2 buf_size;     // 14-15
+    float clip_out;      // 16
+};
+
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+
+// 正本: @回転 の ps_sd_swirl
+float sd_hash(float2 p) {
+    p = frac(p * float2(443.897, 441.423));
+    p += dot(p, p.yx + 19.19);
+    return frac((p.x + p.y) * p.x);
+}
+
+float sd_wave(float x, float shape) {
+    float s = sin(x * 6.28318530718);
+    float t = abs(frac(x) * 2.0 - 1.0) * 2.0 - 1.0;
+    return lerp(s, t, saturate(shape));
+}
+
+float sd_jitter(float x, float rnd, float seed) {
+    float r = sd_hash(float2(floor(x), seed));
+    return lerp(1.0, r * 2.0, saturate(rnd));
+}
+
+float4 ps_sd_direction(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    // 広げた画像の扱いは正本 @回転 の ps_sd_swirl の説明
+    float2 buf_uv = uv;
+    bool expanded = (pad.x + pad.y) > 0.0;
+    if (expanded) {
+        uv = (buf_uv * buf_size - pad) / resolution;
+    }
+
+    // 縦横比: 横の uv に 幅/高さ を掛けて等方な空間へ直す（正本 @回転 の ps_sd_swirl の説明）
+    float aspect = resolution.x / max(resolution.y, 1.0);
+    float rad = radians(extra);
+    float2 dir = float2(cos(rad), sin(rad));
+    float2 perp = float2(-dir.y, dir.x);
+
+    // 波の向きに直交する軸で位相を取る＝dir 方向へ縞状に押し出す
+    float phase = dot(uv - 0.5, perp) * ridges;
+    float w = sd_wave(phase, wave_shape) * sd_jitter(phase, randomness, random_seed);
+
+    float2 offset = dir * w * (amount / 500.0);
+    offset.x /= max(aspect, 1e-5);
+
+    float2 suv = uv + offset;
+    if (wrap_mode > 0.5) {
+        suv = frac(suv);
+    } else if (clip_out < 0.5) {
+        suv = saturate(suv);
+    }
+    float2 tuv = expanded ? (suv * resolution + pad) / buf_size : suv;
+
+    float4 fg = tex.Sample(smp, tuv);
+    if (compose_bg > 0.5) {
+        float4 bg = tex.Sample(smp, buf_uv);
+        return fg + bg * (1.0 - fg.a);
+    }
+    return fg;
+}
+]]
+
+-- 正本: @回転 の expand（同じ複製。変更時は 4 つとも直す）
+local PAD_MARGIN = 2
+local SIZE_BUDGET = 15000000
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+-- 広げる量を決めて領域拡張まで行い、広げた量を返す（広げなければ 0, 0）
+local function expand(want_x, want_y, w, h)
+  if is_filter or wrap == 1 then return 0, 0 end
+  want_x = (want_x > 0) and (math.ceil(want_x) + PAD_MARGIN) or 0
+  want_y = (want_y > 0) and (math.ceil(want_y) + PAD_MARGIN) or 0
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  local sx, sy = 0, 0
+  for k = 64, 0, -1 do
+    sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if (w + 2 * sx) * (h + 2 * sy) <= SIZE_BUDGET then break end
+    sx, sy = 0, 0
+  end
+  if sx > 0 or sy > 0 then
+    obj.effect("領域拡張", "上", sy, "下", sy, "左", sx, "右", sx, "塗りつぶし", 0)
+  end
+  return sx, sy
+end
+
+local W0, H0 = obj.w, obj.h
+-- 変位は「角度」の向きに 波 x 量/500 x 高さ px（波の絶対値は 1 + ランダム割合 未満）。その成分だけ広げる
+local reach = (1 + randomness / 100) * math.abs(amount) / 500 * H0
+local rad = math.rad(extra)
+local pad_x, pad_y = expand(math.abs(math.cos(rad)) * reach, math.abs(math.sin(rad)) * reach, W0, H0)
+
+-- 通常のオブジェクトでラップ OFF なら、広げていなくても元の画像の外は透明として読む（v1.03）
+if not is_filter and wrap ~= 1 then
+  obj.pixelshader("ps_sd_direction", "object", "object", {
+    0.5, 0.5,
+    W0, H0,
+    amount, ridges, wave, randomness / 100,
+    random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, extra,
+    pad_x, pad_y, obj.w, obj.h, 1,
+  }, "copy", "clip")
+else
+  -- 端を読む経路は sampler を明示する（v1.03）。省くと範囲外を透明として補間し、
+  -- ちょうど端（uv 0 / 1）を読んだ画素が半透明になる（ラップ ON の継ぎ目・フィルタオブジェクトの画面の端）
+  obj.pixelshader("ps_sd_direction", "object", "object", {
+    0.5, 0.5,
+    W0, H0,
+    amount, ridges, wave, randomness / 100,
+    random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, extra,
+    0, 0, obj.w, obj.h, 0,
+  }, "copy", (wrap == 1) and "loop" or "clamp")
+end
+
+@ジグザグ
+--information:ジグザグ@ShapeDistort_H v1.04 by HexBrowns
+--label:HexScript
+--filter
+
+--group:変形
+--track@amount:量,-200,200,15,0.1
+--track@ridges:リッジ数,1,50,8,1
+--select@wave:波形=0,正弦波=0,三角波=1
+--select@order:重ねる順=0,横→縦=0,縦→横=1
+--group
+
+--group:ゆらぎ,0
+--track@randomness:ランダム割合,0,100,0,0.1
+--track@random_seed:ランダムシード,0,10000,0,1
+--group
+
+--group:表示,0
+--check@wrap:ラップ,1
+--check@compose_bg:背景を合成,0
+--group
+
+--[[pixelshader@ps_sd_zigzag:
+cbuffer P : register(b0) {
+    float2 center;       // 0-1  未使用（レイアウトを 4 セクションで揃えている）
+    float2 resolution;   // 2-3
+    float amount;        // 4
+    float ridges;        // 5
+    float wave_shape;    // 6
+    float randomness;    // 7
+    float random_seed;   // 8
+    float wrap_mode;     // 9
+    float compose_bg;    // 10
+    float extra;         // 11  重ねる順（0 = 横→縦 / 1 = 縦→横）
+    float2 pad;          // 12-13
+    float2 buf_size;     // 14-15
+    float clip_out;      // 16
+};
+
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+
+// 正本: @回転 の ps_sd_swirl
+float sd_hash(float2 p) {
+    p = frac(p * float2(443.897, 441.423));
+    p += dot(p, p.yx + 19.19);
+    return frac((p.x + p.y) * p.x);
+}
+
+float sd_wave(float x, float shape) {
+    float s = sin(x * 6.28318530718);
+    float t = abs(frac(x) * 2.0 - 1.0) * 2.0 - 1.0;
+    return lerp(s, t, saturate(shape));
+}
+
+float sd_jitter(float x, float rnd, float seed) {
+    float r = sd_hash(float2(floor(x), seed));
+    return lerp(1.0, r * 2.0, saturate(rnd));
+}
+
+float4 ps_sd_zigzag(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    // 広げた画像の扱いは正本 @回転 の ps_sd_swirl の説明
+    float2 buf_uv = uv;
+    bool expanded = (pad.x + pad.y) > 0.0;
+    if (expanded) {
+        uv = (buf_uv * buf_size - pad) / resolution;
+    }
+
+    // 縦横比: 横の uv に 幅/高さ を掛けて等方な空間へ直す（正本 @回転 の ps_sd_swirl の説明）
+    float aspect = resolution.x / max(resolution.y, 1.0);
+
+    // 横のずれ（行ごと。y で決まる）と縦のずれ（列ごと。x で決まる）を順に重ねる（v1.04）。
+    // 描く画素 p から読む位置へは、後に掛けるずれから戻る: 横→縦 なら先に縦（p.x で決まる）、
+    // その位置の y で横を決める。どちらも行・列を滑らせるだけの写しなので、重ねても画像は裂けない。
+    // v1.03 までは両方を p から同時に決めていて、ずれが大きいと画像が折り返して破片になった
+    float kx = amount / 500.0 / max(aspect, 1e-5);
+    float ky = amount / 500.0;
+    float2 suv = uv;
+    if (extra < 0.5) {
+        float phase_y = suv.x * ridges;
+        suv.y += sd_wave(phase_y, wave_shape) * sd_jitter(phase_y, randomness, random_seed + 37.0) * ky;
+        float phase_x = suv.y * ridges;
+        suv.x += sd_wave(phase_x, wave_shape) * sd_jitter(phase_x, randomness, random_seed) * kx;
+    } else {
+        float phase_x = suv.y * ridges;
+        suv.x += sd_wave(phase_x, wave_shape) * sd_jitter(phase_x, randomness, random_seed) * kx;
+        float phase_y = suv.x * ridges;
+        suv.y += sd_wave(phase_y, wave_shape) * sd_jitter(phase_y, randomness, random_seed + 37.0) * ky;
+    }
+    if (wrap_mode > 0.5) {
+        suv = frac(suv);
+    } else if (clip_out < 0.5) {
+        suv = saturate(suv);
+    }
+    float2 tuv = expanded ? (suv * resolution + pad) / buf_size : suv;
+
+    float4 fg = tex.Sample(smp, tuv);
+    if (compose_bg > 0.5) {
+        float4 bg = tex.Sample(smp, buf_uv);
+        return fg + bg * (1.0 - fg.a);
+    }
+    return fg;
+}
+]]
+
+-- 正本: @回転 の expand（同じ複製。変更時は 4 つとも直す）
+local PAD_MARGIN = 2
+local SIZE_BUDGET = 15000000
+local is_filter = obj.getinfo("filter")
+is_filter = (is_filter == true or is_filter == 1)
+-- 広げる量を決めて領域拡張まで行い、広げた量を返す（広げなければ 0, 0）
+local function expand(want_x, want_y, w, h)
+  if is_filter or wrap == 1 then return 0, 0 end
+  want_x = (want_x > 0) and (math.ceil(want_x) + PAD_MARGIN) or 0
+  want_y = (want_y > 0) and (math.ceil(want_y) + PAD_MARGIN) or 0
+  local max_w, max_h = obj.getinfo("image_max")
+  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
+  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
+  local px, py = math.min(want_x, cap_x), math.min(want_y, cap_y)
+  local sx, sy = 0, 0
+  for k = 64, 0, -1 do
+    sx, sy = math.floor(px * k / 64), math.floor(py * k / 64)
+    if (w + 2 * sx) * (h + 2 * sy) <= SIZE_BUDGET then break end
+    sx, sy = 0, 0
+  end
+  if sx > 0 or sy > 0 then
+    obj.effect("領域拡張", "上", sy, "下", sy, "左", sx, "右", sx, "塗りつぶし", 0)
+  end
+  return sx, sy
+end
+
+local W0, H0 = obj.w, obj.h
+-- 変位は横・縦とも 波 x 量/500 x 高さ px（波の絶対値は 1 + ランダム割合 未満）。順に重ねても、
+-- 読む位置は横と縦がそれぞれ 1 回ずつずれるだけなので、広げる量は同じ
+local reach = (1 + randomness / 100) * math.abs(amount) / 500 * H0
+local pad_x, pad_y = expand(reach, reach, W0, H0)
+
+-- 通常のオブジェクトでラップ OFF なら、広げていなくても元の画像の外は透明として読む（v1.03）
+if not is_filter and wrap ~= 1 then
+  obj.pixelshader("ps_sd_zigzag", "object", "object", {
+    0.5, 0.5,
+    W0, H0,
+    amount, ridges, wave, randomness / 100,
+    random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, order,
+    pad_x, pad_y, obj.w, obj.h, 1,
+  }, "copy", "clip")
+else
+  -- 端を読む経路は sampler を明示する（v1.03）。省くと範囲外を透明として補間し、
+  -- ちょうど端（uv 0 / 1）を読んだ画素が半透明になる（ラップ ON の継ぎ目・フィルタオブジェクトの画面の端）
+  obj.pixelshader("ps_sd_zigzag", "object", "object", {
+    0.5, 0.5,
+    W0, H0,
+    amount, ridges, wave, randomness / 100,
+    random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, order,
+    0, 0, obj.w, obj.h, 0,
+  }, "copy", (wrap == 1) and "loop" or "clamp")
+end
