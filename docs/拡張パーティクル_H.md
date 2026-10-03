@@ -5,11 +5,11 @@
 粒子を別のオブジェクトへ渡して、そこで描いたり、そこから粒子を出したりもできます（「受け取って描く」・出力位置「渡された粒子」）。
 すぐに使える組み合わせを、プリセット（エイリアス）として 22 本付けています。
 
-`Script/@拡張パーティクル_H.anm2`（計算は `Script/ParticleR_H.lua`）、v0.13.0。
+`Script/@拡張パーティクル_H.anm2`（計算は `Script/Particle_H.lua`）、v0.13.0。
 
 ## インストール
 
-1. [HexScript の Releases](https://github.com/HexBrowns/HexScript/releases) の zip を展開し、`Script\@拡張パーティクル_H.anm2` と `Script\ParticleR_H.lua` の 2 つを、AviUtl2 のデータフォルダ（既定は `C:\ProgramData\aviutl2`）の `Script` フォルダへ置く
+1. [HexScript の Releases](https://github.com/HexBrowns/HexScript/releases) の zip を展開し、`Script\@拡張パーティクル_H.anm2` と `Script\Particle_H.lua` の 2 つを、AviUtl2 のデータフォルダ（既定は `C:\ProgramData\aviutl2`）の `Script` フォルダへ置く
 2. プリセットを使うなら、zip の `Alias\拡張パーティクル_H\` のフォルダ（`.object` が 22 個）も、データフォルダの `Alias` フォルダへ置く
 3. AviUtl2 を再起動する
 4. 画像・図形・テキストなどのオブジェクトに「本体@拡張パーティクル_H」を追加する（HexScript の中）

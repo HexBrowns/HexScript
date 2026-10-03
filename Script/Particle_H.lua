@@ -1,6 +1,6 @@
--- ParticleR_H.lua — 拡張パーティクル_H の計算モジュール（obj に触らない純粋な計算）
+-- Particle_H.lua — 拡張パーティクル_H の計算モジュール（obj に触らない純粋な計算）
 --
--- 呼び手: Script/@拡張パーティクル_H.anm2 の「本体」。require("ParticleR_H")
+-- 呼び手: Script/@拡張パーティクル_H.anm2 の「本体」。require("Particle_H")
 -- 計画:   AI/specifications/20261002_拡張パーティクル_H_spec.md（5.3 時間と乱数 / 5.4 描画）
 -- 検証器: AI/scripts/拡張パーティクル_H/verify_core.py（この本文を luaJIT.dll でそのまま走らせる）
 --
@@ -616,11 +616,11 @@ end
 local ce2_cache = {}
 
 local function script_dir()
-  local p = package.searchpath and package.searchpath("ParticleR_H", package.path or "")
+  local p = package.searchpath and package.searchpath("Particle_H", package.path or "")
   if p then return p:match("^(.*[/\\])") end
   -- require の検索先から分からなければ、tra2 自身と同じ既定のフォルダ（tra2 も Live の場所を C:\ProgramData\aviutl2 で持つ）
   local d = "C:\\ProgramData\\aviutl2\\Script\\"
-  if M.read_text(d .. "ParticleR_H.lua") then return d end
+  if M.read_text(d .. "Particle_H.lua") then return d end
   return nil
 end
 
@@ -5242,13 +5242,13 @@ function M.screen_apply(S, list, quad)
 end
 
 --[[
-粒子を外へ渡す: _G.ParticleR_H_share[鍵] に、今のフレームの粒子を生まれた順に置く。鍵 = シーン:名前。
+粒子を外へ渡す: _G.Particle_H_share[鍵] に、今のフレームの粒子を生まれた順に置く。鍵 = シーン:名前。
 座標は本体の位置 B を足した値（受け取る側が自分の位置を引く）。frame はシーン基準のフレーム（obj.originframe）。
 戻り値: 同じフレームに別のオブジェクト（id）が同じ鍵で書いていたら true（後から書いた方が勝つ）
 ]]
 function M.share_put(key, res, bx, by, bz, frame, id)
-  local T = _G.ParticleR_H_share or {}
-  _G.ParticleR_H_share = T
+  local T = _G.Particle_H_share or {}
+  _G.Particle_H_share = T
   local old = T[key]
   local dup = old ~= nil and old.frame == frame and old.id ~= id
   local S = { frame = frame, id = id, n = 0, x = {}, y = {}, z = {}, rx = {}, ry = {}, rz = {}, zoom = {}, alpha = {},
@@ -5266,8 +5266,8 @@ function M.share_put(key, res, bx, by, bz, frame, id)
   T[key] = S
   -- 出力位置「渡された粒子」のための履歴（フレームごと。位置と速さだけ、多ければ間引いて SHARE_HIST_N 個まで）。
   -- 今のフレームから SHARE_HIST_F フレームより離れたものは捨てる
-  local HT = _G.ParticleR_H_share_hist or {}
-  _G.ParticleR_H_share_hist = HT
+  local HT = _G.Particle_H_share_hist or {}
+  _G.Particle_H_share_hist = HT
   local H = HT[key] or {}
   HT[key] = H
   local cap = M.SHARE_HIST_N
@@ -5296,7 +5296,7 @@ M.SHARE_HIST_F = 300   -- 履歴を残すフレームの幅（今のフレーム
 そのフレームが無ければ、前後 3 フレームまでの近いもの（前を先に）、それも無ければ一番近いもの。履歴が無ければ nil
 ]]
 function M.share_hist(key, frame)
-  local HT = _G.ParticleR_H_share_hist
+  local HT = _G.Particle_H_share_hist
   local H = HT and HT[key]
   if not H then return nil end
   if H[frame] then return H[frame] end
@@ -5314,7 +5314,7 @@ end
 
 -- 受け取る: 鍵の表と、受け取る側のフレーム − 渡した側のフレーム。表が無ければ nil
 function M.share_get(key, frame)
-  local T = _G.ParticleR_H_share
+  local T = _G.Particle_H_share
   local S = T and T[key]
   if not S then return nil end
   return S, frame - S.frame

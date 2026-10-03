@@ -109,8 +109,8 @@ float4 prh_glass(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
 }
 ]]
 -- 付けたオブジェクトの画像を粒子として放出する。拡張（出力位置・回転・風など）は本体より上に付ける。
--- 計算は Script/ParticleR_H.lua。計画: AI/specifications/20261002_拡張パーティクル_H_spec.md
-local P = require("ParticleR_H")
+-- 計算は Script/Particle_H.lua。計画: AI/specifications/20261002_拡張パーティクル_H_spec.md
+local P = require("Particle_H")
 local t_start = P.clock()
 local SUFFIX = "@拡張パーティクル_H"
 local function on(v) return v == true or v == 1 end
@@ -145,7 +145,7 @@ for i = 1, 64 do
     if kind then above[kind] = true end
   end
 end
-local box = _G.ParticleR_H_ext and _G.ParticleR_H_ext[obj.id]
+local box = _G.Particle_H_ext and _G.Particle_H_ext[obj.id]
 local function ext(kind, key)
   local e = box and box[key]
   if e and above[kind] and e.origin == obj.originframe then return e end
@@ -334,13 +334,13 @@ if e_emit and e_emit.shape == 8 then
   end
 end
 -- 文字の並び: 素材のテキストを 1 文字ずつ測って並べる（測った幅はフォントと文字ごとに取っておく）
-_G.ParticleR_H_textw = _G.ParticleR_H_textw or {}
+_G.Particle_H_textw = _G.Particle_H_textw or {}
 local function text_layout()
   if RT.tlayout ~= nil then return RT.tlayout or nil end
   RT.tlayout = false
   if e_mat and e_mat.kind == 4 and (e_mat.count or 0) > 0 then
     save_self()
-    local TW_ = _G.ParticleR_H_textw
+    local TW_ = _G.Particle_H_textw
     local fk = table.concat({ tostring(e_mat.font), e_mat.tsize, e_mat.tdeco }, "|") .. "|"
     local set = false
     local function measure(str)
@@ -545,9 +545,9 @@ end
 local sig = table.concat(sig_parts, ",") .. "|" .. table.concat(sig_ext, "|") .. "|" .. ser(e_emit) .. ser(e_indiv) ..
   (e_zoal and ser({ e_zoal.vm0, e_zoal.vm1, e_zoal.vmode, e_zoal.vrep, e_zoal.vslot }) or "") .. ce2_hash ..
   string.format("|%s|%s|%s|%s|%s|%s", tostring(birth_mode), tostring(reverse), start, precision, seed, sync) .. fhash
-_G.ParticleR_H_cache = _G.ParticleR_H_cache or {}
-local cache = _G.ParticleR_H_cache[obj.id] or {}
-_G.ParticleR_H_cache[obj.id] = cache
+_G.Particle_H_cache = _G.Particle_H_cache or {}
+local cache = _G.Particle_H_cache[obj.id] or {}
+_G.Particle_H_cache[obj.id] = cache
 
 -- 放出の数: 頻度が動いていれば、シミュレーション時刻 0 から今までを 1 フレームずつ積む
 local rate_obj
@@ -965,9 +965,9 @@ do
   for _, v in ipairs(parts) do warns[#warns + 1] = v end
 end
 local wmsg = table.concat(warns, " / ")
-_G.ParticleR_H_err = _G.ParticleR_H_err or {}
-if _G.ParticleR_H_err[obj.id] ~= wmsg then
-  _G.ParticleR_H_err[obj.id] = wmsg
+_G.Particle_H_err = _G.Particle_H_err or {}
+if _G.Particle_H_err[obj.id] ~= wmsg then
+  _G.Particle_H_err[obj.id] = wmsg
   if wmsg ~= "" then print("@warn", "[拡張パーティクル_H] 注意: " .. wmsg) end
 end
 
@@ -1056,17 +1056,17 @@ if on(diag) then
   if BL then used[#used + 1] = "blend=" .. BL end
   local msg = string.format("[拡張パーティクル_H] layer=%d above=%s used=%s seen=%s runs=%d merged=%s",
     obj.layer, table.concat(kinds, ","), table.concat(used, ","), table.concat(seen, "|"), #runs, tostring(runs.merged == true))
-  _G.ParticleR_H_diag = _G.ParticleR_H_diag or {}
-  if _G.ParticleR_H_diag[obj.id] ~= msg then
-    _G.ParticleR_H_diag[obj.id] = msg
+  _G.Particle_H_diag = _G.Particle_H_diag or {}
+  if _G.Particle_H_diag[obj.id] ~= msg then
+    _G.Particle_H_diag[obj.id] = msg
     print("@warn", msg)
   end
   -- 数の要約も、変わったときだけ出す（フレーム番号・計算の刻みの数・音の大きさのように毎フレーム変わる値は入れない）
   local stat = string.format("[拡張パーティクル_H] alive=%d drawn=%d overflow=%d over=%d cq=%d getvalue=%d resets=%d",
     res.n, drawn, res.overflow, R.over, #R.cq4 + #R.cq3, gets, res.resets)
-  _G.ParticleR_H_diag2 = _G.ParticleR_H_diag2 or {}
-  if _G.ParticleR_H_diag2[obj.id] ~= stat then
-    _G.ParticleR_H_diag2[obj.id] = stat
+  _G.Particle_H_diag2 = _G.Particle_H_diag2 or {}
+  if _G.Particle_H_diag2[obj.id] ~= stat then
+    _G.Particle_H_diag2[obj.id] = stat
     print("@warn", stat)
   end
 end
@@ -1150,9 +1150,9 @@ if shape >= 1 and shape <= 4 then
   obj.setanchor("pos", n, "xyz", "line", def)
   for i = 1, n * 3 do pts[i] = (pos and pos[i]) or def[i] end
 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 -- 上の出力位置につなぐ: このフレームに上の出力位置（線・線を走る）が書いた点の後ろに、この点を足す
 local prev = box.emit
 if on(chain) and (shape == 1 or shape == 2) and prev and prev.origin == obj.originframe and (prev.shape == 1 or prev.shape == 2) then
@@ -1206,9 +1206,9 @@ box.emit = {
 --group
 -- 本体より上に付ける。回転を揺らす・放射した時刻で角度を変える・回転を加速する
 local function on(v) return v == true or v == 1 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.rot = {
   origin = obj.originframe,
   swing_speed = swing_speed, swing = { swing_x, swing_y, swing_z },
@@ -1265,9 +1265,9 @@ box.rot = {
 -- 補間: 点と点の間の変わり方（区間ごとに掛かる）。反復: 反復の回数だけ往復する（奇数は次の値、偶数は前の値で終わる）。
 -- カーブエディタ2: スロットの式で変わる（CurveEditor2 の Live スロット）。
 -- 速度倍率: 粒子の自分の速さ（出力速度・加速度）に、寿命に沿って掛ける %（風などの外から受けた速さには掛けない）
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 local function arr(t)
   local o = {}
   if type(t) == "table" then for i = 1, #t do o[i] = tonumber(t[i]) or 0 end end
@@ -1306,9 +1306,9 @@ box.zoal = {
 -- 本体より上に付ける。粒子ごとに値をばらつかせる。正の値は元の値の %、負の値は絶対値の幅（原作の説明書 09 の式）。
 -- 乱数を変える番号: {番号,番号,…} の粒子だけ、乱数を変える（変え方を変えると別の乱数）。番号は本体の「粒子の番号も表示」で見る
 local function on(v) return v == true or v == 1 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.indiv = {
   origin = obj.originframe,
   speed = i_speed, accel = i_accel, vrx = i_vrx, vry = i_vry, vrz = i_vrz, alpha = i_alpha, zoom = i_zoom,
@@ -1340,9 +1340,9 @@ for var, item in pairs({ wx = "風力X", wy = "風力Y", wz = "風力Z" }) do
 end
 local up = on(use_point)
 if up then obj.setanchor("wpos", 1, "xyz") end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.wind = {
   origin = obj.originframe, wx = wx, wy = wy, wz = wz, drag = drag, use_point = up,
   pt = { (wpos and wpos[1]) or 0, (wpos and wpos[2]) or 0, (wpos and wpos[3]) or 0 }, range = wrange, i_wind = i_wind, mv = mv,
@@ -1365,9 +1365,9 @@ local function on(v) return v == true or v == 1 end
 local mv = {}
 local m = obj.getoption("track_mode", "nstr")
 if m ~= nil and m ~= 0 and m ~= "" then mv.str = "強さ" end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.noise = {
   origin = obj.originframe, str = nstr, scale = nscale, speed = nspeed, seed = nseed, z = on(nz),
   start = nstart, fade = nfade, i_noise = i_noise, mv = mv,
@@ -1405,9 +1405,9 @@ for i = 0, n - 1 do def[#def + 1] = (i - (n - 1) / 2) * 200; def[#def + 1] = -30
 obj.setanchor("cpos", n, "xyz", "line", def)
 local pts = {}
 for i = 1, n * 3 do pts[i] = (cpos and cpos[i]) or def[i] end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 -- 上の集結点につなぐ: このフレームに上の集結点が書いた点の後ろに、この点を足す（5 つより多く置ける）
 local prev = box.att
 if on(cchain) and prev and prev.origin == obj.originframe then
@@ -1483,9 +1483,9 @@ box.att = {
 local function on(v) return v == true or v == 1 end
 local s = tonumber(sph) or 0
 if s ~= 0 then obj.setanchor("spos", 1, "xyz") end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.bnc = {
   origin = obj.originframe, bx = tonumber(bx) or 0, by = tonumber(by) or 0, bz = tonumber(bz) or 3,
   xmin = math.min(xmin, xmax), xmax = math.max(xmin, xmax), ymin = math.min(ymin, ymax), ymax = math.max(ymin, ymax),
@@ -1536,9 +1536,9 @@ box.bnc = {
 -- 挙動不審: 不審間隔（秒）ごとに、不審確率（%）で、その向きへ不審速度（px/秒）ではじかれる。
 -- 速度の関数: 関数ファイル（.lua）の vector(t) が返す速度（px/秒。t は粒子が生まれてからの秒）を足して動かす
 local function on(v) return v == true or v == 1 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.beh = {
   origin = obj.originframe, jx = jx, jy = jy, jz = jz, jn = jn, jpat = tonumber(jpat) or 1,
   ys = ys, yx = yx, yy = yy, yz = yz, yrel = on(yrel), i_ys = i_ys, i_ya = i_ya,
@@ -1575,9 +1575,9 @@ box.beh = {
 -- 分散: 粒子が生まれてから分散タイム（秒）で、進む向きを拡散度（度）の範囲でばらばらに変える（花火）。反射で分散: 最初に跳ね返ったときに分散する。
 -- 急停止: 生まれてからこの秒数で速さを 0 にする（重力・風などは効き続ける）
 local function on(v) return v == true or v == 1 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.disp = {
   origin = obj.originframe, dt = dt, dbounce = on(dbounce), dxy = dxy, dz = dz, dspd = tonumber(dspd) or 0, dv = dv,
   dacc_on = on(dacc_on), dac = dac, i_dt = i_dt, stop = stop, i_stop = i_stop,
@@ -1611,9 +1611,9 @@ box.disp = {
 local function on(v) return v == true or v == 1 end
 local c = tonumber(ocenter) or 0
 if c == 1 then obj.setanchor("opos", 1, "xyz") end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.orbit = {
   origin = obj.originframe, center = c, pos = { (opos and opos[1]) or 0, (opos and opos[2]) or 0, (opos and opos[3]) or 0 },
   rx = orx, ry = ory, rz = orz, w = ow, acc = oacc, nonneg = on(ononeg), vr = ovr, lim = olim, ax = oax, ay = oay,
@@ -1656,9 +1656,9 @@ local function arr(t)
   if type(t) == "table" then for i = 1, #t do o[i] = tonumber(t[i]) or 0 end end
   return o
 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.time = {
   origin = obj.originframe, tp_on = on(tp_on), tp = tp, emit_win = arr(emit_win), act_win = arr(act_win), act_rel = on(act_rel),
   burst_t = arr(burst_t), burst_n = math.floor(burst_n), keep_on = on(keep_on), keep_n = keep_n,
@@ -1754,10 +1754,10 @@ box.time = {
 -- 文字揃え・文字の間隔・行の間隔: 出力位置・形へ集まるの「文字の並び」で文字を並べるときに使う（px）。
 -- 動画: 粒子ごとに動画を再生する。動画の段数: 1 フレームに読む動画の絵の数の上限（多いほど滑らかで重い）
 local function on(v) return v == true or v == 1 end
-local P = require("ParticleR_H")
+local P = require("Particle_H")
 local kind = tonumber(kind) or 0
-_G.ParticleR_H_matcache = _G.ParticleR_H_matcache or {}
-local MC = _G.ParticleR_H_matcache
+_G.Particle_H_matcache = _G.Particle_H_matcache or {}
+local MC = _G.Particle_H_matcache
 local m = {
   origin = obj.originframe, kind = kind, shape = tonumber(cshape) or 0, csize = csize, ccenter = on(ccenter), cwhere = tonumber(cwhere) or 0,
   figs = { fig1, fig2, fig3 }, fignum = math.max(math.min(math.floor(fignum), 3), 1), fsize = fsize, fcol = fcol, fline = fline,
@@ -1800,9 +1800,9 @@ elseif kind == 5 then
   m.obj_now = obj.time
   if not mfile or mfile == "" or info.duration <= 0 then m.kind = 0 end
 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.mat = m
 
 @フィルター
@@ -1830,9 +1830,9 @@ for pair in spec:gmatch("[^,]+") do
   local k, v = pair:match("^%s*(.-)%s*=%s*(.-)%s*$")
   if k and k ~= "" then fixed[#fixed + 1] = { k, tonumber(v) or v } end
 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.filt = {
   origin = obj.originframe, name = fname, item = fitem, v0 = fv0, v1 = fv1, base = tonumber(fbase) or 0,
   levels = math.max(math.floor(flevels), 1), i_v = fiv, fixed = fixed,
@@ -1883,15 +1883,15 @@ box.filt = {
 -- 出た所の色: 出力位置が「他レイヤーの形」「自分の画像を並べる」のとき、出た所の画像の色にする（画像の色から 段数 色を選んで近い色で塗る）。
 -- 白い素材（図形など）は「輝度を保持する」をオフにする（オンだと白のまま）
 local function on(v) return v == true or v == 1 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 local mode = tonumber(cmode) or 0
 local n = math.max(math.min(math.floor(cnum), 4), 1)
 local cols = { c1, c2, c3, c4 }
 if cpal and cpal ~= "" then
   -- パレット（番号=rrggbb の行）。読めなければ色1〜4 のまま
-  local text = require("ParticleR_H").read_text(cpal)
+  local text = require("Particle_H").read_text(cpal)
   if text then
     local pal = {}
     for idx, hex in text:gmatch("(%d+)%s*=%s*(%x%x%x%x%x%x)") do pal[#pal + 1] = { tonumber(idx), tonumber(hex, 16) } end
@@ -1936,9 +1936,9 @@ box.color = {
 -- 本体より上に付ける。
 -- 粒子を並べる: 少し前の位置（間隔は秒）に、粒子を薄く小さくして並べる（尻尾の透過率・拡大率はいちばん後ろの値）。
 -- 帯: 少し前の位置を結んだ帯を描く（幅は px。頭から尻尾へ で、帯の色 → 帯の色2 と変わる）。速度で伸ばす: 粒子を進む向きの後ろへ、速さ × 伸ばす時間 だけ伸ばす
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.trail = {
   origin = obj.originframe, mode = tonumber(tmode) or 0, n = math.max(math.min(math.floor(tnum), 32), 1), dt = tint,
   alpha_end = talpha, zoom_end = tzoom, col = tcol, width = twidth, stretch = tstretch,
@@ -1968,9 +1968,9 @@ box.trail = {
 -- 半径・大きさは px（粒子の拡大率に合わせて変わる）。見た目=粒子と同じ のとき、大きさは粒子に対する %。公転・自転速度は度/秒。
 -- 立体的に回す: 粒子ごとに回る面を傾ける（円環も傾く）
 local function on(v) return v == true or v == 1 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.fan = {
   origin = obj.originframe, n = math.floor(fnum), rad = frad, same = (tonumber(fsame) or 0) == 1, fig = ffig, size = fsize,
   col = fcol, rev = frev, rot = frot, even = on(feven), d3 = on(f3d),
@@ -2011,9 +2011,9 @@ box.fan = {
 -- 本体より上に付ける。粒子どうしを線で結ぶ（粒子の後ろに描く）。
 -- 生まれた順の隣: 生まれた順に次の粒子と結ぶ（面にする: 続く 3 つを三角形にする）。近い粒子: 結ぶ距離（px）以内の粒子と、1 粒子あたり最大の線の数まで結ぶ
 local function on(v) return v == true or v == 1 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.mesh = {
   origin = obj.originframe, rule = tonumber(mrule) or 0, dist = mdist, max = math.floor(mmax), col = mcol, width = mwidth,
   alpha = malpha, fade = on(mfade), group = on(mgroup), face = on(mface), mul = on(mmul),
@@ -2043,9 +2043,9 @@ box.mesh = {
 --hide@gph:gmode==0
 -- 本体より上に付ける。粒子の位置を格子の点にそろえる（間隔は px。極座標は本体の中心から、角度と仰角は度）。
 -- マスクのレイヤー: そのレイヤーのオブジェクトの形（アルファ）を本体の中心に重ね、形の外の粒子を描かない（反転で形の中を描かない）
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 local mode = tonumber(gmode) or 0
 box.grid = {
   origin = obj.originframe, mode = mode,
@@ -2070,9 +2070,9 @@ box.grid = {
 -- 本体より上に付ける。粒子を立体にする（素材を各面に貼る）。大きさ: px（0 は素材の大きさ）。
 -- 分割数: 球・錐体の面の細かさ、曲面の細かさ、厚みの重ねる枚数。曲がり: 100 で幅（高さ）を円周とする筒に巻き付く。奥行き: 厚みの px。
 -- 粒子が多いと重い（球は 1 粒あたり 分割数 × 分割数 枚の三角形）
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.solid = {
   origin = obj.originframe, type = tonumber(stype) or 0, size = ssize, div = math.floor(sdiv), bh = sbh, bv = sbv, depth = sdepth,
 }
@@ -2088,9 +2088,9 @@ box.solid = {
 --track@gtint:色の強さ,0,100,0,0.01
 -- 本体より上に付ける。粒子をガラスにする（粒子の形の向こうの絵を、縁ほどずらして見せる）。屈折・縁の幅・ぼかしは px。
 -- 粒子の形（アルファ）だけを使い、色は使わない。カメラ制御の下では効かない（粒子をそのまま描く）
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.glass = {
   origin = obj.originframe, ref = gref, width = gwid, edge = gedge, blur = gblur, col = gcol, tint = gtint,
 }
@@ -2125,9 +2125,9 @@ box.glass = {
 --   拍の感度が大きいほど小さな立ち上がりも拾う。BPMのグリッドは、編集画面のグリッド（BPM）の拍。細かさ 2 で 8 分、4 で 16 分。
 --   強い拍ほど多く: 音の拍は立ち上がりの大きさ、グリッドは小節の頭 1 / 拍 0.7 / 拍の間 0.4 を数に掛ける
 local function on(v) return v == true or v == 1 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.audio = {
   origin = obj.originframe, src = tonumber(asrc) or 0, file = afile or "", band = math.floor(aband), band2 = math.floor(aband2),
   gain = again, zoom = azoom, alpha = aalpha, spread = aspread,
@@ -2154,9 +2154,9 @@ box.audio = {
 -- particle_obj(t, t0, life, pi, pj, seed, 値1, 値2, 値3, 設定値1〜8, 色1, 色2, 図形1, 図形2, チェック1, チェック2) を、
 -- 種類（pi = 0〜種類の数-1）× 時間の段（t = 0〜生存時間）ごとに 1 回だけ呼ぶ。関数は仮想バッファに描いて obj.load("tempbuffer") で終える。
 -- 種類の数 × 時間の段数は 64 まで（超える分は段数を減らす）
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 local nvar = math.max(math.floor(cvar), 1)
 local nlv = math.max(math.min(math.floor(clv), math.floor(64 / nvar)), 1)
 box.custom = {
@@ -2226,9 +2226,9 @@ local def = { 0, 0, 0, 300, 0, 0 }
 if ty == 3 then obj.setanchor("fpos", 2, "xyz", "line", def) elseif ty ~= 5 then obj.setanchor("fpos", 1, "xyz", def) end
 local pos = {}
 for i = 1, 6 do pos[i] = (fpos and fpos[i]) or def[i] end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 local F = {
   type = ty, pos = pos, str = fstr, range = frange, i_str = i_fstr, spin = fspin, up = fup, ax = fax, ay = fay,
   t0 = ft0, wave = fwave, width = fwidth, follow = ffollow, cool = fcool, heavy = fheavy, base = fbase,
@@ -2274,9 +2274,9 @@ box.field = { origin = obj.originframe, list = list }
 -- 奥行き: Z が始め→終わりの間で、大きさ・透過率を 0 → この % だけ変える（奥が大きい Z）。
 -- 点滅: なめらか = 1 秒に 点滅の速さ 回、深さ % だけ暗くなる / きらめき = 1 / 点滅の速さ 秒ごとに、ときどき強く光る（ふだんは深さ % 暗い）。
 -- 形: 縦横比（プラス = 横が縮む / マイナス = 縦が縮む）とゆがみ（%。横へ傾ける）。個別は粒子ごとのばらつきの幅
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.look = {
   origin = obj.originframe, sref = sref, szoom = szoom, salpha = salpha, dz0 = dz0, dz1 = dz1, dzoom = dzoom, dalpha = dalpha,
   blink_hz = blink_hz, blink_depth = blink_depth, blink_shape = tonumber(blink_shape) or 0,
@@ -2310,9 +2310,9 @@ end
 obj.setanchor("ppos", n, "xyz", "line", def)
 local pts = {}
 for i = 1, n * 3 do pts[i] = (ppos and ppos[i]) or def[i] end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 local prev = box.path
 if on(pchain) and prev and prev.origin == obj.originframe then
   local all = {}
@@ -2378,9 +2378,9 @@ elseif src == 3 then
   pts = {}
   for i = 1, np * 3 do pts[i] = (gpos and gpos[i]) or def[i] end
 end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.gather = {
   origin = obj.originframe, src = src, layer = math.floor(glayer), thr = gthr, pick = tonumber(gpick) or 0, np = np, pts = pts,
   radius = grad, start = gstart, dur = gdur, base = tonumber(gbase) or 0, spread = gspread, order = tonumber(gorder) or 0,
@@ -2407,9 +2407,9 @@ box.gather = {
 -- 出す時: 消えるとき（寿命の終わり）/ 最初に跳ね返ったとき（跳ね返りが要る）/ 分散したとき（分散と停止が要る）/ 動いている間（間隔ごとに、その時の位置から）。
 -- 子は 1 回に 出す数 だけ出て、速さ（の 60〜100%）で、親の進む向きから ± 拡散角度 の向きへ飛ぶ（親の速さを受け継ぐ % を足す）。
 -- 子は 速さ・重力Y・空気抵抗 だけで動く（風・力場などは掛からない）。大きさは素材の大きさに対する %。透過率は 0 から 終透過率 へ
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.child = {
   origin = obj.originframe, event = tonumber(cevent) or 0, n = math.floor(cnum), interval = cint, speed = cspeed, spread = cspread,
   inherit = cinherit, life = clife, zoom = czoom, gy = cgy, drag = cdrag, alpha1 = calpha1,
@@ -2437,9 +2437,9 @@ box.child = {
 -- 本体より上に付ける。粒子の影を、粒子より先に（後ろに）同じ素材で描く。
 -- ずらす: 画面の上でずらす（ドロップシャドウ）。床に写す: 床の高さ（Y）の面へ、光の向き（下へ 1 進むごとに X・Z へ進む量）で写し、床に寝かせて描く。
 -- 影の濃さ: 粒子の不透明度に掛ける %。高さで薄く: 床からこの距離（px）で影が消える
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.shadow = {
   origin = obj.originframe, mode = tonumber(smode) or 0, dx = sdx, dy = sdy, floor = sfloor, lx = slx, lz = slz,
   dark = sdark, blur = sblur, col = scol, fade = sfade,
@@ -2456,7 +2456,7 @@ box.shadow = {
 -- 本体の「渡す名前」で渡された粒子の位置に、このオブジェクトの画像を描く（本体とは別のオブジェクトに付ける）。
 -- 位置は渡した側の座標（本体の位置を足した値）からこのオブジェクトの位置を引いて置く。拡大率は粒子の拡大率に掛ける %。
 -- 渡す側が同じフレームで先に計算されていないと、前のフレームの粒子になる（ログに注意が出る）
-local P = require("ParticleR_H")
+local P = require("Particle_H")
 local function on(v) return v == true or v == 1 end
 local function num(v, d) return tonumber(v) or d end
 local name = tostring(rname or "")
@@ -2477,16 +2477,16 @@ end
 -- 上のレイヤーが先に計算される（実機 EPR-204〜207）。渡す側が下だと 1 つ前のフレームの粒子になる。
 -- 使うのは今のフレームと 1 つ前だけ（それより古いのは渡す側がもう無い、先のものは戻って描いている）
 if S and lag ~= 0 and lag ~= 1 then S = nil end
-_G.ParticleR_H_err = _G.ParticleR_H_err or {}
-if _G.ParticleR_H_err[obj.id] ~= warn then
-  _G.ParticleR_H_err[obj.id] = warn
+_G.Particle_H_err = _G.Particle_H_err or {}
+if _G.Particle_H_err[obj.id] ~= warn then
+  _G.Particle_H_err[obj.id] = warn
   if warn ~= "" then print("@warn", "[拡張パーティクル_H] 注意: " .. warn) end
 end
 if on(rdiag) then
   local msg = string.format("受け取って描く %s: 粒子 %d / フレームの差 %s", name, S and S.n or 0, tostring(lag))
-  _G.ParticleR_H_rdiag = _G.ParticleR_H_rdiag or {}
-  if _G.ParticleR_H_rdiag[obj.id] ~= msg then
-    _G.ParticleR_H_rdiag[obj.id] = msg
+  _G.Particle_H_rdiag = _G.Particle_H_rdiag or {}
+  if _G.Particle_H_rdiag[obj.id] ~= msg then
+    _G.Particle_H_rdiag[obj.id] = msg
     print("@warn", "[拡張パーティクル_H] " .. msg)
   end
 end
@@ -2525,9 +2525,9 @@ obj.setoption("draw_state", true)
 local function on(v) return v == true or v == 1 end
 local kind = tonumber(lkind) or 0
 if kind == 1 then obj.setanchor("lpos", 1, "xyz") end
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 box.light = {
   origin = obj.originframe, kind = kind, lx = lx, ly = ly, lz = lz,
   pos = { (lpos and lpos[1]) or -400, (lpos and lpos[2]) or -400, (lpos and lpos[3]) or -300 },
@@ -2561,9 +2561,9 @@ box.light = {
 -- 粒子どうしを使うと、最初のフレームと後ろへ飛んだときに頭から計算し直すので重い（途中の状態を取っておき、そこから進め直す）。
 -- 当たる相手: 別のオブジェクトの本体が「渡す名前」で渡した粒子に当たって押される（相手は押し返さない）。相手の大きさ: 中心どうしがこれより近づかない（px）。
 --   相手を上のレイヤーに置く。相手の位置は 1 フレームに 500 個まで（多ければ間引く）
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 local function on(v) return v == true or v == 1 end
 box.inter = {
   origin = obj.originframe, r = ir, rep = irep, size = isize, att = iatt, fric = ifric,
@@ -2585,8 +2585,8 @@ box.inter = {
 -- 書き出す: 描いたフレームを書く（出力すると全部のフレームが埋まる。どの順で描いても上書きできる）。
 -- 読み込む: そのフレームの記録があれば計算せずに描く。無いフレームは、無いフレームは計算する がオンなら計算し、オフなら描かない。
 -- 本体・拡張の動きの設定が変わった焼き付けは使わない（ログに注意が出る。書き出し直す）。重い粒子どうしを一度だけ計算して、後は軽く見るのに使う
-_G.ParticleR_H_ext = _G.ParticleR_H_ext or {}
-local box = _G.ParticleR_H_ext[obj.id] or {}
-_G.ParticleR_H_ext[obj.id] = box
+_G.Particle_H_ext = _G.Particle_H_ext or {}
+local box = _G.Particle_H_ext[obj.id] or {}
+_G.Particle_H_ext[obj.id] = box
 local function on(v) return v == true or v == 1 end
 box.bake = { origin = obj.originframe, mode = tonumber(bmode) or 0, dir = tostring(bdir or ""), name = tostring(bname or ""), sim = on(bsim) }

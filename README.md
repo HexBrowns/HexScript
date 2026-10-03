@@ -22,7 +22,7 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 | `@Filters_H.anm2` | `EffectUtils_Noise.lua` `EffectUtils_ColorGrade.lua` |
 | `プロシージャル模様_H.obj2` | `EffectUtils_ColorGrade.lua` |
 | `@ローポリ化.anm2` `@ローポリ背景.obj2` | `EffectUtils_Lowpoly.lua` |
-| `@拡張パーティクル_H.anm2` | `ParticleR_H.lua`（プリセットを使うなら `Alias/拡張パーティクル_H/` も） |
+| `@拡張パーティクル_H.anm2` | `Particle_H.lua`（プリセットを使うなら `Alias/拡張パーティクル_H/` も） |
 
 ## 収録スクリプト
 
