@@ -27,47 +27,47 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 
 ### 画面全体・色
 
-| ファイル | 内容 | 説明書 |
-|---|---|---|
-| `@Filters_H.anm2` | フィルム調の加工 17 種（グリッチ、グレイン、ハレーション、ライトリーク、ビネット、アナモルフィックフレア、リキッドディストーション、シマー、フォグヘイズ、フィルムバーン、カラーグレード、リフト・ガンマ・ゲイン、バレル歪み、ノイズオーバーレイ、バイブランス、HSL選択補正、LUT適用） | [docs](docs/Filtersフィルタ使用ガイド.md) |
-| `@光学系ボケ.anm2` | レンズで撮ったようなボケ 4 種（玉ボケ、レンズぼかし、チルトシフト、球面収差ボケ） | [docs](docs/光学系ボケ.md) |
-| `@キーイング_H.anm2` | 背景を抜いた素材の仕上げ 3 種（マット調整、スピル除去、トラックマット） | [docs](docs/キーイング_H.md) |
-| `レンジ警告_H.anm2` | 白飛び・黒潰れ・色域外の画素をゼブラで示す検査用の効果 | [docs](docs/レンジ警告_H.md) |
+| 見本 | ファイル | 内容 | 説明書 |
+|---|---|---|---|
+| <img src="images/HexBrowns.Filters_H_thumbnail.png" width="160"> | `@Filters_H.anm2` | フィルム調の加工 17 種（グリッチ、グレイン、ハレーション、ライトリーク、ビネット、アナモルフィックフレア、リキッドディストーション、シマー、フォグヘイズ、フィルムバーン、カラーグレード、リフト・ガンマ・ゲイン、バレル歪み、ノイズオーバーレイ、バイブランス、HSL選択補正、LUT適用） | [docs](docs/Filtersフィルタ使用ガイド.md) |
+| <img src="images/HexBrowns.OpticalBokeh_thumbnail.png" width="160"> | `@光学系ボケ.anm2` | レンズで撮ったようなボケ 4 種（玉ボケ、レンズぼかし、チルトシフト、球面収差ボケ） | [docs](docs/光学系ボケ.md) |
+| <img src="images/HexBrowns.Keying_H_thumbnail.png" width="160"> | `@キーイング_H.anm2` | 背景を抜いた素材の仕上げ 3 種（マット調整、スピル除去、トラックマット） | [docs](docs/キーイング_H.md) |
+| <img src="images/HexBrowns.RangeWarning_H_thumbnail.png" width="160"> | `レンジ警告_H.anm2` | 白飛び・黒潰れ・色域外の画素をゼブラで示す検査用の効果 | [docs](docs/レンジ警告_H.md) |
 
 ### 変形・配置
 
-| ファイル | 内容 | 説明書 |
-|---|---|---|
-| `@ShapeDistort_H.anm2` | 画像をゆがませる 4 種（回転、放射、方向、ジグザグ） | [docs](docs/ShapeDistort_H.md) |
-| `@ローポリ化.anm2` `@ローポリ背景.obj2` | オブジェクトのローポリ化と、ローポリの背景 | [docs](docs/ローポリ.md) |
-| `テキスト縦書き化.anm2` | 横書きのテキストを、文字ごとのオブジェクトのまま縦書きに並べる | [docs](docs/テキスト縦書き化.md) |
-| `枠内自動フィット_H.obj2` | 指定した枠に収まる最大のフォントサイズで文字を出す | [docs](docs/枠内自動フィット_H.md) |
+| 見本 | ファイル | 内容 | 説明書 |
+|---|---|---|---|
+| <img src="images/HexBrowns.ShapeDistort_H_thumbnail.png" width="160"> | `@ShapeDistort_H.anm2` | 画像をゆがませる 4 種（回転、放射、方向、ジグザグ） | [docs](docs/ShapeDistort_H.md) |
+| <img src="images/HexBrowns.Lowpoly_thumbnail.png" width="160"> | `@ローポリ化.anm2` `@ローポリ背景.obj2` | オブジェクトのローポリ化と、ローポリの背景 | [docs](docs/ローポリ.md) |
+| <img src="images/HexBrowns.VerticalText_thumbnail.png" width="160"> | `テキスト縦書き化.anm2` | 横書きのテキストを、文字ごとのオブジェクトのまま縦書きに並べる | [docs](docs/テキスト縦書き化.md) |
+| <img src="images/HexBrowns.AutoFitText_H_thumbnail.png" width="160"> | `枠内自動フィット_H.obj2` | 指定した枠に収まる最大のフォントサイズで文字を出す | [docs](docs/枠内自動フィット_H.md) |
 
 ### 光・粒・模様
 
-| ファイル | 内容 | 説明書 |
-|---|---|---|
-| `光線経路_H.obj2` | 鏡で反射し、プリズムで分光する光線の経路を描く | [docs](docs/光線経路_H.md) |
-| `光束_H.anm2` | オブジェクトの形から光の筋を伸ばす | [docs](docs/光束_H.md) |
-| `ビーム化_H.anm2` | 形を、白い芯と色の付いた光のビームに描き替える | [docs](docs/ビーム化_H.md) |
-| `微粒子_H.obj2` | ほこり・浮遊物・細かい雪などの粒を流す | [docs](docs/微粒子_H.md) |
-| `泡_H.obj2` | 泡を描く | [docs](docs/泡_H.md) |
-| `プロシージャル模様_H.obj2` | 雲・縞・セル・六方格子・反応拡散から模様を作る（プリセット 22 本） | [docs](docs/プロシージャル模様_H.md) |
-| `グリッド_H.obj2` | 線の網目や、図形を等間隔に並べた模様 | [docs](docs/グリッド_H.md) |
-| `装飾パーティクル_H.anm2` | オブジェクトの範囲に粒を出しては消す（アス（AVILITY）さんの「装飾パーティクル」の軽量版） | [docs](docs/装飾パーティクル_H.md) |
+| 見本 | ファイル | 内容 | 説明書 |
+|---|---|---|---|
+| <img src="images/HexBrowns.LightPath_H_thumbnail.gif" width="160"> | `光線経路_H.obj2` | 鏡で反射し、プリズムで分光する光線の経路を描く | [docs](docs/光線経路_H.md) |
+| <img src="images/HexBrowns.LightShaft_H_thumbnail.gif" width="160"> | `光束_H.anm2` | オブジェクトの形から光の筋を伸ばす | [docs](docs/光束_H.md) |
+| <img src="images/HexBrowns.Beam_H_thumbnail.gif" width="160"> | `ビーム化_H.anm2` | 形を、白い芯と色の付いた光のビームに描き替える | [docs](docs/ビーム化_H.md) |
+| <img src="images/HexBrowns.FineParticles_H_thumbnail.gif" width="160"> | `微粒子_H.obj2` | ほこり・浮遊物・細かい雪などの粒を流す | [docs](docs/微粒子_H.md) |
+| <img src="images/HexBrowns.Bubbles_H_thumbnail.gif" width="160"> | `泡_H.obj2` | 泡を描く | [docs](docs/泡_H.md) |
+| <img src="images/HexBrowns.ProceduralPattern_H_thumbnail.png" width="160"> | `プロシージャル模様_H.obj2` | 雲・縞・セル・六方格子・反応拡散から模様を作る（プリセット 22 本） | [docs](docs/プロシージャル模様_H.md) |
+| <img src="images/HexBrowns.Grid_H_thumbnail.gif" width="160"> | `グリッド_H.obj2` | 線の網目や、図形を等間隔に並べた模様 | [docs](docs/グリッド_H.md) |
+| <img src="images/HexBrowns.DecoParticle_H_thumbnail.gif" width="160"> | `装飾パーティクル_H.anm2` | オブジェクトの範囲に粒を出しては消す（アス（AVILITY）さんの「装飾パーティクル」の軽量版） | [docs](docs/装飾パーティクル_H.md) |
 
 ### カメラ・シーン
 
-| ファイル | 内容 | 説明書 |
-|---|---|---|
-| `手持ちカメラ_H.cam2` | 手持ち撮影のような揺れ | [docs](docs/手持ちカメラ_H.md) |
-| `@SceneTransitions.scn2` | シーンチェンジ 3 種（スマッシュカット、ズームトランジション、パララックス） | [docs](docs/SceneTransitions.md) |
+| 見本 | ファイル | 内容 | 説明書 |
+|---|---|---|---|
+| <img src="images/HexBrowns.HandheldCamera_H_thumbnail.gif" width="160"> | `手持ちカメラ_H.cam2` | 手持ち撮影のような揺れ | [docs](docs/手持ちカメラ_H.md) |
+| <img src="images/HexBrowns.SceneTransitions_thumbnail.gif" width="160"> | `@SceneTransitions.scn2` | シーンチェンジ 3 種（スマッシュカット、ズームトランジション、パララックス） | [docs](docs/SceneTransitions.md) |
 
 ### 制作補助
 
-| ファイル | 内容 | 説明書 |
-|---|---|---|
-| `検証パターン_H.obj2` | 階調・色相・肌色などのテストパターン 9 種 | [docs](docs/検証パターン_H.md) |
+| 見本 | ファイル | 内容 | 説明書 |
+|---|---|---|---|
+| <img src="images/HexBrowns.TestPattern_H_thumbnail.png" width="160"> | `検証パターン_H.obj2` | 階調・色相・肌色などのテストパターン 9 種 | [docs](docs/検証パターン_H.md) |
 
 ### 改造（元作品の作者またはライセンスが不明）
 
