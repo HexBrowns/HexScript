@@ -10,7 +10,7 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 
 1. [Releases](https://github.com/HexBrowns/HexScript/releases) から `HexScript_v*.zip` をダウンロードして展開する
 2. `Script/` の中身を、AviUtl2 の `Script` フォルダ（既定は `C:\ProgramData\aviutl2\Script`）へコピーする。使うものだけでかまいません。ただし下の「一緒に置くファイル」は忘れずに
-3. プリセットが要るなら、`Preset/` と `Default/` の中身を、AviUtl2 のデータフォルダの同名のフォルダへコピーする
+3. プリセットが要るなら、`Preset/`・`Default/`・`Alias/` の中身を、AviUtl2 のデータフォルダの同名のフォルダへコピーする（`Alias/` はフォルダごと）
 4. AviUtl2 を起動し直す
 
 **ファイル名の先頭の `@` は消さないでください。** 1 つのファイルに複数のスクリプトが入っているものは、`@` で始まる名前でないと分割されません。
@@ -22,6 +22,7 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 | `@Filters_H.anm2` | `EffectUtils_Noise.lua` `EffectUtils_ColorGrade.lua` |
 | `プロシージャル模様_H.obj2` | `EffectUtils_ColorGrade.lua` |
 | `@ローポリ化.anm2` `@ローポリ背景.obj2` | `EffectUtils_Lowpoly.lua` |
+| `@拡張パーティクル_H.anm2` | `ParticleR_H.lua`（プリセットを使うなら `Alias/拡張パーティクル_H/` も） |
 
 ## 収録スクリプト
 
@@ -55,6 +56,7 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 | <img src="images/HexBrowns.ProceduralPattern_H_thumbnail.png" width="160"> | `プロシージャル模様_H.obj2` | 雲・縞・セル・六方格子・反応拡散から模様を作る（プリセット 22 本） | [docs](docs/プロシージャル模様_H.md) |
 | <img src="images/HexBrowns.Grid_H_thumbnail.gif" width="160"> | `グリッド_H.obj2` | 線の網目や、図形を等間隔に並べた模様 | [docs](docs/グリッド_H.md) |
 | <img src="images/HexBrowns.DecoParticle_H_thumbnail.gif" width="160"> | `装飾パーティクル_H.anm2` | オブジェクトの範囲に粒を出しては消す（アス（AVILITY）さんの「装飾パーティクル」の軽量版） | [docs](docs/装飾パーティクル_H.md) |
+| <img src="images/HexBrowns.ExtendedParticle_H_thumbnail.gif" width="160"> | `@拡張パーティクル_H.anm2` | 画像を粒子として放出する。風・力場・パス・跳ね返り・子粒子・軌跡・光源など 32 種類の拡張を積んで組み合わせる（プリセット 22 本）。rikky さんの「拡張パーティクル(R)」を AviUtl2 向けに作り直したもの | [docs](docs/拡張パーティクル_H.md) |
 
 ### カメラ・シーン
 
