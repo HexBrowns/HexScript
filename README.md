@@ -96,7 +96,7 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 | ファイル | 置き場所 | 元作品 |
 |---|---|---|
 | `ロングシャドー_H.anm2` `トーンカーブ_H.anm2` | [HexBrowns/aviutl2-scripts](https://github.com/HexBrowns/aviutl2-scripts) | こんにゃくねこ さんの LongShadow / Tonecurve_C（CC0-1.0） |
-| `ブラインドループ_H.anm2` | [gist のフォーク](https://gist.github.com/HexBrowns) | zopty さんのブラインドループ（BSD-3-Clause） |
+| `ブラインドループ_H.anm2` | [gist のフォーク](https://gist.github.com/HexBrowns/ba9203470e0fad888421a76760afb417) | zopty さんのブラインドループ（BSD-3-Clause） |
 | `モザイク_H.anm2` | [HexBrowns/aviutl2_script_Pixelizer](https://github.com/HexBrowns/aviutl2_script_Pixelizer) | nctype さんの Pixelizer（MIT） |
 | `多色グラデーション_H.anm2` | [HexBrowns/AviUtl2-GradientPlus](https://github.com/HexBrowns/AviUtl2-GradientPlus) | azurite さんのグラデーション+（CC0-1.0） |
 | `@連結ライン_Hex.anm2` | [HexBrowns/aviutl2_script_Path_S](https://github.com/HexBrowns/aviutl2_script_Path_S) | σ軸 さんの Path_S（MIT） |
