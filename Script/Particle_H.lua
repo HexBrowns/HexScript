@@ -14,7 +14,7 @@ local abs, max, min, pi, huge = math.abs, math.max, math.min, math.pi, math.huge
 local RAD = pi / 180
 
 local M = {}
-M.VERSION = "0.13.0"
+M.VERSION = "0.17.0"
 M.MAX_PARTICLES = 10000   -- 生きている粒子の上限（実機 PRP-12 / 18 で決めた）
 M.INTER_MAX = 3000        -- 粒子どうし（v0.12.0）で一緒に進める粒子の上限（超えた分は力を受けず、今までどおり粒子ごとに進める）
 M.INTER_CP = 64           -- 粒子どうしのチェックポイントの数の上限（間隔はオブジェクトの長さ ÷ この数、1 秒より短くしない）
@@ -35,6 +35,7 @@ local CH = {
   disp1 = 28, disp2 = 29, sus = 30, att = 33, irr = 34, wind = 36, noise = 37, tdisp = 38, tstop = 39,
   tatt = 40, attxy = 41, attz = 42, dspeed = 43, jit = 44, wob = 50, wobs = 60, wobp = 61, orbw = 62,
   orbvr = 63, orbc = 64, orbth = 67, mat = 70, col = 80, filt = 81, fan = 83, cust = 100, fld = 120, blink = 200, look = 210, prev = 220, path = 230, gat = 240, gst = 250, pace = 260, child = 270, shard = 280,
+  dlink = 290, trace = 291,
 }
 M.CH = CH
 
@@ -1086,7 +1087,15 @@ local function emit_pos(emit, key, b, sk)
     -- lay(b): 誕生時刻 b の対象の位置・Z軸回転・拡大率・中心（本体から見た座標）。対象が無ければ nil
     local L = emit.lay
     if not L then return nil end
-    local X, Y, Z, rz, sx, sy, cx, cy = L(b)
+    -- 追う位置（v0.14.0。原作の出力タイプ 1 のオプ2）: 1 = 0〜生まれた時刻、2 = オブジェクト全体の、でたらめな時刻の位置
+    local tq = b
+    if emit.shape == 5 and (emit.trace or 0) ~= 0 then
+      local lo = emit.t0 or 0
+      local hi = emit.trace == 1 and b or (emit.t1 or b)
+      if hi < lo then hi = lo end
+      tq = lo + (hi - lo) * rnd(key, CH.trace, sk)
+    end
+    local X, Y, Z, rz, sx, sy, cx, cy = L(tq)
     if X == nil then return nil end
     local x, y, z = X, Y, Z
     if emit.shape == 6 then
@@ -1098,11 +1107,11 @@ local function emit_pos(emit, key, b, sk)
     if not emit.use_dir and (emit.add_vel or 0) == 0 then return x, y, z end
     -- 対象の動き（前後の時刻の差）。動く向きに出す・動きの速さを足す
     local dt = emit.dt or (1 / 30)
-    local b0 = max(b - dt, 0)
+    local b0 = max(tq - dt, 0)
     local X0, Y0, Z0 = L(b0)
-    local X1, Y1, Z1 = L(b + dt)
+    local X1, Y1, Z1 = L(tq + dt)
     if X0 == nil or X1 == nil then return x, y, z end
-    local span = b + dt - b0
+    local span = tq + dt - b0
     local vx, vy, vz = (X1 - X0) / span, (Y1 - Y0) / span, (Z1 - Z0) / span
     local sp = sqrt(vx * vx + vy * vy + vz * vz)
     local odir, ozd
@@ -1174,6 +1183,7 @@ function M.prepare_emit(emit, rt, cfg)
     E.errs = cfg and cfg.errs
     -- 関数の t はオブジェクトの時刻（開始時間の分はマイナスになる。原作の説明書 19 の t0 と同じ）
     E.obj_time = cfg and (cfg.obj_time_raw or cfg.obj_time)
+    E.t0, E.t1 = cfg and cfg.t_start or 0, cfg and cfg.t_end
     E.dt = 1 / ((cfg and cfg.fps) or 30)
     return E
   end
@@ -1321,24 +1331,61 @@ local function plane1(t, lo, hi, p, v, e)
   return p, v, hit
 end
 
-local function bounce(B, px, py, pz, vx, vy, vz, t)
+-- 範囲の中だけの面（v0.14.0。原作の領域内反射のオフ）: ほかの 2 軸が範囲の中（ok）で、1 刻み前（p − v × h）は面の内側だったときだけ跳ね返す。
+-- 範囲の外を通った粒子は、面の延長をすり抜ける（後で範囲に入っても引き戻さない）
+local function plane1f(t, lo, hi, p, v, e, ok, h)
+  if not ok then return p, v, false end
+  local prev = p - v * h
+  local hit = false
+  if (t == 0 or t == 1) and p < lo and prev >= lo then p = 2 * lo - p; if v < 0 then v = -v * e end; hit = true end
+  if (t == 0 or t == 2) and p > hi and prev <= hi then p = 2 * hi - p; if v > 0 then v = -v * e end; hit = true end
+  return p, v, hit
+end
+
+-- 最後に当たった面の向き（粒子の側を向く単位の向き。XY だけ。転がる回転に使う。v0.15.0）
+local bnx, bny = 0, -1
+
+-- t = シミュレーション時刻、age = 粒子の年齢（面を変える時刻を粒子ごとに数えるとき）
+local function bounce(B, px, py, pz, vx, vy, vz, t, age)
   local h1, h2, h3_, hs, hshape
-  px, vx, h1 = plane1(B.bx, B.xmin, B.xmax, px, vx, B.ex)
-  py, vy, h2 = plane1(B.by, B.ymin, B.ymax, py, vy, B.ey)
-  pz, vz, h3_ = plane1(B.bz, B.zmin, B.zmax, pz, vz, B.ez)
+  local bx, by, bz, sph = B.bx, B.by, B.bz, B.sph
+  -- 面を変える時刻（v0.14.0。原作のタイプ変更時間）: その時刻より後は、変えた後の面（0 はそのまま）
+  if (B.ctime or 0) > 0 then
+    local tt
+    if B.crel then tt = age else tt = t and (B.obj and B.obj(t) or t) end
+    if tt and tt >= B.ctime then
+      if B.cbx > 0 then bx = B.cbx - 1 end
+      if B.cby > 0 then by = B.cby - 1 end
+      if B.cbz > 0 then bz = B.cbz - 1 end
+      if B.csph > 0 then sph = B.csph - 1 end
+    end
+  end
+  if B.finite then
+    local h = B.h or 0
+    local inx, iny, inz = px >= B.xmin and px <= B.xmax, py >= B.ymin and py <= B.ymax, pz >= B.zmin and pz <= B.zmax
+    px, vx, h1 = plane1f(bx, B.xmin, B.xmax, px, vx, B.ex, iny and inz, h)
+    py, vy, h2 = plane1f(by, B.ymin, B.ymax, py, vy, B.ey, inx and inz, h)
+    pz, vz, h3_ = plane1f(bz, B.zmin, B.zmax, pz, vz, B.ez, inx and iny, h)
+  else
+    px, vx, h1 = plane1(bx, B.xmin, B.xmax, px, vx, B.ex)
+    py, vy, h2 = plane1(by, B.ymin, B.ymax, py, vy, B.ey)
+    pz, vz, h3_ = plane1(bz, B.zmin, B.zmax, pz, vz, B.ez)
+  end
+  if h1 then bnx, bny = (abs(px - B.xmin) < abs(px - B.xmax)) and 1 or -1, 0 end
+  if h2 then bnx, bny = 0, (abs(py - B.ymin) < abs(py - B.ymax)) and 1 or -1 end
   local kf = 1 - (B.fric or 0) / 100
   if kf < 1 then
     if h1 then vy, vz = vy * kf, vz * kf end
     if h2 then vx, vz = vx * kf, vz * kf end
     if h3_ then vx, vy = vx * kf, vy * kf end
   end
-  if B.sph ~= 0 then
+  if sph ~= 0 then
     local cx, cy, cz, R = B.cx, B.cy, B.cz, B.srad
     local dx, dy, dz = px - cx, py - cy, pz - cz
     local d = sqrt(dx * dx + dy * dy + dz * dz)
     if d > 1e-9 then
       local nx, ny, nz = dx / d, dy / d, dz / d
-      local outside = B.sph == 1 or (B.sph == 3 and py <= cy)
+      local outside = sph == 1 or (sph == 3 and py <= cy)
       if outside and d < R then
         px, py, pz = cx + nx * R, cy + ny * R, cz + nz * R
         local vn = vx * nx + vy * ny + vz * nz
@@ -1351,7 +1398,8 @@ local function bounce(B, px, py, pz, vx, vy, vz, t)
           vx, vy, vz = nx * v2 + (vx - nx * v2) * kf, ny * v2 + (vy - ny * v2) * kf, nz * v2 + (vz - nz * v2) * kf
         end
         hs = true
-      elseif B.sph == 2 and d > R then
+        bnx, bny = nx, ny
+      elseif sph == 2 and d > R then
         px, py, pz = cx + nx * R, cy + ny * R, cz + nz * R
         local vn = vx * nx + vy * ny + vz * nz
         if vn > 0 then
@@ -1363,6 +1411,7 @@ local function bounce(B, px, py, pz, vx, vy, vz, t)
           vx, vy, vz = nx * v2 + (vx - nx * v2) * kf, ny * v2 + (vy - ny * v2) * kf, nz * v2 + (vz - nz * v2) * kf
         end
         hs = true
+        bnx, bny = -nx, -ny
       end
     end
   end
@@ -1400,6 +1449,7 @@ local function bounce(B, px, py, pz, vx, vy, vz, t)
           vx, vy, vz = nx * v2 + (vx - nx * v2) * kf, ny * v2 + (vy - ny * v2) * kf, vz * kf
         end
         hshape = true
+        bnx, bny = nx, ny
       end
     end
   end
@@ -1732,7 +1782,8 @@ typedef struct {
   int32_t key, steps, flags, nb, tgt;
   double px, py, pz, dx, dy, dz, s, wx, wy, wz, tb, td, ac, bb;
   double e1x, e1y, e1z, e1vx, e1vy, e2x, e2y, e2z, e2vx, e2vy, tk;
-} PRH_State8;
+  double roll, om;
+} PRH_State9;
 ]])
 
 -- 状態の旗
@@ -1750,6 +1801,7 @@ local function advance(P, q, S, from, to)
   local wx, wy, wz = S.wx, S.wy, S.wz
   local ac, flags, nb, tgt, tb, td = S.ac, S.flags, S.nb, S.tgt, S.tb, S.td
   local tk = S.tk
+  local roll, om = S.roll, S.om
   local KP = P.keep
   local k, sk = q.k, q.sk
   local W, N, A, B, D, U, T = P.wind, P.noise, P.att, P.bnc, P.disp, P.sus, P.act
@@ -1760,7 +1812,10 @@ local function advance(P, q, S, from, to)
     local t = q.b + ta
     local nb0 = nb
     if not T or in_window(T.win, T.rel and ta or T.obj(t)) then
-      if q.t_stop > 0 and bit.band(flags, F_STOP) == 0 and ta >= q.t_stop then
+      -- 分散してから止める: 止める時刻は 分散した時刻 ＋ つなぐ時間（分散するまでは止めない）
+      local tstop = q.t_stop
+      if q.link1 then tstop = bit.band(flags, F_DISP) ~= 0 and (td + q.link_t) or 0 end
+      if tstop > 0 and bit.band(flags, F_STOP) == 0 and ta >= tstop then
         s, wx, wy, wz = 0, 0, 0, 0
         flags = bit.bor(flags, F_STOP)
       end
@@ -1771,7 +1826,7 @@ local function advance(P, q, S, from, to)
         local ux, uy, uz = dx, dy, dz
         if sp > 1e-9 then ux, uy, uz = vx / sp, vy / sp, vz / sp end
         ux, uy, uz = turn(ux, uy, uz, (rnd(k, CH.disp1, sk) * 2 - 1) * D.xy, (rnd(k, CH.disp2, sk) * 2 - 1) * D.z)
-        if D.speed_set then sp = q.disp_speed end
+        if D.speed_set or q.link2 then sp = q.disp_speed end
         dx, dy, dz, s, wx, wy, wz = ux, uy, uz, sp, 0, 0, 0
         if D.acc_set then ac = D.acc end
         flags = bit.bor(flags, F_DISP)
@@ -1825,6 +1880,10 @@ local function advance(P, q, S, from, to)
             fx, fy, fz = fx + ax_, fy + ay_, fz + az_
           end
         end
+      end
+      if q.drag then
+        -- 子粒子の空気抵抗（v0.15.0。子に動きの拡張を掛けるとき。閉じた式の子と同じ、速さに比例する抵抗）
+        fx, fy, fz = fx - q.drag * (dx * s + wx), fy - q.drag * (dy * s + wy), fz - q.drag * (dz * s + wz)
       end
       if ac ~= 0 then
         s = s + ac * h
@@ -1905,7 +1964,7 @@ local function advance(P, q, S, from, to)
       px, py, pz = px + mx_ * h, py + my_ * h, pz + mz_ * h
       if B then
         local hit
-        px, py, pz, vx, vy, vz, hit = bounce(B, px, py, pz, vx, vy, vz, t + h)
+        px, py, pz, vx, vy, vz, hit = bounce(B, px, py, pz, vx, vy, vz, t + h, ta + h)
         if hit then
           if B.irr and rnd(k * 131 + nb, CH.irr, sk) * 100 < B.irrp then
             local sp = sqrt(vx * vx + vy * vy + vz * vz)
@@ -1923,7 +1982,10 @@ local function advance(P, q, S, from, to)
           local spd = sqrt(vx * vx + vy * vy + vz * vz)
           if spd > 1e-12 then dx, dy, dz = vx / spd, vy / spd, vz / spd end
           s, wx, wy, wz = spd, 0, 0, 0
+          -- 転がる（v0.15.0）: 当たった後の面に沿う速さ ÷ 半径 で回る（宙では同じ速さで回り続ける）
+          if B.roll then om = (bnx * vy - bny * vx) / B.rrad end
         end
+        if B.roll then roll = roll + om * h end
       end
       -- 止まったら残す（v0.8.0）: 跳ね返った直後か急停止した後に、速さがしきい値を下回ったら、その場に止める
       -- （跳ね返った後のいつでも見ると、小さく跳ねた頂点で宙に止まる）
@@ -1933,6 +1995,7 @@ local function advance(P, q, S, from, to)
           flags = bit.bor(flags, F_PARK)
           tk = ta + h
           s, wx, wy, wz = 0, 0, 0, 0
+          om = 0
           if P.hist2 and (i + 1) % P.hstride2 == 0 then
             local base2 = q.slot * P.hm2 + ((i + 1) / P.hstride2) % P.hm2
             P.hist2[base2 * 3], P.hist2[base2 * 3 + 1], P.hist2[base2 * 3 + 2] = px, py, pz
@@ -1956,6 +2019,7 @@ local function advance(P, q, S, from, to)
   S.px, S.py, S.pz, S.dx, S.dy, S.dz, S.s = px, py, pz, dx, dy, dz, s
   S.wx, S.wy, S.wz, S.ac, S.flags, S.nb, S.tgt, S.tb, S.td = wx, wy, wz, ac, flags, nb, tgt, tb, td
   S.tk = tk
+  S.roll, S.om = roll, om
   S.steps = to
 end
 M.advance = advance
@@ -2255,6 +2319,7 @@ local function inter_resolve(W, IN)
     end
     cand, nc = next_c, nn
   end
+  local FR = (IN.fric > 0) and W.fpos or nil
   for i, m in pairs(moved) do
     local S = st[i - 1]
     local ml = sqrt(m[1] * m[1] + m[2] * m[2] + m[3] * m[3])
@@ -2262,7 +2327,24 @@ local function inter_resolve(W, IN)
       local nx, ny, nz = m[1] / ml, m[2] / ml, m[3] / ml
       local vx, vy, vz = S.dx * S.s + S.wx, S.dy * S.s + S.wy, S.dz * S.s + S.wz
       local vn = vx * nx + vy * ny + vz * nz
-      if vn < 0 then set_velocity(S, vx - vn * nx, vy - vn * ny, vz - vn * nz) end
+      if vn < 0 then vx, vy, vz = vx - vn * nx, vy - vn * ny, vz - vn * nz; set_velocity(S, vx, vy, vz) end
+      -- 静止摩擦（v0.15.0）: このラウンドに相手に沿ってずれた分を、押し戻した量 × 摩擦 まで打ち消す（位置で解く摩擦。
+      -- 押し合うほどずれにくい）。ずれを打ち消した割合だけ、面に沿う速さも消す
+      if FR then
+        local o = i * 3
+        local tx, ty, tz = S.px - FR[o], S.py - FR[o + 1], d3 and (S.pz - FR[o + 2]) or 0
+        local tn = tx * nx + ty * ny + tz * nz
+        tx, ty, tz = tx - tn * nx, ty - tn * ny, tz - tn * nz
+        local tl = sqrt(tx * tx + ty * ty + tz * tz)
+        if tl > 1e-12 then
+          local lim = IN.fric * ml
+          local f = tl <= lim and 1 or lim / tl
+          S.px, S.py, S.pz = S.px - tx * f, S.py - ty * f, S.pz - tz * f
+          local vn2 = vx * nx + vy * ny + vz * nz
+          local wtx, wty, wtz = vx - vn2 * nx, vy - vn2 * ny, vz - vn2 * nz
+          set_velocity(S, vx - wtx * f, vy - wty * f, vz - wtz * f)
+        end
+      end
     end
   end
 end
@@ -2277,7 +2359,8 @@ local function world_round(P, W, r, init)
   local IN = P.inter
   local t0, t1 = r * h, (r + 1) * h
   -- 生まれる粒子
-  local e0 = max(floor(W.rate.count(t0 - W.wmax)) - 1, 0)
+  -- 下限は t0 のほんの少し前で数える（ちょうど t0 に一斉に出した分を、もう出たものとして飛ばさない。v0.16.0 で直した）
+  local e0 = max(floor(W.rate.count(t0 - W.wmax - h * 1e-6)) - 1, 0)
   local e1 = floor(W.rate.count(t1 + W.wmax)) + 1
   for e = e0, e1 do
     for j = 0, W.sync - 1 do
@@ -2289,8 +2372,8 @@ local function world_round(P, W, r, init)
           local i = W.n + 1
           if i > W.stcap then
             local cap2 = W.stcap * 2
-            local st2 = ffi.new("PRH_State8[?]", cap2)
-            ffi.copy(st2, W.st, ffi.sizeof("PRH_State8") * W.n)
+            local st2 = ffi.new("PRH_State9[?]", cap2)
+            ffi.copy(st2, W.st, ffi.sizeof("PRH_State9") * W.n)
             W.st, W.stcap = st2, cap2
           end
           W.n = i
@@ -2301,6 +2384,7 @@ local function world_round(P, W, r, init)
           S.key, S.steps, S.flags, S.nb, S.tgt, S.bb = q.k, 0, 0, 0, -1, q.b
           S.px, S.py, S.pz, S.dx, S.dy, S.dz, S.s = px, py, pz, ux, uy, uz, v0
           S.wx, S.wy, S.wz, S.tb, S.td, S.ac, S.tk = 0, 0, 0, -1, -1, ac, -1
+          S.roll, S.om = 0, 0
           if P.hist2 then
             for jj = 0, P.hm2 - 1 do P.hstep2[q.slot * P.hm2 + jj] = -1 end
           end
@@ -2318,6 +2402,12 @@ local function world_round(P, W, r, init)
   -- 粒子どうしの力（ラウンドの始めの位置から）
   local Fb = inter_forces(W, IN)
   local st = W.st
+  -- 静止摩擦（v0.15.0）: 進める前の位置（位置の直しで、このラウンドのずれを測る）
+  local FR
+  if IN.size > 0 and IN.fric > 0 then
+    if not W.fpos or W.fposn < (W.n + 1) * 3 then W.fposn = (W.n + 1) * 3 * 2; W.fpos = ffi.new("double[?]", W.fposn) end
+    FR = W.fpos
+  end
   for i = 1, W.n do
     if not W.frozen[i] then
       local S = st[i - 1]
@@ -2329,6 +2419,7 @@ local function world_round(P, W, r, init)
           set_velocity(S, S.dx * S.s + S.wx + ux, S.dy * S.s + S.wy + uy, S.dz * S.s + S.wz + uz)
         end
         local q = W.q[i]
+        if FR then FR[i * 3], FR[i * 3 + 1], FR[i * 3 + 2] = S.px, S.py, S.pz end
         local gx, gy, gz = q.gx, q.gy, q.gz
         local fx_, fy_, fz_ = Fb[o], Fb[o + 1], Fb[o + 2]
         q.gx, q.gy, q.gz = gx + fx_, gy + fy_, gz + fz_
@@ -2383,7 +2474,7 @@ local function world_round(P, W, r, init)
       if not (W.frozen[i] and t1 > q.b + q.L + keep_after) then
         m = m + 1
         if m ~= i then
-          ffi.copy(st + (m - 1), st + (i - 1), ffi.sizeof("PRH_State8"))
+          ffi.copy(st + (m - 1), st + (i - 1), ffi.sizeof("PRH_State9"))
           W.ks[m], W.es[m], W.js[m], W.q[m], W.frozen[m] = W.ks[i], W.es[i], W.js[i], W.q[i], W.frozen[i]
         end
         W.idx[W.ks[m]] = m
@@ -2404,8 +2495,8 @@ local function world_advance(P, W, R, init)
     W.n, W.active, W.idx, W.ks, W.es, W.js, W.q, W.frozen = 0, 0, {}, {}, {}, {}, {}, {}
     W.r, W.over = 0, 0
     if best then
-      if best.n > W.stcap then W.st, W.stcap = ffi.new("PRH_State8[?]", best.n), best.n end
-      ffi.copy(W.st, best.st, ffi.sizeof("PRH_State8") * best.n)
+      if best.n > W.stcap then W.st, W.stcap = ffi.new("PRH_State9[?]", best.n), best.n end
+      ffi.copy(W.st, best.st, ffi.sizeof("PRH_State9") * best.n)
       W.n, W.r = best.n, best.r
       for i = 1, best.n do
         local q = init(best.es[i], best.js[i])
@@ -2432,8 +2523,8 @@ local function world_advance(P, W, R, init)
       local have = false
       for _, C in ipairs(W.cps) do if C.r == W.r then have = true; break end end
       if not have then
-        local C = { r = W.r, n = W.n, st = ffi.new("PRH_State8[?]", max(W.n, 1)), ks = {}, es = {}, js = {}, frozen = {} }
-        ffi.copy(C.st, W.st, ffi.sizeof("PRH_State8") * W.n)
+        local C = { r = W.r, n = W.n, st = ffi.new("PRH_State9[?]", max(W.n, 1)), ks = {}, es = {}, js = {}, frozen = {} }
+        ffi.copy(C.st, W.st, ffi.sizeof("PRH_State9") * W.n)
         for i = 1, W.n do C.ks[i], C.es[i], C.js[i], C.frozen[i] = W.ks[i], W.es[i], W.js[i], W.frozen[i] end
         W.cps[#W.cps + 1] = C
       end
@@ -2442,17 +2533,54 @@ local function world_advance(P, W, R, init)
 end
 M.world_advance = world_advance
 
+-- 分散と急停止をつなぐ: 粒子ごとの つなぐ時間 と、止まってから分散する時刻（q.t_stop と q.t_disp を決めた後に呼ぶ）
+-- v0 = 生まれたときの速さ。止まってから分散するとき、分散の速さを決めていなければこの速さで動き出す（止まった粒子は速さ 0 なので）
+local function disp_link(P, q, ik, sk, v0)
+  q.link1, q.link2, q.link_t = false, false, 0
+  local D = P.dlink
+  if not D then return end
+  q.link_t = max(vary(D.t, D.i, rnd(ik, CH.dlink, sk)), 0.001)
+  if D.mode == 1 then
+    q.link1 = true
+  elseif D.mode == 2 and not D.by_bounce and q.t_stop > 0 then
+    q.t_disp = q.t_stop + q.link_t
+    if not P.disp.speed_set then q.link2, q.disp_speed = true, v0 or 0 end
+  end
+end
+M.disp_link = disp_link
+
+-- 最初に跳ね返る年齢の先読み（v0.14.0。フィルター・色の「跳ね返るまで」）: 状態 S の写しを、跳ね返るか寿命 L まで 1 刻みずつ進める。
+-- 軌跡の履歴は汚さない（先読みの間は書かない）。跳ね返らなければ -1
+function M.first_bounce(P, q, S, L)
+  if bit.band(S.flags, F_BNC) ~= 0 and S.tb >= 0 then return S.tb end
+  local T = ffi.new("PRH_State9")
+  ffi.copy(T, S, ffi.sizeof("PRH_State9"))
+  local h1, h2 = P.hist, P.hist2
+  P.hist, P.hist2 = nil, nil
+  local last = floor(L / P.h)
+  local out = -1
+  for i = T.steps, last - 1 do
+    advance(P, q, T, i, i + 1)
+    if bit.band(T.flags, F_BNC) ~= 0 then out = T.tb; break end
+    if bit.band(T.flags, F_DEAD + F_PARK) ~= 0 then break end
+  end
+  P.hist, P.hist2 = h1, h2
+  return out
+end
+
 -- 状態の置き場。呼び手がオブジェクトごとに持つ表 cache に入れる。設定（sig）が変われば作り直す
 function M.prepare_cache(cache, sig, alive_hint, hist_m, hist2_m)
   local cap = 64
   while cap < alive_hint * 2 + 64 do cap = cap * 2 end
   hist_m, hist2_m = hist_m or 0, hist2_m or 0
   if cache.sig ~= sig or not cache.st or cache.cap < cap or (cache.hm or 0) ~= hist_m or (cache.hm2 or 0) ~= hist2_m then
-    cache.st = ffi.new("PRH_State8[?]", cap)
+    cache.st = ffi.new("PRH_State9[?]", cap)
     for i = 0, cap - 1 do cache.st[i].key = -1 end
     cache.cap = cap
     cache.sig = sig
     cache.world = nil
+    cache.fb = nil
+    cache.child = nil
     cache.resets = (cache.resets or 0) + 1
     cache.hm = hist_m
     if hist_m > 0 then
@@ -2539,7 +2667,12 @@ local function jitter(J, k, axis, sk)
   if J.curve then
     local p0, p1, p2, p3 = node(seg - 1), node(seg), node(seg + 1), node(seg + 2)
     local f2, f3 = f * f, f * f * f
-    return 0.5 * ((2 * p1) + (-p0 + p2) * f + (2 * p0 - 5 * p1 + 4 * p2 - p3) * f2 + (-p0 + 3 * p1 - 3 * p2 + p3) * f3)
+    local c = 0.5 * ((2 * p1) + (-p0 + p2) * f + (2 * p0 - 5 * p1 + 4 * p2 - p3) * f2 + (-p0 + 3 * p1 - 3 * p2 + p3) * f3)
+    -- 滑らかさ（v0.14.0。原作のパターン 0〜101）: 1 で曲線のまま、0 で折れ線、間は 2 つを混ぜる
+    local sm = J.smooth or 1
+    if sm >= 1 then return c end
+    local lin = p1 + (p2 - p1) * f
+    return lin + (c - lin) * sm
   end
   local a = node(seg)
   return a + (node(seg + 1) - a) * f
@@ -2576,7 +2709,8 @@ function M.prepare_motion(cfg)
   end
   if beh then
     if beh.jx ~= 0 or beh.jy ~= 0 or beh.jz ~= 0 then
-      J = { n = max(floor(beh.jn), 1), curve = beh.jpat == 1, x = beh.jx, y = beh.jy, z = beh.jz }
+      J = { n = max(floor(beh.jn), 1), curve = beh.jpat == 1, x = beh.jx, y = beh.jy, z = beh.jz,
+            smooth = min(max((beh.jsmooth or 100) / 100, 0), 1) }
     end
     if beh.yx ~= 0 or beh.yy ~= 0 or beh.yz ~= 0 then
       WB = { speed = beh.ys, x = beh.yx, y = beh.yy, z = beh.yz, rel = beh.yrel, i_speed = beh.i_ys, i_amp = beh.i_ya }
@@ -2589,7 +2723,7 @@ function M.prepare_motion(cfg)
     if not TW.emit_win and not TW.act_win then TW = nil end
   end
   local sus = beh and beh.sp > 0
-  local dispon = disp and (disp.dt > 0 or disp.dbounce)
+  local dispon = disp and (disp.dt > 0 or disp.dbounce or ((disp.link or 0) == 2 and disp.stop > 0))
   local stopon = disp and disp.stop > 0
   local RT = cfg.rt or {}
   local vec = beh and RT.vfn
@@ -2644,13 +2778,20 @@ function M.prepare_motion(cfg)
     P.bnc = { bx = bnc.bx, by = bnc.by, bz = bnc.bz, xmin = bnc.xmin, xmax = bnc.xmax, ymin = bnc.ymin, ymax = bnc.ymax,
               zmin = bnc.zmin, zmax = bnc.zmax, ex = bnc.ex, ey = bnc.ey, ez = bnc.ez, sph = bnc.sph,
               cx = sp[1] or 0, cy = sp[2] or 0, cz = sp[3] or 0, srad = max(bnc.srad, 1), se = bnc.se,
-              irr = bnc.irr, irrp = bnc.irrp, irra = bnc.irra, shape = RT.bshape, fric = bnc.fric or 0 }
+              irr = bnc.irr, irrp = bnc.irrp, irra = bnc.irra, shape = RT.bshape, fric = bnc.fric or 0,
+              finite = (bnc.finite or 0) == 1, h = P.h, ctime = bnc.ctime or 0, crel = bnc.crel, obj = cfg.obj_time,
+              cbx = bnc.cbx or 0, cby = bnc.cby or 0, cbz = bnc.cbz or 0, csph = bnc.csph or 0,
+              roll = bnc.roll or nil, rrad = max(bnc.rrad or 10, 1e-3) }
   end
   if dispon then
     P.disp = { by_bounce = disp.dbounce, time = disp.dbounce and 0 or disp.dt, i_time = disp.i_dt, xy = disp.dxy, z = disp.dz,
                speed_set = disp.dspd == 1, speed = disp.dv, acc_set = disp.dacc_on, acc = disp.dac }
   end
   if stopon then P.stop = { time = disp.stop, i_time = disp.i_stop } end
+  -- 分散と急停止をつなぐ（v0.14.0。原作の分散停止リンク）: 1 = 分散してから つなぐ時間 で止める / 2 = 止まってから つなぐ時間 で分散する
+  if disp and (disp.link or 0) ~= 0 and dispon then
+    P.dlink = { mode = disp.link, t = max(disp.link_t or 1, 0.001), i = disp.i_link or 0, by_bounce = disp.dbounce }
+  end
   if sus then
     local x, y, z = beh.sdx, beh.sdy, beh.sdz
     local l = sqrt(x * x + y * y + z * z)
@@ -2665,6 +2806,7 @@ function M.prepare_motion(cfg)
       sep = inter.sep / 100, ali = inter.ali / 100, coh = inter.coh / 100, view = cos(min(max(inter.view, 0), 180) * RAD),
       vmin = max(inter.vmin, 0), vmax = max(inter.vmax, 0), d3 = inter.d3,
       other = RT.inter_other, orad = max(inter.orad or 0, 0), orep = inter.orep or 0,
+      max = max(floor(inter.imax or M.INTER_MAX), 1),
     }
   end
   local TR = cfg.trail
@@ -2692,6 +2834,80 @@ end
 
 
 --[[
+拡大率・透過率（v0.16.0 に simulate から切り出した。焼き付けを読んだ後に、今の設定で計算し直すのにも使う）。
+tb・td = 最初に跳ね返った年齢・分散した年齢（無ければ huge）。戻り値: 拡大率（倍）, 不透明度（0..1）
+]]
+local function zoom_alpha_setup(cfg, zoal, indiv, track, now)
+  local TC_ = cfg.track_const or {}
+  return { zoal = zoal, indiv = indiv, track = track, obj_now = zoal and zoal.by_object and cfg.obj_time(now) or 0,
+           z0 = TC_.zoom0, z1 = TC_.zoom1, a0 = TC_.alpha0, a1 = TC_.alpha1 }
+end
+local function zoom_alpha(ZA, k, ik, sk, b, L, age_e, tb, td)
+  local zoal, indiv, track = ZA.zoal, ZA.indiv, ZA.track
+  local z0, z1, a0, a1
+  if zoal then
+    z0, z1, a0, a1 = zoal.zoom0, zoal.zoom1, zoal.alpha0, zoal.alpha1
+  else
+    z0, z1, a0, a1 = (ZA.z0 or track("zoom0", b)), (ZA.z1 or track("zoom1", b)), (ZA.a0 or track("alpha0", b)), (ZA.a1 or track("alpha1", b))
+  end
+  if indiv then
+    local rz_ = rnd(ik, CH.zoom, sk)
+    local ra_ = rnd(ik, CH.alpha, sk)
+    z0, z1 = vary(z0, indiv.zoom, rz_), vary(z1, indiv.zoom, rz_)
+    a0, a1 = vary(a0, indiv.alpha, ra_), vary(a1, indiv.alpha, ra_)
+  end
+  local zm, tr
+  if zoal then
+    local Lend, xk = L, age_e
+    if zoal.by_object then Lend, xk = zoal.total, ZA.obj_now end
+    zm = eval_keys(zoal.zm, z0, z1, Lend, xk, zoal.zmode, zoal.zb, tb, zoal.zd, td, zoal.zshape)
+    tr = eval_keys(zoal.am, a0, a1, Lend, xk, zoal.amode, zoal.ab, tb, zoal.ad, td, zoal.ashape)
+  else
+    local f = age_e / L
+    zm = z0 + (z1 - z0) * f
+    tr = a0 + (a1 - a0) * f
+  end
+  return max(zm, 0) / 100, min(max(1 - tr / 100, 0), 1)
+end
+
+--[[
+焼き付けを読んだ粒子の拡大率・透過率を、今の設定で計算し直す（v0.16.0。見た目だけを変えたときも焼き付けを使い続けるため）。
+cfg は simulate に渡すものと同じ。位置・回転・年齢・寿命・跳ね返りの年齢は焼き付けのまま。見た目の調整・音の大きさ・格子の型抜きも掛け直す
+]]
+function M.relook(res, cfg)
+  local zoal = M.prepare_zoal(cfg.zoal)
+  local indiv = cfg.indiv
+  local same_group = indiv and indiv.same_group
+  local track = cfg.track
+  if cfg.track_const then
+    local TC, track0 = cfg.track_const, track
+    track = function(name, t)
+      local v = TC[name]
+      if v ~= nil then return v end
+      return track0(name, t)
+    end
+  end
+  local ZA = zoom_alpha_setup(cfg, zoal, indiv, track, cfg.now or 0)
+  local CD = cfg.child
+  local sk0, rsk = cfg.sk, res.rsk
+  for i = 0, res.n - 1 do
+    local k, b, L, age = res.k[i], res.b[i], res.life[i], res.age[i]
+    if CD and k >= 0x30000000 then
+      res.zoom[i] = CD.zoom / 100
+      res.alpha[i] = min(max(1 - CD.alpha1 / 100 * age / CD.life, 0), 1)
+    else
+      local sk = (res.rs and res.rs[i] == 1 and rsk) or sk0
+      local ik = same_group and res.e[i] or k
+      local tb = (res.tb and res.tb[i] >= 0) and res.tb[i] or huge
+      local td = (res.td and res.td[i] >= 0) and res.td[i] or huge
+      res.zoom[i], res.alpha[i] = zoom_alpha(ZA, k, ik, sk, b, L, min(age, L), tb, td)
+    end
+  end
+  M.post(res, cfg, true)
+end
+M.zoom_alpha = zoom_alpha
+
+--[[
 cfg（呼び手が作る）:
   now       シミュレーション時刻（秒）
   t_end     シミュレーション時刻での終わり（終了時に消える）
@@ -2710,6 +2926,15 @@ cfg（呼び手が作る）:
 function M.simulate(cfg)
   local now, sk, sync = cfg.now, cfg.sk, max(floor(cfg.sync or 1), 1)
   local track, rate = cfg.track, cfg.rate
+  -- 動かないトラックバーの値は表から直接読む（呼び手の track を毎回呼ばない。v0.16.0）
+  if cfg.track_const then
+    local TC, track0 = cfg.track_const, track
+    track = function(name, t)
+      local v = TC[name]
+      if v ~= nil then return v end
+      return track0(name, t)
+    end
+  end
   local indiv, rot, zoal = cfg.indiv, cfg.rot, M.prepare_zoal(cfg.zoal)
   local vmul = zoal and zoal.vmul
   local emit = M.prepare_emit(cfg.emit, cfg.rt, cfg)
@@ -2738,6 +2963,24 @@ function M.simulate(cfg)
   local CD = cfg.child
   local KP = P and P.keep
   local LOOPE = cfg.loop_e
+  -- 子粒子に動きの拡張を掛ける（v0.15.0）: 親と同じ風・ノイズ場・力場・跳ね返りで、子も積分する。集結点・分散と停止・
+  -- 時間の窓・止まったら残す・挙動不審・速度倍率・速度の関数・履歴は子には掛けない。状態は子の番号ごとに取っておく
+  local CP, cq, cgen
+  if CD and CD.ext and P and not O and not PA then
+    CP = {}
+    for kk, vv in pairs(P) do CP[kk] = vv end
+    CP.att, CP.disp, CP.act, CP.keep, CP.sus, CP.vmul, CP.vec, CP.hist, CP.hist2, CP.stop, CP.dlink = nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil
+    -- 子の設定が変われば、取っておいた子の状態を捨てる（親の設定が変われば置き場ごと作り直される）
+    local csig = table.concat({ CD.event, CD.n, CD.interval, CD.speed, CD.spread, CD.inherit, CD.life, CD.gy, CD.drag }, ",")
+    if not P.cache.child or P.cache.child.csig ~= csig then P.cache.child = { st = {}, seen = {}, gen = 0, csig = csig } end
+    CP.cst = P.cache.child
+    CP.cst.gen = CP.cst.gen + 1
+    cgen = CP.cst.gen
+    local ff = {}
+    if P.fields then for fi = 1, #P.fields do ff[fi] = 1 end end
+    cq = { fwind = 1, fnoise = 1, ff = ff, t_stop = 0, t_disp = 0, disp_speed = 0, link1 = false, link2 = false, slot = 0,
+           gx = 0, gy = CD.gy, gz = 0, drag = CD.drag > 0 and CD.drag or nil }
+  end
   local t_lo = now - cfg.life_max - jitter - (CD and CD.life or 0)
   local e_lo = t_lo <= 0 and 0 or max(floor(rate.count(t_lo)) - 1, 0)
   if KP then e_lo = max(e_lo - ceil(KP.max / sync), 0) end
@@ -2802,6 +3045,7 @@ function M.simulate(cfg)
       q.t_disp = (P.disp and P.disp.time > 0) and max(vary(P.disp.time, P.disp.i_time, rnd(ik, CH.tdisp, skp)), 0) or 0
       q.t_stop = (P.stop and P.stop.time > 0) and max(vary(P.stop.time, P.stop.i_time, rnd(ik, CH.tstop, skp)), 1e-9) or 0
       q.disp_speed = P.disp and P.disp.speed or 0
+      disp_link(P, q, ik, skp, v0)
       if P.att then
         q.t_att = vary(P.att.start, P.att.i_start, rnd(ik, CH.tatt, skp))
         q.att_xy = P.att.xy + (rnd(k, CH.attxy, skp) * 2 - 1) * P.att.exy
@@ -2813,10 +3057,10 @@ function M.simulate(cfg)
     if not W then
       local cpr = max(ceil(max(cfg.t_end or 0, 1) / M.INTER_CP / P.h), ceil(1 / P.h))
       W = { r = 0, n = 0, active = 0, ks = {}, es = {}, js = {}, q = {}, frozen = {}, idx = {}, cps = {}, over = 0,
-            st = ffi.new("PRH_State8[?]", 256), stcap = 256, cp_every = cpr }
+            st = ffi.new("PRH_State9[?]", 256), stcap = 256, cp_every = cpr }
       P.cache.world = W
     end
-    W.rate, W.sync, W.cap, W.h = rate, sync, P.INTER_MAX or M.INTER_MAX, P.h
+    W.rate, W.sync, W.cap, W.h = rate, sync, P.inter.max or M.INTER_MAX, P.h
     W.wmax = jitter
     W.keep_after = (CD and CD.life or 0) + 2 * P.h
     W.keep_max = KP and KP.max or nil
@@ -2870,6 +3114,9 @@ function M.simulate(cfg)
     out.rs = ffi.new("uint8_t[?]", cap)
     out.rsk = RSK
   end
+  -- フィルター・色の「跳ね返ってから / 跳ね返るまで」（v0.14.0）: 最初に跳ね返った年齢と、その先読み（-1 は跳ね返らない）
+  if cfg.need_tb then out.tb, out.tbp = ffi.new("double[?]", cap), ffi.new("double[?]", cap) end
+  if cfg.need_td then out.td = ffi.new("double[?]", cap) end
   local TR = cfg.trail
   local TN = (TR and TR.n > 0) and TR.n or 0
   if TN > 0 then
@@ -2880,6 +3127,13 @@ function M.simulate(cfg)
     out.tok = ffi.new("uint8_t[?]", cap * TN)
   end
   local overflow = 0
+  -- 動かないトラックバーの値（ループの中で毎回 track を呼ばない。v0.16.0）
+  local TC_ = cfg.track_const or {}
+  local TC_life, TC_dir, TC_spread, TC_zdir, TC_zspread = TC_.life, TC_.dir, TC_.spread, TC_.zdir, TC_.zspread
+  local TC_speed, TC_accel, TC_gx, TC_gy, TC_gz = TC_.speed, TC_.accel, TC_.gx, TC_.gy, TC_.gz
+  local TC_rx0, TC_ry0, TC_rz0, TC_vrx, TC_vry, TC_vrz = TC_.rx0, TC_.ry0, TC_.rz0, TC_.vrx, TC_.vry, TC_.vrz
+  local TC_zoom0, TC_zoom1, TC_alpha0, TC_alpha1 = TC_.zoom0, TC_.zoom1, TC_.alpha0, TC_.alpha1
+  local ZA = zoom_alpha_setup(cfg, zoal, indiv, track, now)
   -- 新しい粒子から数えて上限で打ち切る（古い粒子を落とす）。描く順は後で並べ直す
   for e = e_hi, e_lo, -1 do
     local te = rate.time_of(e)
@@ -2898,7 +3152,7 @@ function M.simulate(cfg)
         end
         local age = now - b
         if age >= 0 then
-          local L = track("life", b)
+          local L = (TC_life or track("life", b))
           if indiv and indiv.life ~= 0 then L = vary(L, indiv.life, rnd(ik, CH.life, sk)) end
           L = max(L, 0.001)
           if cfg.vanish_at_end then L = min(L, cfg.t_end - b) end
@@ -2917,13 +3171,13 @@ function M.simulate(cfg)
               local noemit = px == nil
               if noemit then px, py, pz = 0, 0, 0 end
               -- 向きと速さ
-              local dir = (odir or track("dir", b)) + (rnd(k, CH.dir, sk) * 2 - 1) * track("spread", b)
-              local zd = (ozd or track("zdir", b)) + (rnd(k, CH.zdir, sk) * 2 - 1) * track("zspread", b)
+              local dir = (odir or (TC_dir or track("dir", b))) + (rnd(k, CH.dir, sk) * 2 - 1) * (TC_spread or track("spread", b))
+              local zd = (ozd or (TC_zdir or track("zdir", b))) + (rnd(k, CH.zdir, sk) * 2 - 1) * (TC_zspread or track("zspread", b))
               local dxy, dz = cos(zd * RAD), sin(zd * RAD)
               local ux, uy, uz = sin(dir * RAD) * dxy, cos(dir * RAD) * dxy, dz
-              local v0 = track("speed", b)
-              local ac = track("accel", b)
-              local gx, gy, gz = track("gx", b), track("gy", b), track("gz", b)
+              local v0 = (TC_speed or track("speed", b))
+              local ac = (TC_accel or track("accel", b))
+              local gx, gy, gz = (TC_gx or track("gx", b)), (TC_gy or track("gy", b)), (TC_gz or track("gz", b))
               if indiv then
                 v0 = vary(v0, indiv.speed, rnd(ik, CH.speed, sk))
                 ac = vary(ac, indiv.accel, rnd(ik, CH.accel, sk))
@@ -2963,6 +3217,8 @@ function M.simulate(cfg)
               end
               local x, y, z, vx, vy
               local tb, td = huge, huge
+              local tbp = -1
+              local rroll = 0
               local alive = true
               local S_
               if O then
@@ -2995,7 +3251,7 @@ function M.simulate(cfg)
                 -- 粒子どうし: 世界にいる粒子は、世界の状態から続ける（端数の刻みだけ、この下で粒子ごとに進める）
                 if WORLD then
                   local wi = WORLD.idx[k]
-                  if wi and WORLD.st[wi - 1].bb == b then ffi.copy(S, WORLD.st + (wi - 1), ffi.sizeof("PRH_State8")) end
+                  if wi and WORLD.st[wi - 1].bb == b then ffi.copy(S, WORLD.st + (wi - 1), ffi.sizeof("PRH_State9")) end
                 end
                 S_ = S
                 local slot = bit.band(k, P.cache.cap - 1)
@@ -3003,6 +3259,7 @@ function M.simulate(cfg)
                   S.key, S.steps, S.flags, S.nb, S.tgt, S.bb = k, 0, 0, 0, -1, b
                   S.px, S.py, S.pz, S.dx, S.dy, S.dz, S.s = px, py, pz, ux, uy, uz, v0
                   S.wx, S.wy, S.wz, S.tb, S.td, S.ac, S.tk = 0, 0, 0, -1, -1, ac, -1
+                  S.roll, S.om = 0, 0
                   if P.hist2 then
                     for jj = 0, P.hm2 - 1 do P.hstep2[slot * P.hm2 + jj] = -1 end
                   end
@@ -3026,6 +3283,7 @@ function M.simulate(cfg)
                 q.t_disp = (P.disp and P.disp.time > 0) and max(vary(P.disp.time, P.disp.i_time, rnd(ik, CH.tdisp, sk)), 0) or 0
                 q.t_stop = (P.stop and P.stop.time > 0) and max(vary(P.stop.time, P.stop.i_time, rnd(ik, CH.tstop, sk)), 1e-9) or 0
                 q.disp_speed = P.disp and P.disp.speed or 0
+                disp_link(P, q, ik, sk, v0)
                 if P.att then
                   q.t_att = vary(P.att.start, P.att.i_start, rnd(ik, CH.tatt, sk))
                   q.att_xy = P.att.xy + (rnd(k, CH.attxy, sk) * 2 - 1) * P.att.exy
@@ -3036,10 +3294,21 @@ function M.simulate(cfg)
                   advance(P, q, S, S.steps, full)
                 end
                 if bit.band(S.flags, F_DEAD) ~= 0 then alive = false end
+                if out.tb and cfg.need_fb then
+                  -- 跳ね返るまで: 跳ね返った後はその年齢、まだなら先読み（粒子の番号ごとに 1 回）
+                  if S.tb >= 0 then tbp = S.tb
+                  else
+                    P.cache.fb = P.cache.fb or {}
+                    local v = P.cache.fb[k]
+                    if v == nil or v ~= v then v = M.first_bounce(P, q, S, L); P.cache.fb[k] = v end
+                    tbp = v
+                  end
+                end
                 local svx, svy, svz = S.dx * S.s + S.wx, S.dy * S.s + S.wy, S.dz * S.s + S.wz
                 local r = age_e - full * h
                 if bit.band(S.flags, F_PARK) ~= 0 then r = 0 end
                 if P.act and not in_window(P.act.win, P.act.rel and age_e or P.act.obj(now_e)) then r = 0 end
+                rroll = r
                 x, y, z = S.px + svx * r, S.py + svy * r, S.pz + svz * r
                 if P.vmul and r > 0 then
                   local mm = P.vmul((full * h + 0.5 * r) / L) - 1
@@ -3052,7 +3321,7 @@ function M.simulate(cfg)
                   x, y, z = x + fx_ * r, y + fy_ * r, z + fz_ * r
                 end
                 -- 刻みの間の外挿でも面や球を越えないようにする（位置だけ直す。状態は変えない）
-                if P.bnc and r > 0 then x, y, z = bounce(P.bnc, x, y, z, svx, svy, svz, now_e) end
+                if P.bnc and r > 0 then x, y, z = bounce(P.bnc, x, y, z, svx, svy, svz, now_e, age_e) end
                 vx, vy = svx, svy
                 if S.tb >= 0 then tb = S.tb end
                 if S.td >= 0 then td = S.td end
@@ -3182,10 +3451,10 @@ function M.simulate(cfg)
               out.vx[n], out.vy[n] = vx, vy
               -- 回転
               local mode = cfg.rot_random or 1
-              local rx0 = mode == 2 and rnd(k, CH.rx0, sk) * 360 or track("rx0", b)
-              local ry0 = mode == 2 and rnd(k, CH.ry0, sk) * 360 or track("ry0", b)
-              local rz0 = mode >= 1 and rnd(k, CH.rz0, sk) * 360 or track("rz0", b)
-              local vrx, vry, vrz = track("vrx", b), track("vry", b), track("vrz", b)
+              local rx0 = mode == 2 and rnd(k, CH.rx0, sk) * 360 or (TC_rx0 or track("rx0", b))
+              local ry0 = mode == 2 and rnd(k, CH.ry0, sk) * 360 or (TC_ry0 or track("ry0", b))
+              local rz0 = mode >= 1 and rnd(k, CH.rz0, sk) * 360 or (TC_rz0 or track("rz0", b))
+              local vrx, vry, vrz = (TC_vrx or track("vrx", b)), (TC_vry or track("vry", b)), (TC_vrz or track("vrz", b))
               if indiv then
                 vrx = vary(vrx, indiv.vrx, rnd(ik, CH.vrx, sk))
                 vry = vary(vry, indiv.vry, rnd(ik, CH.vry, sk))
@@ -3200,37 +3469,16 @@ function M.simulate(cfg)
               out.rx[n] = axis_angle(rx0, vrx, age_r, b, 1, rot, k, sk, ob)
               out.ry[n] = axis_angle(ry0, vry, age_r, b, 2, rot, k, sk, ob)
               out.rz[n] = axis_angle(rz0, vrz, age_r, b, 3, rot, k, sk, ob)
+              -- 転がる（v0.15.0）: 転がった角度（刻みの間は転がる速さで外挿）
+              if S_ and P.bnc and P.bnc.roll then out.rz[n] = out.rz[n] + (S_.roll + S_.om * rroll) / RAD end
               -- 拡大率・透過率（透過率は 0=不透明。AviUtl2 の標準と同じ向き）
-              local z0, z1, a0, a1
-              if zoal then
-                z0, z1, a0, a1 = zoal.zoom0, zoal.zoom1, zoal.alpha0, zoal.alpha1
-              else
-                z0, z1, a0, a1 = track("zoom0", b), track("zoom1", b), track("alpha0", b), track("alpha1", b)
-              end
-              local rz_, ra_ = 0, 0
-              if indiv then
-                rz_ = rnd(ik, CH.zoom, sk)
-                ra_ = rnd(ik, CH.alpha, sk)
-                z0, z1 = vary(z0, indiv.zoom, rz_), vary(z1, indiv.zoom, rz_)
-                a0, a1 = vary(a0, indiv.alpha, ra_), vary(a1, indiv.alpha, ra_)
-              end
-              local zm, tr
-              if zoal then
-                local Lend, xk = L, age_e
-                if zoal.by_object then Lend, xk = zoal.total, cfg.obj_time(now) end
-                zm = eval_keys(zoal.zm, z0, z1, Lend, xk, zoal.zmode, zoal.zb, tb, zoal.zd, td, zoal.zshape)
-                tr = eval_keys(zoal.am, a0, a1, Lend, xk, zoal.amode, zoal.ab, tb, zoal.ad, td, zoal.ashape)
-              else
-                local f = age_e / L
-                zm = z0 + (z1 - z0) * f
-                tr = a0 + (a1 - a0) * f
-              end
-              out.zoom[n] = max(zm, 0) / 100
-              out.alpha[n] = min(max(1 - tr / 100, 0), 1)
+              out.zoom[n], out.alpha[n] = zoom_alpha(ZA, k, ik, sk, b, L, age_e, tb, td)
               out.k[n] = k
               if out.rs then out.rs[n] = (RS and RS[k]) and 1 or 0 end
               out.age[n] = age
               out.b[n], out.life[n], out.e[n] = b, L, ew
+              if out.tb then out.tb[n], out.tbp[n] = (S_ and S_.tb >= 0) and S_.tb or -1, tbp end
+              if out.td then out.td[n] = (S_ and S_.td >= 0) and S_.td or -1 end
               if alive and not noemit then n = n + 1 end
               -- 子粒子（速さ・重力・空気抵抗だけの閉じた式。親の後ろに並べる）
               for ie = 1, nev do
@@ -3248,7 +3496,38 @@ function M.simulate(cfg)
                     local cvx, cvy = sin(ang) * sp + pvx * f_, cos(ang) * sp + pvy * f_
                     local kd, g = CD.drag, CD.gy
                     local cx_, cy_, cvx2, cvy2
-                    if kd > 0 then
+                    local cz_ = ez0
+                    local cdead = false
+                    if CP then
+                      -- 積分（子の番号ごとの状態から続ける。無ければ出来事の時刻から）
+                      local h_ = CP.h
+                      local cfull = floor(ca / h_)
+                      local b_c = b + a_ev
+                      local CS = CP.cst.st[ck]
+                      if not CS or CS.steps > cfull or CS.bb ~= b_c then
+                        CS = CS or ffi.new("PRH_State9")
+                        CP.cst.st[ck] = CS
+                        local sp0 = sqrt(cvx * cvx + cvy * cvy)
+                        CS.key, CS.steps, CS.flags, CS.nb, CS.tgt, CS.bb = ck, 0, 0, 0, -1, b_c
+                        CS.px, CS.py, CS.pz = ex0, ey0, ez0
+                        if sp0 > 1e-12 then CS.dx, CS.dy = cvx / sp0, cvy / sp0 else CS.dx, CS.dy = 0, 1 end
+                        CS.dz, CS.s = 0, sp0
+                        CS.wx, CS.wy, CS.wz, CS.tb, CS.td, CS.ac, CS.tk = 0, 0, 0, -1, -1, 0, -1
+                        CS.roll, CS.om = 0, 0
+                      end
+                      CP.cst.seen[ck] = cgen
+                      cq.k, cq.sk, cq.b, cq.L = ck, sk, b_c, CD.life
+                      if CS.steps < cfull then
+                        P.steps = P.steps + (cfull - CS.steps)
+                        advance(CP, cq, CS, CS.steps, cfull)
+                      end
+                      if bit.band(CS.flags, F_DEAD) ~= 0 then cdead = true end
+                      local r_ = ca - cfull * h_
+                      local svx, svy, svz = CS.dx * CS.s + CS.wx, CS.dy * CS.s + CS.wy, CS.dz * CS.s + CS.wz
+                      cx_, cy_, cz_ = CS.px + svx * r_, CS.py + svy * r_, CS.pz + svz * r_
+                      if CP.bnc and r_ > 0 then cx_, cy_, cz_ = bounce(CP.bnc, cx_, cy_, cz_, svx, svy, svz, b_c + ca, ca) end
+                      cvx2, cvy2 = svx, svy
+                    elseif kd > 0 then
                       local ek = math.exp(-kd * ca)
                       local fm = (1 - ek) / kd
                       cx_ = ex0 + cvx * fm
@@ -3259,12 +3538,15 @@ function M.simulate(cfg)
                       cy_ = ey0 + cvy * ca + 0.5 * g * ca * ca
                       cvx2, cvy2 = cvx, cvy + g * ca
                     end
-                    out.x[n], out.y[n], out.z[n] = cx_, cy_, ez0
+                    if cdead then goto next_child end
+                    out.x[n], out.y[n], out.z[n] = cx_, cy_, cz_
                     out.vx[n], out.vy[n] = cvx2, cvy2
                     out.rx[n], out.ry[n], out.rz[n] = 0, 0, rnd(ck, CH.child + 2, sk) * 360
                     out.zoom[n] = CD.zoom / 100
                     out.alpha[n] = min(max(1 - CD.alpha1 / 100 * ca / CD.life, 0), 1)
                     out.k[n], out.age[n], out.b[n], out.life[n], out.e[n] = ck, ca, b + a_ev, CD.life, ew
+                    if out.tb then out.tb[n], out.tbp[n] = -1, -1 end
+                    if out.td then out.td[n] = -1 end
                     if out.rs then out.rs[n] = 0 end
                     if out.ex then out.ex[n], out.ey[n], out.ez[n] = ex0, ey0, ez0 end
                     if out.cu then
@@ -3274,6 +3556,7 @@ function M.simulate(cfg)
                     if TN > 0 then for jj = 0, TN - 1 do out.tok[n * TN + jj] = 0 end end
                     n = n + 1
                   end
+                  ::next_child::
                 end
               end
             end
@@ -3284,6 +3567,12 @@ function M.simulate(cfg)
   end
   out.n = n
   out.overflow = overflow
+  if CP then
+    local cs = CP.cst
+    for kk, g in pairs(cs.seen) do
+      if g ~= cgen then cs.seen[kk] = nil; cs.st[kk] = nil end
+    end
+  end
   if WORLD then out.inter_n, out.inter_over = WORLD.active, WORLD.over end
   out.steps = P and P.steps or 0
   out.resets = P and P.cache.resets or 0
@@ -3467,7 +3756,7 @@ end
 cfg.audio: { level = 0..1, zoom = %, alpha = %, spread = % }（level が 1 のときの変化）
 cfg.grid:  { mode, a, b, c, mask = M.build_mask(...)（本体の中心に重ねる。無ければ nil）, inv }
 ]]
-function M.post(out, cfg)
+function M.post(out, cfg, look_only)
   local A, G, V = cfg.audio, cfg.grid, cfg.look
   if not A and not G and not V then return end
   local TN = out.tn or 0
@@ -3513,7 +3802,7 @@ function M.post(out, cfg)
       local L = A.level
       out.zoom[i] = out.zoom[i] * max(1 + A.zoom / 100 * L, 0)
       out.alpha[i] = out.alpha[i] * min(max(1 - A.alpha / 100 * L, 0), 1)
-      if A.spread ~= 0 and out.ex then
+      if A.spread ~= 0 and out.ex and not look_only then
         -- 出た所からの距離を広げる
         local f = 1 + A.spread / 100 * L
         local ex, ey, ez = out.ex[i], out.ey[i], out.ez[i]
@@ -3527,11 +3816,14 @@ function M.post(out, cfg)
       end
     end
     if G then
-      local x, y, z = M.snap(G, out.x[i], out.y[i], out.z[i])
-      out.x[i], out.y[i], out.z[i] = x, y, z
-      for j = 0, TN - 1 do
-        local b = i * TN + j
-        if out.tok[b] == 1 then out.tx[b], out.ty[b], out.tz[b] = M.snap(G, out.tx[b], out.ty[b], out.tz[b]) end
+      local x, y, z = out.x[i], out.y[i], out.z[i]
+      if not look_only then
+        x, y, z = M.snap(G, x, y, z)
+        out.x[i], out.y[i], out.z[i] = x, y, z
+        for j = 0, TN - 1 do
+          local b = i * TN + j
+          if out.tok[b] == 1 then out.tx[b], out.ty[b], out.tz[b] = M.snap(G, out.tx[b], out.ty[b], out.tz[b]) end
+        end
       end
       if G.mask then
         local inside = M.mask_at(G.mask, x, y) >= G.mask.thr
@@ -3677,7 +3969,7 @@ int SetEndOfFile(void* h);
 local BAKE_MAGIC = "PRHBAKE1"
 -- 粒子ごとの欄（無い欄は書かない）。軌跡の欄は 粒子の数 × 軌跡の点の数
 local BAKE_F32 = { "x", "y", "z", "rx", "ry", "rz", "vx", "vy", "zoom", "alpha", "age", "b", "life",
-                   "ex", "ey", "ez", "cu", "cv", "cw", "ch", "asx", "asy", "shr" }
+                   "ex", "ey", "ez", "cu", "cv", "cw", "ch", "asx", "asy", "shr", "tb", "tbp", "td" }
 local BAKE_I32 = { "k", "e", "ci" }
 local BAKE_U8 = { "cl", "rs" }
 local BAKE_TRAIL = { "tx", "ty", "tz" }
@@ -3857,6 +4149,38 @@ function M.bake_write(path, sig, N, f, res)
 end
 
 -- 読む: フレーム f の res。戻り値: res か nil, 理由（"無い" = ファイルが無い / "違う" = 設定が違う / "抜け" = そのフレームが無い）
+--[[
+CSV（v0.16.0）: dir の 名前_csv フォルダに、フレームごとに 00012.csv（フレームの番号）を書く。1 行 1 粒、番号の小さい順。
+列: k,x,y,z,rx,ry,rz,zoom,alpha,age,life（座標は本体から見た px、角度は度、zoom は %、alpha は 0..1 の不透明度）
+]]
+pcall(ffi.cdef, [[
+int CreateDirectoryW(const uint16_t* path, void* sa);
+]])
+function M.csv_write(dir, name, f, res)
+  local BS = string.char(92)
+  if dir:sub(-1) ~= BS and dir:sub(-1) ~= "/" then dir = dir .. BS end
+  local folder = dir .. name .. "_csv"
+  local K = kernel()
+  K.CreateDirectoryW(to_w(folder), nil)
+  local idx = {}
+  for i = 0, res.n - 1 do idx[i + 1] = i end
+  M.sort_by_k(idx, res)
+  local lines = { "k,x,y,z,rx,ry,rz,zoom,alpha,age,life" }
+  local fmt = "%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,%.6f"
+  for t, i in ipairs(idx) do
+    lines[t + 1] = string.format(fmt, res.k[i], res.x[i], res.y[i], res.z[i], res.rx[i], res.ry[i], res.rz[i],
+                                 res.zoom[i] * 100, res.alpha[i], res.age[i], res.life[i])
+  end
+  local text = table.concat(lines, "\r\n") .. "\r\n"
+  local h = K.CreateFileW(to_w(folder .. BS .. string.format("%05d.csv", f)), 0x40000000, 1, nil, 2, 0x80, nil)
+  if ffi.cast("intptr_t", h) == -1 then return nil, "CSV を書けない: " .. folder end
+  local done = ffi.new("uint32_t[1]")
+  local ok = K.WriteFile(h, text, #text, done, nil) ~= 0 and done[0] == #text
+  K.CloseHandle(h)
+  if not ok then return nil, "CSV を書けない: " .. folder end
+  return true
+end
+
 function M.bake_read(path, sig, N, f)
   local h = bake_open(path, false)
   if not h then return nil, "無い" end
@@ -3940,6 +4264,244 @@ function M.wav_decode(buf, size)
     end
   end
   return { rate = rate, n = n, x = x }
+end
+
+--[[
+mp3・m4a など（v0.15.0）: Windows の Media Foundation で PCM（float 32 bit）に直し、wav_decode と同じ形にする。
+COM の関数は、インターフェースの関数表（vtable）の番号で呼ぶ（IMFAttributes: GetUINT32 7・SetGUID 24 / IMFSourceReader:
+SetStreamSelection 4・GetCurrentMediaType 6・SetCurrentMediaType 7・ReadSample 9 / IMFSample: ConvertToContiguousBuffer 41 /
+IMFMediaBuffer: Lock 3・Unlock 4 / IUnknown: Release 2）。MFStartup と MFShutdown は読み込み 1 回ごとに対で呼ぶ。
+最初の音の時刻が 0 より後なら、その分を無音で埋める（ファイルの先頭 = 0 秒にそろえる）
+]]
+pcall(ffi.cdef, [[
+typedef struct { uint32_t d1; uint16_t d2, d3; uint8_t d4[8]; } PRH_GUID;
+typedef struct { void** vt; } PRH_COM;
+typedef uint32_t (*PRH_FnRelease)(PRH_COM*);
+typedef int32_t (*PRH_FnSetGUID)(PRH_COM*, const PRH_GUID*, const PRH_GUID*);
+typedef int32_t (*PRH_FnGetUINT32)(PRH_COM*, const PRH_GUID*, uint32_t*);
+typedef int32_t (*PRH_FnStreamSel)(PRH_COM*, uint32_t, int32_t);
+typedef int32_t (*PRH_FnGetCurMT)(PRH_COM*, uint32_t, PRH_COM**);
+typedef int32_t (*PRH_FnSetCurMT)(PRH_COM*, uint32_t, uint32_t*, PRH_COM*);
+typedef int32_t (*PRH_FnReadSample)(PRH_COM*, uint32_t, uint32_t, uint32_t*, uint32_t*, int64_t*, PRH_COM**);
+typedef int32_t (*PRH_FnToContig)(PRH_COM*, PRH_COM**);
+typedef int32_t (*PRH_FnLock)(PRH_COM*, uint8_t**, uint32_t*, uint32_t*);
+typedef int32_t (*PRH_FnUnlock)(PRH_COM*);
+int32_t MFStartup(uint32_t version, uint32_t flags);
+int32_t MFShutdown(void);
+int32_t MFCreateMediaType(PRH_COM** pp);
+int32_t MFCreateSourceReaderFromURL(const uint16_t* url, void* attr, PRH_COM** pp);
+int32_t CoInitializeEx(void* reserved, uint32_t coinit);
+void CoUninitialize(void);
+]])
+
+local function guid(d1, d2, d3, b)
+  local g = ffi.new("PRH_GUID")
+  g.d1, g.d2, g.d3 = d1, d2, d3
+  for i = 1, 8 do g.d4[i - 1] = b[i] end
+  return g
+end
+
+local MF
+local function mf_lib()
+  if MF == nil then
+    local ok, plat, rw, ole = pcall(function() return ffi.load("mfplat"), ffi.load("mfreadwrite"), ffi.load("ole32") end)
+    MF = ok and {
+      plat = plat, rw = rw, ole = ole,
+      MAJOR = guid(0x48eba18e, 0xf8c9, 0x4687, { 0xbf, 0x11, 0x0a, 0x74, 0xc9, 0xf9, 0x6a, 0x8f }),
+      SUBTYPE = guid(0xf7e34c9a, 0x42e8, 0x4714, { 0xb7, 0x4b, 0xcb, 0x29, 0xd7, 0x2c, 0x35, 0xe5 }),
+      AUDIO = guid(0x73647561, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 }),
+      FLOAT = guid(0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 }),
+      CH = guid(0x37e48bf5, 0x645e, 0x4c5b, { 0x89, 0xde, 0xad, 0xa9, 0xe2, 0x9b, 0x69, 0x6a }),
+      RATE = guid(0x5faeeae7, 0x0290, 0x4c31, { 0x9e, 0x8a, 0xc5, 0x34, 0xf6, 0x8d, 0x9d, 0xba }),
+    } or false
+  end
+  return MF or nil
+end
+
+local function vcall(o, i, T, ...) return ffi.cast(T, o.vt[i])(o, ...) end
+local function release(o) if o ~= nil then vcall(o, 2, "PRH_FnRelease") end end
+
+function M.mf_decode(path)
+  local L = mf_lib()
+  if not L then return nil, "Media Foundation を読めない" end
+  local FIRST_AUDIO, ALL = 0xFFFFFFFD, 0xFFFFFFFE
+  local hr_co = L.ole.CoInitializeEx(nil, 0)
+  local hr = L.plat.MFStartup(0x00020070, 1)
+  if hr < 0 then
+    if hr_co == 0 or hr_co == 1 then L.ole.CoUninitialize() end
+    return nil, string.format("Media Foundation を始められない（0x%08x）", bit.band(hr, 0xffffffff))
+  end
+  local rd, mt, cur = ffi.new("PRH_COM*[1]"), ffi.new("PRH_COM*[1]"), ffi.new("PRH_COM*[1]")
+  local result, err
+  local ok, perr = pcall(function()
+    if L.rw.MFCreateSourceReaderFromURL(to_w(path), nil, rd) < 0 or rd[0] == nil then err = "音声ファイルを開けない"; return end
+    local R = rd[0]
+    vcall(R, 4, "PRH_FnStreamSel", ALL, 0)
+    vcall(R, 4, "PRH_FnStreamSel", FIRST_AUDIO, 1)
+    if L.plat.MFCreateMediaType(mt) < 0 then err = "Media Foundation の型を作れない"; return end
+    vcall(mt[0], 24, "PRH_FnSetGUID", L.MAJOR, L.AUDIO)
+    vcall(mt[0], 24, "PRH_FnSetGUID", L.SUBTYPE, L.FLOAT)
+    if vcall(R, 7, "PRH_FnSetCurMT", FIRST_AUDIO, nil, mt[0]) < 0 then err = "音を float に直せない（音の無いファイルか、読めない形式）"; return end
+    if vcall(R, 6, "PRH_FnGetCurMT", FIRST_AUDIO, cur) < 0 then err = "音の形を読めない"; return end
+    local u = ffi.new("uint32_t[1]")
+    vcall(cur[0], 7, "PRH_FnGetUINT32", L.CH, u)
+    local ch = max(tonumber(u[0]), 1)
+    vcall(cur[0], 7, "PRH_FnGetUINT32", L.RATE, u)
+    local rate = tonumber(u[0])
+    if rate <= 0 then err = "音の形を読めない"; return end
+    local cap, n = 1048576, 0
+    local x = ffi.new("float[?]", cap)
+    local idx, flags, ts, smp = ffi.new("uint32_t[1]"), ffi.new("uint32_t[1]"), ffi.new("int64_t[1]"), ffi.new("PRH_COM*[1]")
+    local bufp, pp, mx, cl = ffi.new("PRH_COM*[1]"), ffi.new("uint8_t*[1]"), ffi.new("uint32_t[1]"), ffi.new("uint32_t[1]")
+    local first = true
+    while true do
+      smp[0] = nil
+      if vcall(R, 9, "PRH_FnReadSample", FIRST_AUDIO, 0, idx, flags, ts, smp) < 0 then break end
+      local S = smp[0]
+      if S ~= nil then
+        if first then
+          -- 最初の音の時刻（100ns）が 0 より後なら、その分を無音で埋める
+          local pad = floor(tonumber(ts[0]) * rate / 1e7 + 0.5)
+          if pad > 0 and pad < rate * 10 then
+            while n + pad > cap do local x2 = ffi.new("float[?]", cap * 2); ffi.copy(x2, x, n * 4); x, cap = x2, cap * 2 end
+            ffi.fill(x + n, pad * 4, 0)
+            n = n + pad
+          end
+          first = false
+        end
+        if vcall(S, 41, "PRH_FnToContig", bufp) >= 0 and bufp[0] ~= nil then
+          local Bf = bufp[0]
+          if vcall(Bf, 3, "PRH_FnLock", pp, mx, cl) >= 0 then
+            local m = floor(tonumber(cl[0]) / (4 * ch))
+            while n + m > cap do local x2 = ffi.new("float[?]", cap * 2); ffi.copy(x2, x, n * 4); x, cap = x2, cap * 2 end
+            local f = ffi.cast("float*", pp[0])
+            for i = 0, m - 1 do
+              local a = 0
+              for c = 0, ch - 1 do a = a + f[i * ch + c] end
+              x[n + i] = a / ch
+            end
+            n = n + m
+            vcall(Bf, 4, "PRH_FnUnlock")
+          end
+          release(Bf)
+        end
+        release(S)
+      end
+      if bit.band(flags[0], 2) ~= 0 then break end     -- MF_SOURCE_READERF_ENDOFSTREAM
+    end
+    if n == 0 then err = "音が無い"; return end
+    result = { rate = rate, n = n, x = x }
+  end)
+  release(cur[0]); release(mt[0]); release(rd[0])
+  L.plat.MFShutdown()
+  if hr_co == 0 or hr_co == 1 then L.ole.CoUninitialize() end
+  if not ok then return nil, "Media Foundation: " .. tostring(perr) end
+  if not result then return nil, err or "読めない" end
+  return result
+end
+
+--[[
+Media Foundation が取り除かない先頭の分（サンプル）。実測（2026-10-03、ffmpeg で作った 44.1kHz / 48kHz）で、
+CBR の mp3 は 1729 サンプル（= 先頭の Info フレーム 1152 ＋ LAME タグのエンコーダー遅延 576 ＋ 1）、VBR の mp3 は 577
+（Xing フレームは Media Foundation が飛ばす）、Info フレームの無い mp3 は 577、m4a は 1024（edit list の media_time）遅れた。
+mp3: ID3v2 の後の最初のフレームが Info なら そのフレームの長さ ＋ LAME タグの遅延、Xing なら遅延だけ（タグが無ければ 0）。
+mp4 / m4a: 音のトラック（hdlr が soun）の elst の最初の media_time ÷ mdhd の timescale
+]]
+local function be32(b, o) return b[o] * 16777216 + b[o + 1] * 65536 + b[o + 2] * 256 + b[o + 3] end
+local function mp3_skip(b, size)
+  local o = 0
+  if size >= 10 and ffi.string(b, 3) == "ID3" then
+    o = 10 + b[6] * 2097152 + b[7] * 16384 + b[8] * 128 + b[9]
+    if bit.band(b[5], 0x10) ~= 0 then o = o + 10 end
+  end
+  while o + 4 < size and not (b[o] == 0xFF and bit.band(b[o + 1], 0xE0) == 0xE0) do o = o + 1 end
+  if o + 200 > size then return 0 end
+  local ver, layer = bit.band(bit.rshift(b[o + 1], 3), 3), bit.band(bit.rshift(b[o + 1], 1), 3)
+  if layer ~= 1 then return 0 end
+  local mono = bit.band(bit.rshift(b[o + 3], 6), 3) == 3
+  local spf = ver == 3 and 1152 or 576
+  local side = ver == 3 and (mono and 17 or 32) or (mono and 9 or 17)
+  local x = o + 4 + side
+  local tag = ffi.string(b + x, 4)
+  if tag ~= "Xing" and tag ~= "Info" then return 0 end
+  local fl = be32(b, x + 4)
+  local l = x + 8 + (bit.band(fl, 1) ~= 0 and 4 or 0) + (bit.band(fl, 2) ~= 0 and 4 or 0) + (bit.band(fl, 4) ~= 0 and 100 or 0) +
+            (bit.band(fl, 8) ~= 0 and 4 or 0)
+  local delay = 0
+  if l + 24 <= size then delay = b[l + 21] * 16 + bit.rshift(b[l + 22], 4) end
+  return (tag == "Info" and spf or 0) + delay
+end
+local function mp4_skip(b, size)
+  local skip
+  local function walk(o, e, in_trak)
+    local media_t, scale, sound
+    while o + 8 <= e do
+      local sz, ty = be32(b, o), ffi.string(b + o + 4, 4)
+      local hd = 8
+      if sz == 1 then sz, hd = be32(b, o + 8) * 4294967296 + be32(b, o + 12), 16 elseif sz == 0 then sz = e - o end
+      if sz < hd or o + sz > e then break end
+      if ty == "moov" or ty == "mdia" or ty == "edts" then
+        local m, s_, so = walk(o + hd, o + sz, in_trak)
+        media_t, scale, sound = media_t or m, scale or s_, sound or so
+      elseif ty == "trak" then
+        local m, s_, so = walk(o + hd, o + sz, true)
+        if so and m and s_ and s_ > 0 and not skip then skip = m / s_ end
+      elseif in_trak and ty == "elst" and o + hd + 8 <= e then
+        local v, cnt = b[o + hd], be32(b, o + hd + 4)
+        local p = o + hd + 8
+        for _ = 1, min(cnt, 64) do
+          local mt
+          if v == 1 then
+            if b[p + 8] >= 128 then mt = -1 else mt = be32(b, p + 8) * 4294967296 + be32(b, p + 12) end
+            p = p + 20
+          else
+            mt = be32(b, p + 4)
+            if mt >= 2147483648 then mt = mt - 4294967296 end
+            p = p + 12
+          end
+          if mt >= 0 then media_t = media_t or mt; break end
+        end
+      elseif in_trak and ty == "mdhd" then
+        scale = b[o + hd] == 1 and be32(b, o + hd + 20) or be32(b, o + hd + 12)
+      elseif in_trak and ty == "hdlr" then
+        sound = ffi.string(b + o + hd + 8, 4) == "soun"
+      end
+      o = o + sz
+    end
+    return media_t, scale, sound
+  end
+  walk(0, size, false)
+  return skip or 0
+end
+function M.audio_skip(buf, size, rate)
+  if size < 12 then return 0 end
+  if ffi.string(buf + 4, 4) == "ftyp" then return floor(mp4_skip(buf, size) * rate + 0.5) end
+  return mp3_skip(buf, size)
+end
+
+-- 音声ファイルを PCM にする（WAV はそのまま読み、それ以外は Media Foundation）。直した PCM はファイル（パスと大きさ）ごとに 2 つまで取っておく
+local pcm_cache = {}
+function M.audio_decode(path)
+  local buf, size = M.read_bytes(path)
+  if not buf then return nil, "音声ファイルを開けない" end
+  local key = path .. "|" .. size
+  for _, c in ipairs(pcm_cache) do if c.key == key then return c.W, nil, key end end
+  local W, err
+  if size >= 12 and ffi.string(buf, 4) == "RIFF" and ffi.string(buf + 8, 4) == "WAVE" then
+    W, err = M.wav_decode(buf, size)
+  else
+    W, err = M.mf_decode(path)
+    if W then
+      -- Media Foundation が取り除かない先頭の分を落とす（元の配列は W.base で持ち続ける）
+      local sk_ = min(M.audio_skip(buf, size, W.rate), W.n - 1)
+      if sk_ > 0 then W.base, W.x, W.n = W.x, W.x + sk_, W.n - sk_ end
+    end
+  end
+  buf = nil
+  if not W then return nil, err end
+  table.insert(pcm_cache, 1, { key = key, W = W })
+  pcm_cache[3] = nil
+  return W, nil, key
 end
 
 --[[
@@ -4028,16 +4590,76 @@ end
 -- 音声ファイルの拍（ファイル・帯・感度ごとに取っておく）。戻り値: 時刻の並び, 強さの並び, 理由（読めないとき）
 local beat_cache = {}
 function M.file_beats(path, band, sens)
-  local buf, size = M.read_bytes(path)
-  if not buf then return nil, nil, "音声ファイルを開けない" end
-  local key = path .. "|" .. size .. "|" .. band .. "|" .. sens
+  local W, err, fkey = M.audio_decode(path)
+  if not W then return nil, nil, err end
+  local key = fkey .. "|" .. band .. "|" .. sens
   local hit = beat_cache[key]
   if hit then return hit[1], hit[2] end
-  local W, err = M.wav_decode(buf, size)
-  if not W then return nil, nil, err end
   local t, s_ = M.onsets(W, band, sens)
   beat_cache[key] = { t, s_ }
   return t, s_
+end
+
+-- 音の大きさの包絡（v0.15.0）: 10ms ごとの二乗平均の平方根を、一番大きい値で割った並び（0..1）。band は onsets と同じ
+function M.loudness(W, band)
+  local rate, n, x = W.rate, W.n, W.x
+  local hop = max(floor(rate / 100), 1)
+  local nh = floor(n / hop)
+  local a1 = 1 - math.exp(-2 * pi * 150 / rate)
+  local a2 = 1 - math.exp(-2 * pi * 2000 / rate)
+  local lp1, lp2 = 0, 0
+  local e = ffi.new("double[?]", max(nh, 1))
+  local emax = 0
+  for k = 0, nh - 1 do
+    local acc = 0
+    for i = k * hop, k * hop + hop - 1 do
+      local v = x[i]
+      lp1 = lp1 + a1 * (v - lp1)
+      lp2 = lp2 + a2 * (v - lp2)
+      local y = v
+      if band == 1 then y = lp1 elseif band == 2 then y = v - lp2 end
+      acc = acc + y * y
+    end
+    e[k] = sqrt(acc / hop)
+    if e[k] > emax then emax = e[k] end
+  end
+  if emax > 1e-12 then for k = 0, nh - 1 do e[k] = e[k] / emax end end
+  return { dt = hop / rate, n = nh, e = e }
+end
+
+-- 時刻 t（秒。ファイルの先頭から）の音の大きさ（区間の間は直線でつなぐ。範囲の外は 0）
+function M.loud_at(Lo, t)
+  if not Lo or Lo.n == 0 then return 0 end
+  local u = t / Lo.dt - 0.5
+  if u < 0 or u > Lo.n - 1 then return 0 end
+  local i = floor(u)
+  local f = u - i
+  local a = Lo.e[i]
+  return i + 1 < Lo.n and a + (Lo.e[i + 1] - a) * f or a
+end
+
+local loud_cache = {}
+function M.file_loudness(path, band)
+  local W, err, fkey = M.audio_decode(path)
+  if not W then return nil, err end
+  local key = fkey .. "|" .. band
+  local hit = loud_cache[key]
+  if hit then return hit end
+  local Lo = M.loudness(W, band)
+  loud_cache[key] = Lo
+  return Lo
+end
+
+-- 音の大きさで出す数を変える（v0.15.0）: 元の放出の数 R の、フレームごとの数に 1 ＋ gain / 100 × 音の大きさ を掛けた表にする。
+-- 音の大きさは、そのフレームの真ん中の時刻をファイルの時刻（ft(シミュレーション時刻)。オブジェクトの始まり = 0 秒）に直して読む
+function M.rate_loud(R, Lo, gain, dt, now, ft)
+  local nS = floor(max(now, 0) / dt) + 2
+  local smp = {}
+  for f = 0, nS - 1 do
+    local lam = max(R.count((f + 1) * dt) - R.count(f * dt), 0)
+    smp[f + 1] = lam / dt * (1 + gain / 100 * M.loud_at(Lo, ft((f + 0.5) * dt)))
+  end
+  return M.rate_table(smp, dt)
 end
 
 -- BPM のグリッドの拍（シーンの秒）。list = obj.getinfo("bpm_list")、t0..t1 の範囲、div = 1 拍をいくつに分けるか。
@@ -4211,15 +4833,31 @@ local function movie_time(Mt, res, i, sk)
 end
 
 -- 色の段（粒子 i）
+-- 跳ね返りに合わせた進み（v0.14.0。原作のフィルター1リンク）。after = true: 最初に跳ね返ってから寿命の終わりまでで 0 → 1（跳ね返らなければ 0）。
+-- false: 生まれてから最初に跳ね返る（先読みの）年齢までで 0 → 1、跳ね返った後は 1（跳ね返らなければ 0）
+function M.bounce_progress(res, i, after)
+  local age = res.age[i]
+  if after then
+    local tb = res.tb and res.tb[i] or -1
+    if tb < 0 then return 0 end
+    return (age - tb) / max(res.life[i] - tb, 1e-6)
+  end
+  local tb = res.tbp and res.tbp[i] or -1
+  if tb < 0 then return 0 end
+  if tb <= 0 then return 1 end
+  return age / tb
+end
+
 local function color_level(D, res, i, sk)
   local C = D.color
   local l
   if C.mode == 5 then
     l = res.cl and res.cl[i] or 0
-  elseif C.mode == 0 or C.mode == 3 or C.mode == 4 then
-    -- 寿命で変える / 速さで変える（基準の速さで最後の色）/ 奥行きで変える（奥行きの範囲）
+  elseif C.mode == 0 or C.mode == 3 or C.mode == 4 or C.mode == 6 or C.mode == 7 then
+    -- 寿命で変える / 速さで変える（基準の速さで最後の色）/ 奥行きで変える（奥行きの範囲）/ 跳ね返ってから / 跳ね返るまで
     local f
     if C.mode == 0 then f = res.age[i] / max(res.life[i], 1e-6)
+    elseif C.mode == 6 or C.mode == 7 then f = M.bounce_progress(res, i, C.mode == 6)
     elseif C.mode == 3 then f = sqrt(res.vx[i] * res.vx[i] + res.vy[i] * res.vy[i]) / max(C.ref or 1, 1e-6)
     else f = (C.z1 or 1) ~= (C.z0 or 0) and (res.z[i] - (C.z0 or 0)) / ((C.z1 or 1) - (C.z0 or 0)) or 0 end
     f = min(max(f, 0), 1)
@@ -4313,6 +4951,7 @@ local function look_suffix(D, res, i, sk, use_color, use_filt)
     local f
     if F.base == 0 then f = res.age[i] / max(res.life[i], 1e-6)
     elseif F.base == 1 then f = D.obj_now / max(D.total, 1e-6)
+    elseif F.base == 3 or F.base == 4 then f = M.bounce_progress(res, i, F.base == 3)
     else f = rnd(res.k[i], CH.filt, sk) end
     if F.i_v ~= 0 then f = f + (rnd(res.k[i], CH.filt + 1, sk) * 2 - 1) * F.i_v / 100 end
     f = min(max(f, 0), 1)
@@ -4321,13 +4960,41 @@ local function look_suffix(D, res, i, sk, use_color, use_filt)
   return s
 end
 
+-- 粒子の並び idx（res の番号の表）を、粒子の番号 k の小さい順にする（v0.16.0）。
+-- 比べる関数を渡す table.sort は 10,000 粒で数 ms かかるので、k × 65536 ＋ 並びの番号 の数にして既定の比べ方で並べる
+-- （k が同じなら並びの番号の順。k < 2^37・粒子 < 65536 で、double の整数の範囲に収まる）。もう並んでいれば何もしない
+function M.sort_by_k(idx, res)
+  local n = #idx
+  local K = res.k
+  local up, down = true, true
+  for t = 2, n do
+    local a, b = K[idx[t - 1]], K[idx[t]]
+    if a > b then up = false elseif a < b then down = false end
+    if not up and not down then break end
+  end
+  if up then return idx end
+  if down then
+    -- 本ループは新しい粒子（番号の大きい方）から数えるので、子粒子が無ければ逆順に並んでいる
+    for t = 1, floor(n / 2) do idx[t], idx[n + 1 - t] = idx[n + 1 - t], idx[t] end
+    return idx
+  end
+  if n >= 65536 then
+    table.sort(idx, function(a, b) return K[a] < K[b] end)
+    return idx
+  end
+  for t = 1, n do idx[t] = K[idx[t]] * 65536 + idx[t] end
+  table.sort(idx)
+  for t = 1, n do idx[t] = idx[t] % 65536 end
+  return idx
+end
+
 function M.build_draw(res, D)
   local I = new_inst()
   local sk = D.sk
   local n = res.n
   local idx = {}
   for i = 0, n - 1 do idx[i + 1] = i end
-  table.sort(idx, function(a, b) return res.k[a] < res.k[b] end)
+  M.sort_by_k(idx, res)
   if D.old_front then
     for i = 1, floor(#idx / 2) do idx[i], idx[#idx + 1 - i] = idx[#idx + 1 - i], idx[i] end
   end
@@ -5027,6 +5694,160 @@ M.solid_template = solid_template
 -- 立体物のまとまりの頂点（三角形の頂点の並び {x,y,z,u,v}。u,v は 0..1）。obj.drawpoly(表, 3, 透明度) で描く。
 -- 六面体・球・錐体・双錐体は閉じた凸の形なので、呼び手が裏面を表示しない（culling）にする。
 -- 曲面・厚みは裏も見えるので、粒子ごとに奥の三角形から並べる（opt.eye = 目の位置）
+--[[
+pmd モデル（v0.17.0）: 静止した形だけを読む（頂点の位置・UV・面・材質。ボーン・モーフ・表情は読まない）。
+形（リトルエンディアン）: "Pmd" / 版 float / 名前 20 / コメント 256 → 頂点の数 uint32 と 1 頂点 38 バイト（位置 float×3・法線 float×3・UV float×2・
+ボーン uint16×2・重み uint8・輪郭 uint8）→ 面の頂点の数 uint32 と uint16 の並び → 材質の数 uint32 と 1 材質 70 バイト
+（拡散色 float×3・不透明度 float・反射の強さ float・反射色 float×3・環境色 float×3・トゥーン uint8・輪郭 uint8・面の頂点の数 uint32・テクスチャ char[20]）。
+テクスチャの名前は Shift-JIS（UTF-8 に直す）。「a.bmp*b.sph」の * より後と、.sph / .spa だけの名前は使わない（スフィアマップ）。
+戻り値: { nv, pos（float[nv×3]）, uv（float[nv×2]）, ni, idx（uint16[ni]）, mats = { { r, g, b, a, first, count, tex（フルパスか nil） } } } か nil, 理由
+]]
+local function sjis_to_utf8(p, n)
+  local len = 0
+  while len < n and p[len] ~= 0 do len = len + 1 end
+  if len == 0 then return "" end
+  local K = kernel()
+  local wn = K.MultiByteToWideChar(932, 0, ffi.cast("const char*", p), len, nil, 0)
+  if wn <= 0 then return ffi.string(p, len) end
+  local w = ffi.new("uint16_t[?]", wn + 1)
+  K.MultiByteToWideChar(932, 0, ffi.cast("const char*", p), len, w, wn)
+  w[wn] = 0
+  return from_w(w)
+end
+local model_cache = {}
+function M.pmd_load(path)
+  if not path or path == "" then return nil, "モデルファイルが選ばれていない" end
+  local buf, size = M.read_bytes(path)
+  if not buf then return nil, "モデルファイルを開けない" end
+  local key = path .. "|" .. size
+  local hit = model_cache[key]
+  if hit then return hit end
+  if size < 283 + 4 or ffi.string(buf, 3) ~= "Pmd" then return nil, "pmd ではない（pmx などは読めない）" end
+  local o = 283
+  local function u32(at) return buf[at] + buf[at + 1] * 256 + buf[at + 2] * 65536 + buf[at + 3] * 16777216 end
+  local nv = u32(o); o = o + 4
+  if nv <= 0 or o + nv * 38 + 4 > size then return nil, "pmd の頂点が壊れている" end
+  local pos, uv = ffi.new("float[?]", nv * 3), ffi.new("float[?]", nv * 2)
+  for i = 0, nv - 1 do
+    local f = ffi.cast("float*", buf + o + i * 38)
+    pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2] = f[0], f[1], f[2]
+    uv[i * 2], uv[i * 2 + 1] = f[6], f[7]
+  end
+  o = o + nv * 38
+  local ni = u32(o); o = o + 4
+  if ni % 3 ~= 0 or o + ni * 2 + 4 > size then return nil, "pmd の面が壊れている" end
+  local idx = ffi.new("uint16_t[?]", max(ni, 1))
+  ffi.copy(idx, buf + o, ni * 2)
+  for i = 0, ni - 1 do
+    if idx[i] >= nv then return nil, "pmd の面が範囲の外の頂点を指している" end
+  end
+  o = o + ni * 2
+  local nm = u32(o); o = o + 4
+  if o + nm * 70 > size then return nil, "pmd の材質が壊れている" end
+  local BS = string.char(92)
+  local dir = path:match("^(.*[" .. BS .. "/])") or ""
+  local mats, first = {}, 0
+  for m = 0, nm - 1 do
+    local b = o + m * 70
+    local f = ffi.cast("float*", buf + b)
+    local cnt = u32(b + 46)
+    local name = sjis_to_utf8(buf + b + 50, 20)
+    name = name:match("^([^*]*)") or ""
+    local ext = (name:match("%.([^%.]+)$") or ""):lower()
+    local tex
+    if name ~= "" and ext ~= "sph" and ext ~= "spa" then tex = dir .. name end
+    mats[#mats + 1] = { r = f[0], g = f[1], b = f[2], a = f[3], first = first, count = cnt, tex = tex }
+    first = first + cnt
+  end
+  if first > ni then return nil, "pmd の材質の面の数が面の数より多い" end
+  local Md = { nv = nv, pos = pos, uv = uv, ni = ni, idx = idx, mats = mats, buf = buf }
+  model_cache[key] = Md
+  return Md
+end
+
+--[[
+モデルの材質 mi の三角形を、ラン run の粒子ごとに置いた頂点の並び（{x,y,z,u,v}。u,v は 0..1）。
+モデルの 1 単位 = 10px × モデルの拡大率 × 粒子の拡大率。Y は上向き（MMD）なので反転する。画面も Y が下なので、見た目の上では同じ絵になり、
+三角形の表（外から見て時計回り）もそのまま保たれる（頂点の順は入れ替えない）。
+モデルの (0, 中心の高さ, 0) を粒子の位置に置く。三角形は奥から順に並べる（材質の中だけ）。tex が無い材質は u,v を 0.5 にする（拡散色の四角を貼る）
+]]
+function M.model_verts(R, run, Md, mi, opt)
+  local Mt = Md.mats[mi]
+  local S = opt.solid
+  local I = R.I
+  -- 材質の三角形の頂点を、材質ごとに 1 回だけ並べておく（速さのため。v0.17.0）
+  if not Mt.lx then
+    local pos, uv, idx = Md.pos, Md.uv, Md.idx
+    local lx, ly, lz, uu, vv = {}, {}, {}, {}, {}
+    local has_tex = Mt.tex ~= nil
+    local m = 0
+    for t = Mt.first, Mt.first + Mt.count - 3, 3 do
+      for o = 0, 2 do
+        local j = idx[t + o]
+        m = m + 1
+        lx[m], ly[m], lz[m] = pos[j * 3], pos[j * 3 + 1], pos[j * 3 + 2]
+        uu[m], vv[m] = has_tex and uv[j * 2] or 0.5, has_tex and uv[j * 2 + 1] or 0.5
+      end
+    end
+    Mt.lx, Mt.ly, Mt.lz, Mt.uu, Mt.vv, Mt.nvx = lx, ly, lz, uu, vv, m
+  end
+  local LX, LY, LZ, UU, VV, NV = Mt.lx, Mt.ly, Mt.lz, Mt.uu, Mt.vv, Mt.nvx
+  local ntri = NV / 3
+  local base = (S.mscale or 100) / 100 * 10
+  local cy0 = S.my or 0
+  local eye = opt.eye or { 0, 0, -1024 }
+  local ex, ey, ez = eye[1], eye[2], eye[3]
+  -- 頂点の表は使い回す（drawpoly に渡した後は使わない）
+  local pool = Md.pool or {}
+  Md.pool = pool
+  local np = 0
+  local out, no = {}, 0
+  local keys, tv = {}, {}
+  for _, ii in ipairs(run.items) do
+    local zm = I.zoom[ii] * base
+    local rz = I.rz[ii]
+    if opt.facing == 1 then
+      local vx, vy = I.vx[ii], I.vy[ii]
+      if vx ~= 0 or vy ~= 0 then rz = rz + atan2(vx, -vy) / RAD end
+    end
+    local axx, axy, axz, ayx, ayy, ayz = basis(I, ii, rz, opt)
+    local azx, azy, azz = axy * ayz - axz * ayy, axz * ayx - axx * ayz, axx * ayy - axy * ayx
+    local cx, cy, cz = I.x[ii], I.y[ii], I.z[ii]
+    local sx, sy = zm * (I.asx[ii] or 1), zm * (I.asy[ii] or 1)
+    local np0 = np
+    for m = 1, NV do
+      local lx, ly, lz = LX[m] * sx, -(LY[m] - cy0) * sy, LZ[m] * zm
+      np = np + 1
+      local v = pool[np]
+      if not v then v = { 0, 0, 0, 0, 0 }; pool[np] = v end
+      v[1], v[2], v[3] = cx + lx * axx + ly * ayx + lz * azx, cy + lx * axy + ly * ayy + lz * azy, cz + lx * axz + ly * ayz + lz * azz
+      v[4], v[5] = UU[m], VV[m]
+    end
+    -- 奥から順に並べる: 重心までの距離の 2 乗（整数に丸める）× 65536 ＋ 三角形の番号 を、既定の比べ方で並べて逆から読む
+    for t = 0, ntri - 1 do
+      local a, b, c = pool[np0 + t * 3 + 1], pool[np0 + t * 3 + 2], pool[np0 + t * 3 + 3]
+      local gx = (a[1] + b[1] + c[1]) / 3 - ex
+      local gy = (a[2] + b[2] + c[2]) / 3 - ey
+      local gz = (a[3] + b[3] + c[3]) / 3 - ez
+      keys[t + 1] = floor(min(gx * gx + gy * gy + gz * gz, 1e10)) * 65536 + t
+    end
+    for t = ntri + 1, #keys do keys[t] = nil end
+    if ntri < 65536 then
+      table.sort(keys)
+      for q = ntri, 1, -1 do
+        local t = keys[q] % 65536
+        local b0 = np0 + t * 3
+        out[no + 1], out[no + 2], out[no + 3] = pool[b0 + 1], pool[b0 + 2], pool[b0 + 3]
+        no = no + 3
+      end
+    else
+      for q = 1, NV do out[no + q] = pool[np0 + q] end
+      no = no + NV
+    end
+  end
+  return out
+end
+
 function M.solid_verts(R, run, w, h, opt)
   local S = opt.solid
   if not S.tpl then S.tpl = solid_template(S) end
@@ -5246,7 +6067,7 @@ end
 座標は本体の位置 B を足した値（受け取る側が自分の位置を引く）。frame はシーン基準のフレーム（obj.originframe）。
 戻り値: 同じフレームに別のオブジェクト（id）が同じ鍵で書いていたら true（後から書いた方が勝つ）
 ]]
-function M.share_put(key, res, bx, by, bz, frame, id)
+function M.share_put(key, res, bx, by, bz, frame, id, hist_n)
   local T = _G.Particle_H_share or {}
   _G.Particle_H_share = T
   local old = T[key]
@@ -5255,7 +6076,7 @@ function M.share_put(key, res, bx, by, bz, frame, id)
               k = {}, age = {}, life = {}, vx = {}, vy = {} }
   local idx = {}
   for i = 0, res.n - 1 do idx[i + 1] = i end
-  table.sort(idx, function(a, b) return res.k[a] < res.k[b] end)
+  M.sort_by_k(idx, res)
   for t, i in ipairs(idx) do
     S.x[t], S.y[t], S.z[t] = res.x[i] + bx, res.y[i] + by, res.z[i] + bz
     S.rx[t], S.ry[t], S.rz[t] = res.rx[i], res.ry[i], res.rz[i]
@@ -5270,14 +6091,17 @@ function M.share_put(key, res, bx, by, bz, frame, id)
   _G.Particle_H_share_hist = HT
   local H = HT[key] or {}
   HT[key] = H
-  local cap = M.SHARE_HIST_N
+  -- 履歴は float の配列（添字は 1 から。v0.16.0）。粒子の番号 k も持つ（当たる相手の位置を 2 つのフレームから補うため）
+  local cap = max(floor(hist_n or M.SHARE_HIST_N), 1)
   local step = S.n > cap and S.n / cap or 1
-  local A = { n = 0, x = {}, y = {}, z = {}, vx = {}, vy = {} }
+  local m_ = min(S.n, cap)
+  local A = { n = 0, x = ffi.new("float[?]", m_ + 1), y = ffi.new("float[?]", m_ + 1), z = ffi.new("float[?]", m_ + 1),
+              vx = ffi.new("float[?]", m_ + 1), vy = ffi.new("float[?]", m_ + 1), k = ffi.new("int32_t[?]", m_ + 1) }
   local t = 1
   while t <= S.n and A.n < cap do
     local u = floor(t)
     local m = A.n + 1
-    A.x[m], A.y[m], A.z[m], A.vx[m], A.vy[m] = S.x[u], S.y[u], S.z[u], S.vx[u], S.vy[u]
+    A.x[m], A.y[m], A.z[m], A.vx[m], A.vy[m], A.k[m] = S.x[u], S.y[u], S.z[u], S.vx[u], S.vy[u], S.k[u]
     A.n = m
     t = t + step
   end
@@ -5310,6 +6134,46 @@ function M.share_hist(key, frame)
     if d < bd or (d == bd and f < frame) then best, bd = A, d end
   end
   return best
+end
+
+--[[
+渡された粒子の、フレーム ft（シーン基準。端数あり）の位置（v0.16.0）: ft をはさむ 2 つのフレームから、同じ番号の粒子の位置を直線で補う。
+片方のフレームにしか無い粒子は、そのフレームの位置。どちらかのフレームが無いか、番号の無い古い形の履歴なら、近いフレーム（share_hist）
+]]
+function M.share_at(key, ft)
+  local HT = _G.Particle_H_share_hist
+  local H = HT and HT[key]
+  if not H then return nil end
+  local fa = floor(ft)
+  local u = ft - fa
+  local A, B = H[fa], H[fa + 1]
+  if A and u < 1e-9 then return A end
+  if not (A and B and A.k and B.k) then return M.share_hist(key, floor(ft + 0.5)) end
+  local map = {}
+  for j = 1, B.n do map[B.k[j]] = j end
+  local L = { n = 0, x = {}, y = {}, z = {}, vx = {}, vy = {}, k = {} }
+  local used = {}
+  local m = 0
+  for i = 1, A.n do
+    local j = map[A.k[i]]
+    m = m + 1
+    if j then
+      used[j] = true
+      L.x[m], L.y[m], L.z[m] = A.x[i] + (B.x[j] - A.x[i]) * u, A.y[i] + (B.y[j] - A.y[i]) * u, A.z[i] + (B.z[j] - A.z[i]) * u
+      L.vx[m], L.vy[m] = A.vx[i] + (B.vx[j] - A.vx[i]) * u, A.vy[i] + (B.vy[j] - A.vy[i]) * u
+    else
+      L.x[m], L.y[m], L.z[m], L.vx[m], L.vy[m] = A.x[i], A.y[i], A.z[i], A.vx[i], A.vy[i]
+    end
+    L.k[m] = A.k[i]
+  end
+  for j = 1, B.n do
+    if not used[j] then
+      m = m + 1
+      L.x[m], L.y[m], L.z[m], L.vx[m], L.vy[m], L.k[m] = B.x[j], B.y[j], B.z[j], B.vx[j], B.vy[j], B.k[j]
+    end
+  end
+  L.n = m
+  return L
 end
 
 -- 受け取る: 鍵の表と、受け取る側のフレーム − 渡した側のフレーム。表が無ければ nil

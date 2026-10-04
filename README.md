@@ -56,7 +56,7 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 | <img src="images/HexBrowns.ProceduralPattern_H_thumbnail.png" width="160"> | `プロシージャル模様_H.obj2` | 雲・縞・セル・六方格子・反応拡散から模様を作る（プリセット 22 本） | [docs](docs/プロシージャル模様_H.md) |
 | <img src="images/HexBrowns.Grid_H_thumbnail.gif" width="160"> | `グリッド_H.obj2` | 線の網目や、図形を等間隔に並べた模様 | [docs](docs/グリッド_H.md) |
 | <img src="images/HexBrowns.DecoParticle_H_thumbnail.gif" width="160"> | `装飾パーティクル_H.anm2` | オブジェクトの範囲に粒を出しては消す（アス（AVILITY）さんの「装飾パーティクル」の軽量版） | [docs](docs/装飾パーティクル_H.md) |
-| <img src="images/HexBrowns.ExtendedParticle_H_thumbnail.gif" width="160"> | `@拡張パーティクル_H.anm2` | 画像を粒子として放出する。風・力場・パス・跳ね返り・子粒子・軌跡・光源など 32 種類の拡張を積んで組み合わせる（プリセット 22 本）。rikky さんの「拡張パーティクル(R)」を AviUtl2 向けに作り直したもの | [docs](docs/拡張パーティクル_H.md) |
+| <img src="images/HexBrowns.ExtendedParticle_H_thumbnail.gif" width="160"> | `@拡張パーティクル_H.anm2` | 画像を粒子として放出する。風・力場・パス・跳ね返り・子粒子・軌跡・光源・pmd モデルなど 32 種類の拡張を積んで組み合わせる（プリセット 23 本）。rikky さんの「拡張パーティクル(R)」を AviUtl2 向けに作り直したもの | [docs](docs/拡張パーティクル_H.md) |
 
 ### カメラ・シーン
 
