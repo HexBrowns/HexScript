@@ -2,7 +2,7 @@
 
 HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定ダイアログでは `HexScript` の下に並びます。
 
-- 開発環境: AviUtl ExEdit2 2.1.11a
+- 開発環境: AviUtl ExEdit2 2.1.12
 - ライセンス: [MIT-0](LICENSE)（再配布・改変・商用利用は自由、表記も不要）。ただし「改造」の欄のファイルは元作品の権利が元作者にあります（[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）
 - 使い方は [docs/](docs/) の各ファイルにあります
 
@@ -57,6 +57,22 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 | <img src="images/HexBrowns.Grid_H_thumbnail.gif" width="160"> | `グリッド_H.obj2` | 線の網目や、図形を等間隔に並べた模様 | [docs](docs/グリッド_H.md) |
 | <img src="images/HexBrowns.DecoParticle_H_thumbnail.gif" width="160"> | `装飾パーティクル_H.anm2` | オブジェクトの範囲に粒を出しては消す（アス（AVILITY）さんの「装飾パーティクル」の軽量版） | [docs](docs/装飾パーティクル_H.md) |
 | <img src="images/HexBrowns.ExtendedParticle_H_thumbnail.gif" width="160"> | `@拡張パーティクル_H.anm2` | 画像を粒子として放出する。風・力場・パス・跳ね返り・子粒子・軌跡・光源・pmd モデルなど 32 種類の拡張を積んで組み合わせる（プリセット 23 本）。rikky さんの「拡張パーティクル(R)」を AviUtl2 向けに作り直したもの | [docs](docs/拡張パーティクル_H.md) |
+
+### After Effects の効果に当たるもの
+
+After Effects の効果を参考に、AviUtl2 向けに一から作ったものです。名前の後ろのかっこに、当たる After Effects の効果を書いています。
+
+| 見本 | ファイル | 内容 | 説明書 |
+|---|---|---|---|
+| <img src="images/HexBrowns.RadioWaves_H_thumbnail.gif" width="160"> | `電波_H.obj2` | 中心から広がる円・多角形・星の波を描く（After Effects の「電波」） | [docs](docs/電波_H.md) |
+| <img src="images/HexBrowns.VectorBlur_H_thumbnail.png" width="160"> | `ベクトルブラー_H.anm2` | 画像の明るさの流れ（輪郭の向き）に沿ってぼかす。別のレイヤーを流れの地図にもできる（「ベクトルブラー」） | [docs](docs/ベクトルブラー_H.md) |
+| <img src="images/HexBrowns.CardDance_H_thumbnail.gif" width="160"> | `カードダンス_H.anm2` | 画像をカードに分け、横・縦・放射・別のレイヤーの明るさの順に、裏返す・飛ばす・消す（「カードダンス」「カードワイプ」） | [docs](docs/カードダンス_H.md) |
+| <img src="images/HexBrowns.BallAction_H_thumbnail.gif" width="160"> | `ボールアクション_H.anm2` | 画像を光の当たったボールの集まりにして、散らす・ねじる・揺らす（「CC Ball Action」） | [docs](docs/ボールアクション_H.md) |
+| <img src="images/HexBrowns.Caustics_H_thumbnail.gif" width="160"> | `コースティクス_H.anm2` | 揺れる水面越しに見たように、屈折させて底に光の網目を描く。波紋も出せる（「ウェーブワールド」＋「コースティクス」） | [docs](docs/コースティクス_H.md) |
+| <img src="images/HexBrowns.TimeWarp_H_thumbnail.gif" width="160"> | `タイムワープ_H.obj2` | 動画を好きな速さで再生し、フレームの間を動き（オプティカルフロー）から補間する。なめらかなスロー（「タイムワープ」） | [docs](docs/タイムワープ_H.md) |
+| <img src="images/HexBrowns.ContentAwareFill_H_thumbnail.png" width="160"> | `コンテンツに応じた塗りつぶし_H.anm2` | 範囲の中を周りの絵で埋めて、写り込んだ物を消す（「コンテンツに応じた塗りつぶし」） | [docs](docs/コンテンツに応じた塗りつぶし_H.md) |
+| <img src="images/HexBrowns.Extrude_H_thumbnail.gif" width="160"> | `押し出し_H.anm2` | 文字や図形を奥行き方向に押し出し、縁に面取りか丸みを付ける（3D の「押し出し」「ベベル」） | [docs](docs/押し出し_H.md) |
+| <img src="images/HexBrowns.PlanarTracking_H_thumbnail.gif" width="160"> | `平面トラッキング_H.obj2` | 動画の中の平らな面（看板・画面など）を追い、別のレイヤーの画像を四隅に透視で貼る（「平面トラッカー」＋「コーナーピン」） | [docs](docs/平面トラッキング_H.md) |
 
 ### カメラ・シーン
 
