@@ -42,7 +42,7 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 | <img src="images/HexBrowns.ShapeDistort_H_thumbnail.png" width="160"> | `@ShapeDistort_H.anm2` | 画像をゆがませる 4 種（回転、放射、方向、ジグザグ） | [docs](docs/ShapeDistort_H.md) |
 | <img src="images/HexBrowns.Lowpoly_thumbnail.png" width="160"> | `@ローポリ化.anm2` `@ローポリ背景.obj2` | オブジェクトのローポリ化と、ローポリの背景 | [docs](docs/ローポリ.md) |
 | <img src="images/HexBrowns.VerticalText_thumbnail.png" width="160"> | `テキスト縦書き化.anm2` | 横書きのテキストを、文字ごとのオブジェクトのまま縦書きに並べる | [docs](docs/テキスト縦書き化.md) |
-| <img src="images/HexBrowns.AutoFitText_H_thumbnail.png" width="160"> | `枠内自動フィット_H.obj2` | 指定した枠に収まる最大のフォントサイズで文字を出す | [docs](docs/枠内自動フィット_H.md) |
+| <img src="images/HexBrowns.AutoFitText_H_thumbnail.png" width="160"> | `枠内自動フィット_H.obj2` | 指定した枠に収まる最大のフォントサイズで文字を出す。自動改行・禁則処理つき | [docs](docs/枠内自動フィット_H.md) |
 
 ### 光・粒・模様
 
