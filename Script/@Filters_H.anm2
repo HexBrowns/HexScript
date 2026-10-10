@@ -2955,3 +2955,362 @@ obj.pixelshader("ps_rx_apply", "object", {"cache:rx/src", "cache:rx/g1", "cache:
   strength / 100, math.log(mid_gray / 100), math.log(math.max(max_gain, 1)), cast / 100, 1 / 4096,
   (quality == 2) and 1 or 0,
 }, "copy", "clamp")
+
+@ローカルラプラシアン
+--information:ローカルラプラシアン@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@detail:ディテール,-100,100,0,0.1
+--track@tone:トーン,-100,100,0,0.1
+--track@sigma_r:しきい値(EV),0.4,4,0.8,0.01
+--track@sat_comp:彩度の補正,0,100,0,0.1
+--track@strength:強さ,0,100,100,0.1
+--select@quality:品質=1,速度=0,標準=1,高品質=2
+--[[pixelshader@ps_ll_luma_down:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 src_size;
+    float eps;
+};
+// 正本: ll_lin はこの ps_ll_luma_down。ps_ll_remap_down と ps_ll_apply に同じ写しがある（直すときは全部）
+float3 ll_lin(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a / 12.92;
+    float3 hi = pow((a + 0.055) / 1.055, 2.4);
+    return sign(c) * ((a <= 0.04045) ? lo : hi);
+}
+// 1 画素の (log2 輝度 · α, α)。輝度は線形のストレート
+float4 ll_tap(int2 q) {
+    float4 s = src.Load(int3(q, 0));
+    float3 st = (s.a > 0.001) ? s.rgb / s.a : float3(0.0, 0.0, 0.0);
+    float y = max(dot(ll_lin(st), float3(0.2126, 0.7152, 0.0722)), 0.0);
+    return float4(log2(y + eps) * s.a, s.a, 0.0, 0.0);
+}
+// 入力のガウスピラミッドの 1 段目（1/2）。4x4 の二項フィルタ [1 3 3 1]/8（ps_ll_down と同じ）
+float4 ps_ll_luma_down(float4 pos : SV_Position) : SV_Target {
+    int2 p = int2(pos.xy) * 2;
+    int2 m = int2(src_size) - int2(1, 1);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    [unroll] for (int j = 0; j < 4; j++) {
+        [unroll] for (int i = 0; i < 4; i++) {
+            float w = ((i == 0 || i == 3) ? 1.0 : 3.0) * ((j == 0 || j == 3) ? 1.0 : 3.0) / 64.0;
+            acc += ll_tap(clamp(p + int2(i - 1, j - 1), int2(0, 0), m)) * w;
+        }
+    }
+    return acc;
+}
+]]
+--[[pixelshader@ps_ll_down:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 src_size;
+};
+// 1/2 に縮める（4x4 の二項フィルタ [1 3 3 1]/8。乗算済みの 4 チャンネルをそのまま）
+float4 ps_ll_down(float4 pos : SV_Position) : SV_Target {
+    int2 p = int2(pos.xy) * 2;
+    int2 m = int2(src_size) - int2(1, 1);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    [unroll] for (int j = 0; j < 4; j++) {
+        [unroll] for (int i = 0; i < 4; i++) {
+            float w = ((i == 0 || i == 3) ? 1.0 : 3.0) * ((j == 0 || j == 3) ? 1.0 : 3.0) / 64.0;
+            acc += src.Load(int3(clamp(p + int2(i - 1, j - 1), int2(0, 0), m), 0)) * w;
+        }
+    }
+    return acc;
+}
+]]
+--[[pixelshader@ps_ll_remap_down:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 src_size;
+    float batch;
+    float l_lo;
+    float d_gamma;
+    float sigma_r;
+    float alpha_d;
+    float beta_t;
+    float eps;
+};
+// 正本は ps_ll_luma_down の ll_lin（直すときは全部）
+float3 ll_lin(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a / 12.92;
+    float3 hi = pow((a + 0.055) / 1.055, 2.4);
+    return sign(c) * ((a <= 0.04045) ? lo : hi);
+}
+// 正本: ll_remap はこの ps_ll_remap_down。ps_ll_apply に同じ写しがある（直すときは両方）。
+// 基準 g の周りのリマップ。|d| <= σ はディテール（x^α。α < 1 のときだけ 0 付近を x と滑らかに混ぜて傾きの発散を避ける。
+// α >= 1 で混ぜると単調でなくなる）、外はトーン（傾き β）
+float4 ll_remap(float l, float4 g) {
+    float4 d = l - g;
+    float4 ad = abs(d);
+    float4 sg = (d < 0.0) ? -1.0 : 1.0;
+    float4 x = ad / sigma_r;
+    float4 px = pow(max(x, 0.000001), alpha_d);
+    float4 fx = (alpha_d < 1.0) ? lerp(x, px, smoothstep(0.0, 0.02, x)) : px;
+    float4 inner = g + sg * sigma_r * fx;
+    float4 outer = g + sg * (beta_t * (ad - sigma_r) + sigma_r);
+    return (ad <= sigma_r) ? inner : outer;
+}
+// 基準 4 つ（γ = l_lo + (4·batch + i)·Δγ）のリマップ画像を作りながら 1/2 に縮める（等倍の画像は持たない）。値は α を掛けて持つ
+float4 ps_ll_remap_down(float4 pos : SV_Position) : SV_Target {
+    int2 p = int2(pos.xy) * 2;
+    int2 m = int2(src_size) - int2(1, 1);
+    float4 g = l_lo + (4.0 * batch + float4(0.0, 1.0, 2.0, 3.0)) * d_gamma;
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    [unroll] for (int j = 0; j < 4; j++) {
+        [unroll] for (int i = 0; i < 4; i++) {
+            float w = ((i == 0 || i == 3) ? 1.0 : 3.0) * ((j == 0 || j == 3) ? 1.0 : 3.0) / 64.0;
+            float4 s = src.Load(int3(clamp(p + int2(i - 1, j - 1), int2(0, 0), m), 0));
+            float3 st = (s.a > 0.001) ? s.rgb / s.a : float3(0.0, 0.0, 0.0);
+            float l = log2(max(dot(ll_lin(st), float3(0.2126, 0.7152, 0.0722)), 0.0) + eps);
+            acc += ll_remap(l, g) * (s.a * w);
+        }
+    }
+    return acc;
+}
+]]
+--[[pixelshader@ps_ll_collapse:
+Texture2D gn : register(t0);
+Texture2D gu : register(t1);
+Texture2D xu : register(t2);
+Texture2D tn0 : register(t3);
+Texture2D tn1 : register(t4);
+Texture2D tn2 : register(t5);
+Texture2D tn3 : register(t6);
+Texture2D tn4 : register(t7);
+Texture2D tn5 : register(t8);
+Texture2D tn6 : register(t9);
+Texture2D tn7 : register(t10);
+Texture2D tn8 : register(t11);
+Texture2D tn9 : register(t12);
+Texture2D tu0 : register(t13);
+Texture2D tu1 : register(t14);
+Texture2D tu2 : register(t15);
+Texture2D tu3 : register(t16);
+Texture2D tu4 : register(t17);
+Texture2D tu5 : register(t18);
+Texture2D tu6 : register(t19);
+Texture2D tu7 : register(t20);
+Texture2D tu8 : register(t21);
+Texture2D tu9 : register(t22);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float l_lo;
+    float d_gamma;
+    float k_count;
+    float n_batch;
+};
+// 正本: LL_BATCH はこの ps_ll_collapse。ps_ll_apply に同じ写しがある（直すときは両方）。
+// バッチ B の基準 4 つのラプラシアン係数 (T_n − up(T_n+1))（α で割って）を、入力の輝度 gc を挟む基準の重みで足す
+#define LL_BATCH(B, TN, TU) \
+    if (B < n_batch) { \
+        float4 lap = TN * inv_a - TU.SampleLevel(smp, uv, 0) * inv_ua; \
+        float4 gk = l_lo + (4.0 * B + float4(0.0, 1.0, 2.0, 3.0)) * d_gamma; \
+        acc += dot(max(1.0 - abs(gc - gk) / d_gamma, float4(0.0, 0.0, 0.0, 0.0)), lap); \
+    }
+// 段 n の出力の係数を足して積み上げる: X_n = Σ w·L + up(X_n+1)。出力は (X·α, α)
+float4 ps_ll_collapse(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    int3 p = int3(int(pos.x), int(pos.y), 0);
+    float4 g = gn.Load(p);
+    float a = g.g;
+    float inv_a = (a > 0.0001) ? 1.0 / a : 0.0;
+    float ua = gu.SampleLevel(smp, uv, 0).g;
+    float inv_ua = (ua > 0.0001) ? 1.0 / ua : 0.0;
+    float gc = clamp(g.r * inv_a, l_lo, l_lo + (k_count - 1.0) * d_gamma);
+    float acc = 0.0;
+    LL_BATCH(0, tn0.Load(p), tu0)
+    LL_BATCH(1, tn1.Load(p), tu1)
+    LL_BATCH(2, tn2.Load(p), tu2)
+    LL_BATCH(3, tn3.Load(p), tu3)
+    LL_BATCH(4, tn4.Load(p), tu4)
+    LL_BATCH(5, tn5.Load(p), tu5)
+    LL_BATCH(6, tn6.Load(p), tu6)
+    LL_BATCH(7, tn7.Load(p), tu7)
+    LL_BATCH(8, tn8.Load(p), tu8)
+    LL_BATCH(9, tn9.Load(p), tu9)
+    float4 x = xu.SampleLevel(smp, uv, 0);
+    float xv = (x.g > 0.0001) ? x.r / x.g : 0.0;
+    return (a > 0.0001) ? float4((acc + xv) * a, a, 0.0, 0.0) : float4(0.0, 0.0, 0.0, 0.0);
+}
+]]
+--[[pixelshader@ps_ll_apply:
+Texture2D src : register(t0);
+Texture2D gu : register(t1);
+Texture2D xu : register(t2);
+Texture2D tu0 : register(t3);
+Texture2D tu1 : register(t4);
+Texture2D tu2 : register(t5);
+Texture2D tu3 : register(t6);
+Texture2D tu4 : register(t7);
+Texture2D tu5 : register(t8);
+Texture2D tu6 : register(t9);
+Texture2D tu7 : register(t10);
+Texture2D tu8 : register(t11);
+Texture2D tu9 : register(t12);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float l_lo;
+    float d_gamma;
+    float k_count;
+    float n_batch;
+    float sigma_r;
+    float alpha_d;
+    float beta_t;
+    float strength;
+    float eps;
+    float sat_gain;
+};
+// 正本は ps_ll_luma_down の ll_lin（直すときは全部）
+float3 ll_lin(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a / 12.92;
+    float3 hi = pow((a + 0.055) / 1.055, 2.4);
+    return sign(c) * ((a <= 0.04045) ? lo : hi);
+}
+float3 ll_enc(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a * 12.92;
+    float3 hi = 1.055 * pow(a, 1.0 / 2.4) - 0.055;
+    return sign(c) * ((a <= 0.0031308) ? lo : hi);
+}
+// 正本は ps_ll_remap_down の ll_remap（直すときは両方）
+float4 ll_remap(float l, float4 g) {
+    float4 d = l - g;
+    float4 ad = abs(d);
+    float4 sg = (d < 0.0) ? -1.0 : 1.0;
+    float4 x = ad / sigma_r;
+    float4 px = pow(max(x, 0.000001), alpha_d);
+    float4 fx = (alpha_d < 1.0) ? lerp(x, px, smoothstep(0.0, 0.02, x)) : px;
+    float4 inner = g + sg * sigma_r * fx;
+    float4 outer = g + sg * (beta_t * (ad - sigma_r) + sigma_r);
+    return (ad <= sigma_r) ? inner : outer;
+}
+// 正本は ps_ll_collapse の LL_BATCH（直すときは両方）。等倍の段は T_0 を持たないので、リマップをその場で計算する
+#define LL_BATCH(B, TN, TU) \
+    if (B < n_batch) { \
+        float4 gk = l_lo + (4.0 * B + float4(0.0, 1.0, 2.0, 3.0)) * d_gamma; \
+        float4 lap = ll_remap(l0, gk) - TU.SampleLevel(smp, uv, 0) * inv_ua; \
+        acc += dot(max(1.0 - abs(gc - gk) / d_gamma, float4(0.0, 0.0, 0.0, 0.0)), lap); \
+    }
+// 等倍の段の係数を足して積み上げ直し、輝度の比で色へ掛ける。彩度の補正は、輝度を保ったまま色の差を sat_gain 倍にする
+float4 ps_ll_apply(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.Load(int3(int(pos.x), int(pos.y), 0));
+    if (c.a <= 0.001) return c;
+    float3 lin = ll_lin(c.rgb / c.a);
+    float y = max(dot(lin, float3(0.2126, 0.7152, 0.0722)), 0.0);
+    float l0 = log2(y + eps);
+    float gc = clamp(l0, l_lo, l_lo + (k_count - 1.0) * d_gamma);
+    float ua = gu.SampleLevel(smp, uv, 0).g;
+    float inv_ua = (ua > 0.0001) ? 1.0 / ua : 0.0;
+    float acc = 0.0;
+    LL_BATCH(0, 0, tu0)
+    LL_BATCH(1, 0, tu1)
+    LL_BATCH(2, 0, tu2)
+    LL_BATCH(3, 0, tu3)
+    LL_BATCH(4, 0, tu4)
+    LL_BATCH(5, 0, tu5)
+    LL_BATCH(6, 0, tu6)
+    LL_BATCH(7, 0, tu7)
+    LL_BATCH(8, 0, tu8)
+    LL_BATCH(9, 0, tu9)
+    float4 x = xu.SampleLevel(smp, uv, 0);
+    float xv = (x.g > 0.0001) ? x.r / x.g : l0;
+    float y2 = max(exp2(acc + xv) - eps, 0.0);
+    float3 lin2 = lin * (y2 / max(y, 0.000001));
+    lin2 = y2 + (lin2 - y2) * sat_gain;
+    float3 outc = lerp(lin, max(lin2, float3(0.0, 0.0, 0.0)), strength);
+    return float4(ll_enc(outc) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- 高速ローカルラプラシアンフィルタ（Paris ほか 2011 / Aubry ほか 2014 の式）。輝度の log2 を、基準輝度ごとにリマップした画像の
+-- ラプラシアンピラミッドで作り直す。しきい値より小さい明暗差（質感）はディテール、大きい明暗差はトーンで別々に動かし、輪郭の周りに帯（ハロー）を出さない。
+-- 仕様: AI/specifications/20261009_ローカルラプラシアン_H_spec.md。検証器: AI/scripts/Filters_H/verify_local_laplacian.py
+--
+-- 仕様からの変更: 係数の足し込みに blend "add" を使わない（負の値を足せるか未確認）。全バッチの縮小の段を残し、
+-- 積み上げ直しの各段（ps_ll_collapse）で全バッチを一度に読む。大きさは変えないのでフィルタオブジェクトに置ける
+
+if strength <= 0 then return end
+if detail == 0 and tone == 0 then return end
+local w, h = obj.w, obj.h
+if w < 8 or h < 8 then return end
+
+-- 輝度の log2 の定義域（-7〜0.5 EV。0.008〜1.4 の線形の輝度）。外は重みの上で端の基準に寄せる
+local L_LO, L_HI = -7, 0.5
+local EPS = 1 / 4096
+local sr = math.max(sigma_r, 0.01)
+local alpha_d = 2 ^ (-detail / 50)        -- ディテール 100 で 0.25（質感を強める）、-100 で 4
+local beta_t = 2 ^ (tone / 100 * 1.5)     -- トーン -100 で 0.35（大きな明暗差を縮める）、100 で 2.8
+-- 彩度の補正: トーンで縮めた（広げた）傾きの分だけ色の差を広げる（縮める）
+local sat_gain = math.max(0.25, math.min(4, 1 + (1 / beta_t - 1) * sat_comp / 100))
+
+-- 基準輝度の間隔: 速度 σ/2・標準 σ/3・高品質 σ/4。間隔が σ だとディテールを強めても質感が逆に弱まる
+-- （机上で縞の振幅 0.141 → 0.068 EV。σ/2 で 0.369、細かい基準では 0.396）。
+-- 基準は 4 つずつ最大 10 バッチ（40 個）なので、間隔はそこで頭打ちになる（しきい値 0.4 の標準・高品質）
+local MAX_BATCH = 10
+local dg = sr / ((quality == 0) and 2 or ((quality == 2) and 4 or 3))
+dg = math.max(dg, (L_HI - L_LO) / (4 * MAX_BATCH - 1))
+local K = math.ceil((L_HI - L_LO) / dg - 1e-9) + 1
+local B = math.ceil(K / 4)
+
+-- 段の数: 最上段が 1x1 になるまで（FHD で 11）。最上段（入力のまま残す）が 2 画素以上あると、その引き伸ばしの
+-- なだらかな傾きが画面全体に残り、大きな明暗差がトーンで縮まない（机上で 2x1 のとき段差 3.9 → 3.1 EV と端に傾き、1x1 で 2.1 EV）
+local N = math.max(1, math.ceil(math.log(math.max(w, h)) / math.log(2) - 1e-9))
+local sz = {}
+local pw, ph = w, h
+for n = 1, N do
+  pw, ph = math.ceil(pw / 2), math.ceil(ph / 2)
+  sz[n] = { pw, ph }
+end
+
+local SRC = "cache:ll/src"
+local function G(n) return "cache:ll/g" .. n end
+local function T(b, n) return "cache:ll/t" .. b .. "_" .. n end
+local function X(n) return (n == N) and G(N) or ("cache:ll/x" .. n) end
+
+obj.copybuffer(SRC, "object")
+
+-- 入力のガウスピラミッド（(ℓ·α, α)）
+obj.clearbuffer(G(1), sz[1][1], sz[1][2])
+obj.pixelshader("ps_ll_luma_down", G(1), {SRC}, { w, h, EPS }, "copy", "dot")
+for n = 2, N do
+  obj.clearbuffer(G(n), sz[n][1], sz[n][2])
+  obj.pixelshader("ps_ll_down", G(n), {G(n - 1)}, { sz[n - 1][1], sz[n - 1][2] }, "copy", "dot")
+end
+
+-- 基準 4 つずつのリマップ画像のガウスピラミッド（1 段目から。等倍は適用でその場で計算する）
+for b = 0, B - 1 do
+  obj.clearbuffer(T(b, 1), sz[1][1], sz[1][2])
+  obj.pixelshader("ps_ll_remap_down", T(b, 1), {SRC}, {
+    w, h, b, L_LO, dg, sr, alpha_d, beta_t, EPS,
+  }, "copy", "dot")
+  for n = 2, N do
+    obj.clearbuffer(T(b, n), sz[n][1], sz[n][2])
+    obj.pixelshader("ps_ll_down", T(b, n), {T(b, n - 1)}, { sz[n - 1][1], sz[n - 1][2] }, "copy", "dot")
+  end
+end
+
+-- 10 バッチ分の入力の並び。使わないバッチの場所はバッチ 0 を重ねて渡す（シェーダーは n_batch で読まない）
+local function batches(n)
+  local list = {}
+  for b = 0, MAX_BATCH - 1 do list[#list + 1] = T((b < B) and b or 0, n) end
+  return list
+end
+
+-- 上の段から積み上げ直す（最上段は入力のまま）
+for n = N - 1, 1, -1 do
+  obj.clearbuffer(X(n), sz[n][1], sz[n][2])
+  local res = { G(n), G(n + 1), X(n + 1) }
+  for _, t in ipairs(batches(n)) do res[#res + 1] = t end
+  for _, t in ipairs(batches(n + 1)) do res[#res + 1] = t end
+  obj.pixelshader("ps_ll_collapse", X(n), res, { L_LO, dg, K, B }, "copy", "clamp")
+end
+
+local res = { SRC, G(1), X(1) }
+for _, t in ipairs(batches(1)) do res[#res + 1] = t end
+obj.pixelshader("ps_ll_apply", "object", res, {
+  L_LO, dg, K, B, sr, alpha_d, beta_t, strength / 100, EPS, sat_gain,
+}, "copy", "clamp")
