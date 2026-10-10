@@ -2312,3 +2312,646 @@ if reject then
                           lw, lh, reject, lut_file))
   return
 end
+
+@色調転写
+--information:色調転写@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--select@src_mode:基準=0,画像ファイル=0,動画ファイル=1,レイヤー=2,フレームバッファ=3,どこでもバッファ=4
+--file@ref_file:基準のファイル
+--hide@ref_file:src_mode>1
+--track@ref_time:基準の時刻(秒),0,36000,0,0.01
+--hide@ref_time:src_mode<1
+--hide@ref_time:src_mode>1
+--track@ref_layer:基準のレイヤー,1,1000,1,1
+--hide@ref_layer:src_mode<2
+--hide@ref_layer:src_mode>2
+--string@ref_id:どこでもバッファのID,
+--hide@ref_id:src_mode<4
+--select@match_mode:合わせ方=2,平均=0,平均と広がり=1,分布=2
+--track@strength:強さ,0,100,100,0.1
+--track@amt_l:明るさ,0,100,100,0.1
+--track@amt_ab:色み,0,100,100,0.1
+--track@slope_max:傾きの上限,1,10,4,0.01
+--track@ana_size:解析の大きさ,64,512,256,1
+--[[pixelshader@ps_ct_down:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 src_size;
+    float2 dst_size;
+};
+// 正本: ct_lin / ct_oklab はこの ps_ct_down。ps_ct_apply に同じ写しがある（直すときは両方）
+float3 ct_lin(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a / 12.92;
+    float3 hi = pow((a + 0.055) / 1.055, 2.4);
+    return sign(c) * ((a <= 0.04045) ? lo : hi);
+}
+float3 ct_oklab(float3 c) {
+    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    float3 lms = float3(l, m, s);
+    float3 q = sign(lms) * pow(abs(lms), 1.0 / 3.0);
+    return float3(
+        0.2104542553 * q.x + 0.7936177850 * q.y - 0.0040720468 * q.z,
+        1.9779984951 * q.x - 2.4285922050 * q.y + 0.4505937099 * q.z,
+        0.0259040371 * q.x + 0.7827717662 * q.y - 0.8086757660 * q.z);
+}
+// 縮小して Oklab にする。1 画素は元の 4x4 点の平均（線形の値を α で重み付け）。
+// 出力は (L, a, b, α) のストレート（乗算済みではない。後の集計だけが読む）
+float4 ps_ct_down(float4 pos : SV_Position) : SV_Target {
+    float2 ratio = src_size / max(dst_size, float2(1.0, 1.0));
+    float2 base = floor(pos.xy) * ratio;
+    float3 acc = float3(0.0, 0.0, 0.0);
+    float acc_a = 0.0;
+    [loop] for (int j = 0; j < 4; j++) {
+        [loop] for (int i = 0; i < 4; i++) {
+            float2 p = base + (float2(i, j) + 0.5) * 0.25 * ratio;
+            float4 s = src.SampleLevel(smp, p / src_size, 0);
+            float3 straight = (s.a > 0.001) ? s.rgb / s.a : float3(0.0, 0.0, 0.0);
+            acc += ct_lin(straight) * s.a;
+            acc_a += s.a;
+        }
+    }
+    float3 lab = ct_oklab(acc / max(acc_a, 0.0001));
+    return (acc_a > 0.0001) ? float4(lab, acc_a / 16.0) : float4(0.0, 0.0, 0.0, 0.0);
+}
+]]
+--[[pixelshader@ps_ct_rows:
+Texture2D small : register(t0);
+cbuffer constant0 : register(b0) {
+    float3 range_lo;
+    float bins;
+    float3 range_hi;
+    float row_len;
+};
+// 縮小した絵の 1 行ずつを数える（出力の y が行、x が列）。Histogram_S.obj2 と同じ「行ごとに数えて縦に足す」2 段の 1 段目。
+//   x < bins   : 軸の値が段 x の上端以下の画素の α の和（累積分布を直接数える。最後の段は外の値も含めてすべて）
+//   x = bins   : Σα·v
+//   x = bins+1 : Σα·v²
+// a には行の α の和
+float4 ps_ct_rows(float4 pos : SV_Position) : SV_Target {
+    float col = floor(pos.x);
+    int row = int(pos.y);
+    float3 edge = range_lo + (col + 1.0) * (range_hi - range_lo) / bins;
+    float last = (col > bins - 1.5) ? 1.0 : 0.0;
+    float kind = (col < bins - 0.5) ? 0.0 : ((col < bins + 0.5) ? 1.0 : 2.0);
+    float3 acc = float3(0.0, 0.0, 0.0);
+    float acc_a = 0.0;
+    int n = int(row_len);
+    [loop] for (int i = 0; i < n; i++) {
+        float4 s = small.Load(int3(i, row, 0));
+        float3 v = s.rgb;
+        float3 below = max((float3)(v <= edge), float3(last, last, last));
+        float3 c = (kind < 0.5) ? below : ((kind < 1.5) ? v : v * v);
+        acc += c * s.a;
+        acc_a += s.a;
+    }
+    return float4(acc, acc_a);
+}
+]]
+--[[pixelshader@ps_ct_sum:
+Texture2D rows : register(t0);
+cbuffer constant0 : register(b0) {
+    float rows_n;
+};
+// 2 段目: 行を縦に足し、α の総和で割る。x < bins は累積分布、bins は平均、bins+1 は二乗の平均。
+// a は「数える画素があったか」（無ければ 0。対応表は恒等にする）
+float4 ps_ct_sum(float4 pos : SV_Position) : SV_Target {
+    int col = int(pos.x);
+    int n = int(rows_n);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    [loop] for (int y = 0; y < n; y++) {
+        acc += rows.Load(int3(col, y, 0));
+    }
+    float valid = (acc.a > 0.0001) ? 1.0 : 0.0;
+    return float4(acc.rgb / max(acc.a, 0.0001) * valid, valid);
+}
+]]
+--[[pixelshader@ps_ct_raw:
+Texture2D cdf_s : register(t0);
+Texture2D cdf_r : register(t1);
+cbuffer constant0 : register(b0) {
+    float bins;
+};
+// 段 j の累積分布（j < 0 は 0）。mask で軸を選ぶ
+float ct_cdf(Texture2D t, float j, float4 mask) {
+    float4 c = t.Load(int3(int(max(j, 0.0)), 0, 0));
+    return (j < 0.0) ? 0.0 : dot(c, mask);
+}
+// 段 i の中央での累積分布（段の中は一様とみなす）
+float ct_mid(Texture2D t, float i, float4 mask) {
+    return 0.5 * (ct_cdf(t, i - 1.0, mask) + ct_cdf(t, i, mask));
+}
+// 累積分布の逆関数を段の単位（0〜bins）で返す。q 以上になる最初の段を二分探索し、段の中を線形に補う
+float ct_inv(Texture2D t, float4 mask, float q) {
+    float lo = 0.0;
+    float hi = bins - 1.0;
+    [loop] for (int it = 0; it < 8; it++) {
+        float mid = floor((lo + hi) * 0.5);
+        float left = (ct_cdf(t, mid, mask) >= q) ? 1.0 : 0.0;
+        hi = lerp(hi, mid, left);
+        lo = lerp(mid + 1.0, lo, left);
+    }
+    float j = min(lo, bins - 1.0);
+    float cp = ct_cdf(t, j - 1.0, mask);
+    float cj = ct_cdf(t, j, mask);
+    float f = (cj - cp > 0.000001) ? saturate((q - cp) / (cj - cp)) : 0.5;
+    return j + f;
+}
+// 段 i の写し先（段の単位）。元の画素がある段だけ「元の累積分布で順位にし、基準の累積分布の逆関数で戻す」で決め、
+// 画素の無い段は前後の画素のある段からつなぐ（両端の外は傾き 1、間は線形）。
+// 画素の無い段まで逆関数で決めると、累積分布が平らな所で写し先が止まり、傾きの上限の鎖が大きく遅れる（机上で 136 階調ずれた）
+float ct_fill(float i, float4 mask) {
+    float pv = -1.0;
+    float nv = -1.0;
+    [loop] for (int k = 0; k < 128; k++) {
+        float fk = float(k);
+        float has = (ct_cdf(cdf_s, fk, mask) - ct_cdf(cdf_s, fk - 1.0, mask) > 0.000001) ? 1.0 : 0.0;
+        pv = (has > 0.5 && fk <= i) ? fk : pv;
+        nv = (has > 0.5 && fk >= i && nv < 0.0) ? fk : nv;
+    }
+    float up = ct_inv(cdf_r, mask, ct_mid(cdf_s, max(pv, 0.0), mask));
+    float un = ct_inv(cdf_r, mask, ct_mid(cdf_s, max(nv, 0.0), mask));
+    float r_in = lerp(up, un, (i - pv) / max(nv - pv, 1.0));
+    float r = (pv < 0.0) ? un - (nv - i) : ((nv < 0.0) ? up + (i - pv) : r_in);
+    return (pv < 0.0 && nv < 0.0) ? i + 0.5 : r;
+}
+// 写し先を「段の中央からのずれ」で書く（float16 の刻みを小さく保つ）
+float4 ps_ct_raw(float4 pos : SV_Position) : SV_Target {
+    float i = floor(pos.x);
+    float3 u = float3(
+        ct_fill(i, float4(1.0, 0.0, 0.0, 0.0)),
+        ct_fill(i, float4(0.0, 1.0, 0.0, 0.0)),
+        ct_fill(i, float4(0.0, 0.0, 1.0, 0.0)));
+    return float4(u - (i + 0.5), 1.0);
+}
+]]
+--[[pixelshader@ps_ct_lut:
+Texture2D cdf_s : register(t0);
+Texture2D cdf_r : register(t1);
+Texture2D raw_map : register(t2);
+cbuffer constant0 : register(b0) {
+    float3 range_lo;
+    float match_mode;
+    float3 range_hi;
+    float slope_max;
+    float3 axis_amt;
+    float bins;
+};
+// 対応表（bins x 1）。画素 b に、段 b の中央の値 v が写る先との差 (写し先 - v)·軸の強さ を 3 軸ぶん書く
+// （差で持つと float16 の刻みが小さい。値そのままだと 1 付近の刻みが段の幅の 6% になる）
+float4 ps_ct_lut(float4 pos : SV_Position) : SV_Target {
+    float b = floor(pos.x);
+    float3 d = (range_hi - range_lo) / bins;
+    float3 v = range_lo + (b + 0.5) * d;
+    int stat = int(bins);
+    float3 mean_s = cdf_s.Load(int3(stat, 0, 0)).rgb;
+    float3 mean_r = cdf_r.Load(int3(stat, 0, 0)).rgb;
+    float3 sq_s = cdf_s.Load(int3(stat + 1, 0, 0)).rgb;
+    float3 sq_r = cdf_r.Load(int3(stat + 1, 0, 0)).rgb;
+    float valid = cdf_s.Load(int3(0, 0, 0)).a * cdf_r.Load(int3(0, 0, 0)).a;
+    float3 sd_s = sqrt(max(sq_s - mean_s * mean_s, float3(0.0, 0.0, 0.0)));
+    float3 sd_r = sqrt(max(sq_r - mean_r * mean_r, float3(0.0, 0.0, 0.0)));
+    float kmax = max(slope_max, 1.0);
+    // 平均: 平均の差だけずらす
+    float3 mapped = v + (mean_r - mean_s);
+    if (match_mode > 0.5 && match_mode < 1.5) {
+        // 平均と広がり: 標準偏差の比で伸び縮みさせる（比は [1/上限, 上限]）
+        float3 k = clamp(sd_r / max(sd_s, float3(0.000001, 0.000001, 0.000001)), 1.0 / kmax, kmax);
+        mapped = mean_r + (v - mean_s) * k;
+    }
+    if (match_mode > 1.5) {
+        // 分布: ps_ct_raw の写し先（段の単位）を、前から順に隣の段との差を [1/上限, 上限] 段に収める
+        // （どの画素も段 0 から自分の段まで同じ鎖をたどる）
+        float3 u = float3(0.0, 0.0, 0.0);
+        float3 prev = float3(0.0, 0.0, 0.0);
+        [loop] for (int i = 0; i < 128; i++) {
+            float fi = float(i);
+            if (fi > b) break;
+            float3 raw = raw_map.Load(int3(i, 0, 0)).rgb + (fi + 0.5);
+            float3 lim = (i == 0) ? raw : clamp(raw, prev + 1.0 / kmax, prev + kmax);
+            prev = lim;
+            u = lim;
+        }
+        mapped = range_lo + u * d;
+    }
+    // 元か基準に数える画素が無ければ恒等
+    mapped = (valid > 0.5) ? mapped : v;
+    return float4((mapped - v) * axis_amt, 1.0);
+}
+]]
+--[[pixelshader@ps_ct_apply:
+Texture2D src : register(t0);
+Texture2D lut : register(t1);
+cbuffer constant0 : register(b0) {
+    float3 range_lo;
+    float strength;
+    float3 range_hi;
+    float bins;
+};
+// 正本は ps_ct_down の ct_lin / ct_oklab（直すときは両方）
+float3 ct_lin(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a / 12.92;
+    float3 hi = pow((a + 0.055) / 1.055, 2.4);
+    return sign(c) * ((a <= 0.04045) ? lo : hi);
+}
+float3 ct_enc(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a * 12.92;
+    float3 hi = 1.055 * pow(a, 1.0 / 2.4) - 0.055;
+    return sign(c) * ((a <= 0.0031308) ? lo : hi);
+}
+float3 ct_oklab(float3 c) {
+    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    float3 lms = float3(l, m, s);
+    float3 q = sign(lms) * pow(abs(lms), 1.0 / 3.0);
+    return float3(
+        0.2104542553 * q.x + 0.7936177850 * q.y - 0.0040720468 * q.z,
+        1.9779984951 * q.x - 2.4285922050 * q.y + 0.4505937099 * q.z,
+        0.0259040371 * q.x + 0.7827717662 * q.y - 0.8086757660 * q.z);
+}
+float3 ct_from_oklab(float3 lab) {
+    float l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+    float m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+    float s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+    float l = l_ * l_ * l_;
+    float m = m_ * m_ * m_;
+    float s = s_ * s_ * s_;
+    return float3(
+        4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+}
+// 軸の値 v を対応表（段の中央の値からのずれ）で引く。ずれを段の中央どうしで線形に補って足す。
+// 両端の中央より外は端のずれのまま（＝傾き 1 で延ばす）
+float ct_map(float4 mask, float v, float lo_v, float d) {
+    float u = (v - lo_v) / d - 0.5;
+    float uc = clamp(u, 0.0, bins - 1.0);
+    float i0 = floor(uc);
+    float i1 = min(i0 + 1.0, bins - 1.0);
+    float f = uc - i0;
+    float m0 = dot(lut.Load(int3(int(i0), 0, 0)), mask);
+    float m1 = dot(lut.Load(int3(int(i1), 0, 0)), mask);
+    return v + lerp(m0, m1, f);
+}
+float4 ps_ct_apply(float4 pos : SV_Position) : SV_Target {
+    float4 c = src.Load(int3(int(pos.x), int(pos.y), 0));
+    if (c.a <= 0.001) return c;
+    float3 lab = ct_oklab(ct_lin(c.rgb / c.a));
+    float3 d = (range_hi - range_lo) / bins;
+    float3 mapped = float3(
+        ct_map(float4(1.0, 0.0, 0.0, 0.0), lab.x, range_lo.x, d.x),
+        ct_map(float4(0.0, 1.0, 0.0, 0.0), lab.y, range_lo.y, d.y),
+        ct_map(float4(0.0, 0.0, 1.0, 0.0), lab.z, range_lo.z, d.z));
+    float3 lab2 = lerp(lab, mapped, strength);
+    float3 rgb = ct_from_oklab(lab2);
+    // 色域の外なら、L と色相を保って a・b を縮める（二分探索 8 回）。L が 0〜1 の外（HDR）は縮めない
+    float outside = (any(rgb < -0.0001) || any(rgb > 1.0001)) ? 1.0 : 0.0;
+    float inside_l = (lab2.x > 0.0 && lab2.x < 1.0) ? 1.0 : 0.0;
+    float s_lo = 0.0;
+    float s_hi = 1.0;
+    [loop] for (int it = 0; it < 8; it++) {
+        float mid = 0.5 * (s_lo + s_hi);
+        float3 t = ct_from_oklab(float3(lab2.x, lab2.y * mid, lab2.z * mid));
+        float ok = (all(t >= -0.0001) && all(t <= 1.0001)) ? 1.0 : 0.0;
+        s_lo = lerp(s_lo, mid, ok);
+        s_hi = lerp(mid, s_hi, ok);
+    }
+    float scale = (outside * inside_l > 0.5) ? s_lo : 1.0;
+    rgb = ct_from_oklab(float3(lab2.x, lab2.y * scale, lab2.z * scale));
+    rgb = max(rgb, float3(0.0, 0.0, 0.0));
+    return float4(ct_enc(rgb) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- 基準の映像の色の分布へ、オブジェクトの色を寄せる（Oklab の L・a・b の軸ごと）。
+-- 仕様: AI/specifications/20261009_色調転写_H_spec.md。検証器: AI/scripts/Filters_H/verify_color_transfer.py
+--
+-- --filter を付けていない理由は @LUT適用 と同じ: 基準を obj.load で読むとオブジェクトのサイズが変わる。
+-- 読んだ後は必ず cache:ct/src から戻す（基準を読めなかったときも）。
+--
+-- 分布の集計は、仕様のコンピュートシェーダーではなくピクセルシェーダーの 2 段にした
+-- （行ごとに数えて縦に足す。Histogram_S.obj2 が実機で使っている書き方。小さな cache への UAV の書き込みが未確認のため）
+
+if strength <= 0 then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+
+local mode = src_mode
+if (mode == 0 or mode == 1) and (ref_file == nil or ref_file == "") then return end
+local id = tostring(ref_id or "")
+if mode == 4 and id == "" then return end
+
+-- 同じ理由の警告を毎フレーム出さない（@LUT適用 と同じ）
+local function warn_once(key, message)
+  local k = "Filters_H:CT:" .. key
+  if global[k] == nil then
+    global[k] = "1"
+    print("@warn", message)
+  end
+end
+
+-- 軸の定義域（L は 0〜1、a・b は ±0.4。sRGB の色はこの中に収まる。外の値は端の段で数え、引くときは傾き 1 で延ばす）
+local BINS = 128
+local LO_L, LO_A, LO_B = 0, -0.4, -0.4
+local HI_L, HI_A, HI_B = 1, 0.4, 0.4
+
+-- 解析は長辺 ana_size に縮めて行う（元より大きくはしない）
+local target_long = math.max(16, math.floor(ana_size + 0.5))
+local function small_size(sw, sh)
+  local long = math.max(sw, sh)
+  local t = math.min(target_long, long)
+  return math.max(1, math.floor(sw * t / long + 0.5)), math.max(1, math.floor(sh * t / long + 0.5))
+end
+
+obj.copybuffer("cache:ct/src", "object")
+local sw, sh = small_size(w, h)
+obj.clearbuffer("cache:ct/s_small", sw, sh)
+obj.pixelshader("ps_ct_down", "cache:ct/s_small", {"object"}, {w, h, sw, sh}, "copy", "clamp")
+
+-- 基準を用意する。画像・動画・レイヤー・どこでもバッファは object に読み、フレームバッファはそのまま渡す
+local ref, rw, rh = nil, 0, 0
+if mode == 3 then
+  ref, rw, rh = "framebuffer", obj.screen_w, obj.screen_h
+else
+  local found = false
+  if mode == 0 then
+    local called, result = pcall(obj.load, "image", ref_file)
+    found = called and result ~= false
+  elseif mode == 1 then
+    -- 動画は「総時間(秒)」を返し、読めなければ 0（false ではない。lua.txt の obj.load）
+    local called, result = pcall(obj.load, "movie", ref_file, ref_time)
+    found = called and type(result) == "number" and result > 0
+  elseif mode == 2 then
+    local called, result = pcall(obj.load, "layer", math.floor(ref_layer + 0.5), true)
+    found = called and result ~= false
+  else
+    -- どこでもバッファの 入出力 が作る cache:dkdm_<ID>。無い cache を写しても大きさは 1x1 のまま（au2-filter-object）
+    obj.clearbuffer("object", 1, 1)
+    local called = pcall(obj.copybuffer, "object", "cache:dkdm_" .. id)
+    found = called and (obj.w > 1 or obj.h > 1)
+  end
+  if found and obj.w >= 1 and obj.h >= 1 then
+    ref, rw, rh = "object", obj.w, obj.h
+  end
+end
+local rsw, rsh = 0, 0
+if ref then
+  rsw, rsh = small_size(rw, rh)
+  obj.clearbuffer("cache:ct/r_small", rsw, rsh)
+  obj.pixelshader("ps_ct_down", "cache:ct/r_small", {ref}, {rw, rh, rsw, rsh}, "copy", "clamp")
+end
+
+-- 読み込みで変わった中身と大きさを戻す（基準を読めなかったときも）
+obj.copybuffer("object", "cache:ct/src")
+if not ref then
+  local names = { "画像ファイル", "動画ファイル", "レイヤー", "フレームバッファ", "どこでもバッファ" }
+  local what = (mode == 2) and tostring(math.floor(ref_layer + 0.5))
+              or ((mode == 4) and id or tostring(ref_file))
+  warn_once(mode .. ":" .. what,
+            "[色調転写] 基準（" .. (names[mode + 1] or "?") .. "）を読めないので効果を適用しません: " .. what)
+  return
+end
+
+-- 分布を数える（行ごと → 縦に足す）。結果は (bins + 2) x 1: 累積分布・平均・二乗の平均
+local function count(small, cw, ch, rows, out)
+  obj.clearbuffer(rows, BINS + 2, ch)
+  obj.pixelshader("ps_ct_rows", rows, {small}, {
+    LO_L, LO_A, LO_B, BINS, HI_L, HI_A, HI_B, cw,
+  }, "copy", "dot")
+  obj.clearbuffer(out, BINS + 2, 1)
+  obj.pixelshader("ps_ct_sum", out, {rows}, { ch }, "copy", "dot")
+end
+count("cache:ct/s_small", sw, sh, "cache:ct/s_rows", "cache:ct/s_cdf")
+count("cache:ct/r_small", rsw, rsh, "cache:ct/r_rows", "cache:ct/r_cdf")
+
+-- 分布のときの写し先（画素の無い段は前後からつなぐ）→ 対応表（元の値からのずれ）
+obj.clearbuffer("cache:ct/raw", BINS, 1)
+obj.pixelshader("ps_ct_raw", "cache:ct/raw", {"cache:ct/s_cdf", "cache:ct/r_cdf"}, { BINS }, "copy", "dot")
+obj.clearbuffer("cache:ct/lut", BINS, 1)
+obj.pixelshader("ps_ct_lut", "cache:ct/lut", {"cache:ct/s_cdf", "cache:ct/r_cdf", "cache:ct/raw"}, {
+  LO_L, LO_A, LO_B, match_mode,
+  HI_L, HI_A, HI_B, slope_max,
+  amt_l / 100, amt_ab / 100, amt_ab / 100, BINS,
+}, "copy", "dot")
+obj.pixelshader("ps_ct_apply", "object", {"object", "cache:ct/lut"}, {
+  LO_L, LO_A, LO_B, strength / 100,
+  HI_L, HI_A, HI_B, BINS,
+}, "copy", "dot")
+
+@局所トーン補正
+--information:局所トーン補正@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@strength:強さ,0,100,50,0.1
+--track@local_scale:局所スケール,0.5,20,1.5,0.01
+--track@wide_scale:広域スケール,2,60,25,0.01
+--track@mid_gray:基準の明るさ,1,100,18,0.1
+--track@max_gain:持ち上げの上限,1,32,4,0.01
+--track@cast:色かぶり補正,0,100,0,0.1
+--select@quality:品質=1,速度=0,標準=1,高品質=2
+--[[pixelshader@ps_rx_down:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 src_size;
+    float2 dst_size;
+    float linearize;
+};
+// 正本: rx_lin はこの ps_rx_down。ps_rx_apply に同じ写しがある（直すときは両方）
+float3 rx_lin(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a / 12.92;
+    float3 hi = pow((a + 0.055) / 1.055, 2.4);
+    return sign(c) * ((a <= 0.04045) ? lo : hi);
+}
+// 1 画素。linearize なら sRGB の乗算済みを線形の乗算済みにする（2 段目からは線形のまま）
+float4 rx_tap(int2 p) {
+    float4 s = src.Load(int3(p, 0));
+    float3 straight = (s.a > 0.001) ? s.rgb / s.a : float3(0.0, 0.0, 0.0);
+    float3 rgb = (linearize > 0.5) ? rx_lin(straight) * s.a : s.rgb;
+    return float4(rgb, s.a);
+}
+// 1/2 に縮める（2x2 の平均）。乗算済みのまま平均するので、透明な所は α の重みで自然に外れる（正規化畳み込み）
+float4 ps_rx_down(float4 pos : SV_Position) : SV_Target {
+    int2 p = int2(pos.xy) * 2;
+    int2 m = int2(src_size) - int2(1, 1);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    float n = 0.0;
+    [unroll] for (int j = 0; j < 2; j++) {
+        [unroll] for (int i = 0; i < 2; i++) {
+            int2 q = p + int2(i, j);
+            float w = (q.x <= m.x && q.y <= m.y) ? 1.0 : 0.0;
+            acc += rx_tap(min(q, m)) * w;
+            n += w;
+        }
+    }
+    return acc / max(n, 1.0);
+}
+]]
+--[[pixelshader@ps_rx_blur:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 size;
+    float2 dir;
+    float sigma;
+    float radius;
+};
+// 1 方向のガウスぼかし（乗算済みのまま）。外は透明として足さない（適用で α で割るので縁が暗くならない）
+float4 ps_rx_blur(float4 pos : SV_Position) : SV_Target {
+    float2 p = floor(pos.xy);
+    int r = int(radius);
+    float inv2s2 = 1.0 / max(2.0 * sigma * sigma, 0.0001);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    [loop] for (int k = -r; k <= r; k++) {
+        float2 q = p + dir * float(k);
+        float inside = (q.x >= 0.0 && q.y >= 0.0 && q.x < size.x && q.y < size.y) ? 1.0 : 0.0;
+        float w = exp(-float(k * k) * inv2s2);
+        float2 qc = clamp(q, float2(0.0, 0.0), size - float2(1.0, 1.0));
+        acc += src.Load(int3(int(qc.x), int(qc.y), 0)) * (w * inside);
+        wsum += w;
+    }
+    return acc / max(wsum, 0.0001);
+}
+]]
+--[[pixelshader@ps_rx_apply:
+Texture2D src : register(t0);
+Texture2D g1 : register(t1);
+Texture2D g2 : register(t2);
+Texture2D g3 : register(t3);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float strength;
+    float log_mid;
+    float log_max_gain;
+    float cast;
+    float eps;
+    float bspline;
+};
+// 正本は ps_rx_down の rx_lin（直すときは両方）
+float3 rx_lin(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a / 12.92;
+    float3 hi = pow((a + 0.055) / 1.055, 2.4);
+    return sign(c) * ((a <= 0.04045) ? lo : hi);
+}
+float3 rx_enc(float3 c) {
+    float3 a = abs(c);
+    float3 lo = a * 12.92;
+    float3 hi = 1.055 * pow(a, 1.0 / 2.4) - 0.055;
+    return sign(c) * ((a <= 0.0031308) ? lo : hi);
+}
+// 3 次 B スプラインの拡大（双線形 4 回。小さい段の格子を見えなくする。高品質のとき）
+float4 rx_bspline(Texture2D t, float2 uv) {
+    uint tw = 1;
+    uint th = 1;
+    t.GetDimensions(tw, th);
+    float2 size = float2(float(tw), float(th));
+    float2 tc = uv * size - 0.5;
+    float2 c0 = floor(tc);
+    float2 f = tc - c0;
+    float2 f2 = f * f;
+    float2 f3 = f2 * f;
+    float2 w0 = (-f3 + 3.0 * f2 - 3.0 * f + 1.0) / 6.0;
+    float2 w1 = (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0;
+    float2 w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0;
+    float2 w3 = f3 / 6.0;
+    float2 a0 = w0 + w1;
+    float2 a1 = w2 + w3;
+    float2 h0 = (c0 - 1.0 + w1 / a0 + 0.5) / size;
+    float2 h1 = (c0 + 1.0 + w3 / a1 + 0.5) / size;
+    return a0.y * (a0.x * t.SampleLevel(smp, float2(h0.x, h0.y), 0) + a1.x * t.SampleLevel(smp, float2(h1.x, h0.y), 0))
+         + a1.y * (a0.x * t.SampleLevel(smp, float2(h0.x, h1.y), 0) + a1.x * t.SampleLevel(smp, float2(h1.x, h1.y), 0));
+}
+// サラウンド（ぼかした照明）を線形のストレートで。α が無い所は自分の色
+float3 rx_surround(Texture2D t, float2 uv, float3 self_lin) {
+    float4 bl = t.SampleLevel(smp, uv, 0);
+    float4 bs = rx_bspline(t, uv);
+    float4 g = (bspline > 0.5) ? bs : bl;
+    return (g.a > 0.00001) ? max(g.rgb / g.a, float3(0.0, 0.0, 0.0)) : self_lin;
+}
+// MSR: 3 つのスケールのサラウンドを対数で等重みに平均し、基準の明るさとの差だけ倍率を掛ける。
+// 画面全体の統計は使わない（フレームごとに倍率が揺れない）
+float4 ps_rx_apply(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.Load(int3(int(pos.x), int(pos.y), 0));
+    if (c.a <= 0.001) return c;
+    float3 lin = rx_lin(c.rgb / c.a);
+    float3 lw = float3(0.2126, 0.7152, 0.0722);
+    float3 s1 = rx_surround(g1, uv, lin);
+    float3 s2 = rx_surround(g2, uv, lin);
+    float3 s3 = rx_surround(g3, uv, lin);
+    float sy = (log(dot(s1, lw) + eps) + log(dot(s2, lw) + eps) + log(dot(s3, lw) + eps)) / 3.0;
+    float3 sc = (log(s1 + eps) + log(s2 + eps) + log(s3 + eps)) / 3.0;
+    float dy = clamp(-strength * (sy - log_mid), -log_max_gain, log_max_gain);
+    float3 dc = clamp(-strength * (sc - log_mid), -log_max_gain, log_max_gain);
+    // 色かぶり補正 0 は輝度だけの倍率（彩度を保つ）、1 はチャンネルごとの倍率（色恒常）
+    float3 delta = lerp(float3(dy, dy, dy), dc, cast);
+    return float4(rx_enc(lin * exp(delta)) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- マルチスケールレティネックス（MSR）。3 つの半径でぼかした「照明」を対数で比べ、基準の明るさへ寄せる倍率を場所ごとに掛ける。
+-- 仕様: AI/specifications/20261009_局所トーン補正_H_spec.md。検証器: AI/scripts/Filters_H/verify_retinex.py
+-- 大きさは変えない（出入りとも obj.w x obj.h）のでフィルタオブジェクトにも置ける
+
+if strength <= 0 then return end
+local w, h = obj.w, obj.h
+if w < 2 or h < 2 then return end
+
+-- スケールは長辺に対する % を σ（px）にする。中間は局所と広域の相乗平均
+local long = math.max(w, h)
+local sig = {
+  local_scale / 100 * long,
+  math.sqrt(local_scale * wide_scale) / 100 * long,
+  wide_scale / 100 * long,
+}
+
+-- 縮小した段でぼかす。段 l は 1/2^l。σ_l = σ / 2^l がこの下限を割らない最も小さい段を選ぶ
+-- （速度 4・標準 2・高品質 1 px）。最小の段（1/64）でも半径が足りないときは σ を頭打ちにする
+local lo_sig = (quality == 0) and 4 or ((quality == 2) and 1 or 2)
+local MAX_LEVEL = 6
+local MAX_RADIUS = 24
+local level, lsig, rad = {}, {}, {}
+local need = 1
+for k = 1, 3 do
+  local l = math.floor(math.log(math.max(sig[k] / lo_sig, 1)) / math.log(2))
+  l = math.max(1, math.min(MAX_LEVEL, l))
+  local s = math.min(sig[k] / 2 ^ l, MAX_RADIUS / 3)
+  level[k], lsig[k], rad[k] = l, s, math.max(1, math.ceil(3 * s))
+  need = math.max(need, l)
+end
+
+obj.copybuffer("cache:rx/src", "object")
+local sizes = {}
+local prev, pw, ph = "cache:rx/src", w, h
+for l = 1, need do
+  local nw, nh = math.ceil(pw / 2), math.ceil(ph / 2)
+  local name = "cache:rx/p" .. l
+  obj.clearbuffer(name, nw, nh)
+  obj.pixelshader("ps_rx_down", name, {prev}, { pw, ph, nw, nh, (l == 1) and 1 or 0 }, "copy", "dot")
+  sizes[l] = { nw, nh }
+  prev, pw, ph = name, nw, nh
+end
+
+for k = 1, 3 do
+  local s = sizes[level[k]]
+  local gh, g = "cache:rx/g" .. k .. "h", "cache:rx/g" .. k
+  obj.clearbuffer(gh, s[1], s[2])
+  obj.pixelshader("ps_rx_blur", gh, {"cache:rx/p" .. level[k]}, { s[1], s[2], 1, 0, lsig[k], rad[k] }, "copy", "dot")
+  obj.clearbuffer(g, s[1], s[2])
+  obj.pixelshader("ps_rx_blur", g, {gh}, { s[1], s[2], 0, 1, lsig[k], rad[k] }, "copy", "dot")
+end
+
+obj.pixelshader("ps_rx_apply", "object", {"cache:rx/src", "cache:rx/g1", "cache:rx/g2", "cache:rx/g3"}, {
+  strength / 100, math.log(mid_gray / 100), math.log(math.max(max_gain, 1)), cast / 100, 1 / 4096,
+  (quality == 2) and 1 or 0,
+}, "copy", "clamp")

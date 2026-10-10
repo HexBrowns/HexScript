@@ -30,7 +30,7 @@ HexBrowns が AviUtl ExEdit2 向けに作ったスクリプト集です。設定
 
 | 見本 | ファイル | 内容 | 説明書 |
 |---|---|---|---|
-| <img src="images/HexBrowns.Filters_H_thumbnail.png" width="160"> | `@Filters_H.anm2` | フィルム調の加工 17 種（グリッチ、グレイン、ハレーション、ライトリーク、ビネット、アナモルフィックフレア、リキッドディストーション、シマー、フォグヘイズ、フィルムバーン、カラーグレード、リフト・ガンマ・ゲイン、バレル歪み、ノイズオーバーレイ、バイブランス、HSL選択補正、LUT適用） | [docs](docs/Filtersフィルタ使用ガイド.md) |
+| <img src="images/HexBrowns.Filters_H_thumbnail.png" width="160"> | `@Filters_H.anm2` | フィルム調の加工 19 種（グリッチ、グレイン、ハレーション、ライトリーク、ビネット、アナモルフィックフレア、リキッドディストーション、シマー、フォグヘイズ、フィルムバーン、カラーグレード、リフト・ガンマ・ゲイン、バレル歪み、ノイズオーバーレイ、バイブランス、HSL選択補正、LUT適用、色調転写、局所トーン補正） | [docs](docs/Filtersフィルタ使用ガイド.md) |
 | <img src="images/HexBrowns.OpticalBokeh_thumbnail.png" width="160"> | `@光学系ボケ.anm2` | レンズで撮ったようなボケ 4 種（玉ボケ、レンズぼかし、チルトシフト、球面収差ボケ） | [docs](docs/光学系ボケ.md) |
 | <img src="images/HexBrowns.Keying_H_thumbnail.png" width="160"> | `@キーイング_H.anm2` | 背景を抜いた素材の仕上げ 3 種（マット調整、スピル除去、トラックマット） | [docs](docs/キーイング_H.md) |
 | <img src="images/HexBrowns.RangeWarning_H_thumbnail.png" width="160"> | `レンジ警告_H.anm2` | 白飛び・黒潰れ・色域外の画素をゼブラで示す検査用の効果 | [docs](docs/レンジ警告_H.md) |
