@@ -657,7 +657,8 @@ if is_on(show_box) then
     local hw, hh = bw * 0.5, bh * 0.5
 
     -- 頂点色を指定した obj.drawpoly はオブジェクトの画像を使わない（lua.txt の「関数」の obj.drawpoly({table}) の r,g,b,a）
-    -- ので、図形を読み込まずに枠線を引ける。色は乗算済みアルファ。
+    -- ので、図形を読み込まずに枠線を引ける。色は α を掛けないストレートで渡す（lua.txt は「乗算済みα」と書くが、
+    -- 実機では本体が α を掛ける。ルール au2-shader-lua）。ここでは α = 1 だけなので、どちらでも同じ絵になる。
     local r, g, b, a = 1, 1, 1, 1
     -- 収まらなかったことを調整中に気付けるようにする（表示だけ。ログは出さない）
     if is_on(mark_overflow) and overflow then r, g, b, a = 1, 0, 0, 1 end

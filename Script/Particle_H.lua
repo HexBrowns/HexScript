@@ -92,8 +92,8 @@ M.ramp_integral = ramp_integral
 
 ----------------------------------------------------------------------------- 寿命に沿った変化のカーブ（6.2）
 
--- 補間の種類（UI の「補間」の番号）: 0 直線 / 1 瞬間 / 2 反復 / 3 加速 / 4 減速 / 5 加減速 / 6 バウンス / 7 弾性 / 8 バック / 9 カーブエディタ2
-M.CURVE_NAMES = { [0] = "直線", "瞬間", "反復", "加速", "減速", "加減速", "バウンス", "弾性", "バック", "カーブエディタ2" }
+-- 補間の種類（UI の「補間」の番号）: 0 直線 / 1 瞬間 / 2 反復 / 3 加速 / 4 減速 / 5 加減速 / 6 バウンス / 7 弾性 / 8 バック / 9 カーブエディタ_H
+M.CURVE_NAMES = { [0] = "直線", "瞬間", "反復", "加速", "減速", "加減速", "バウンス", "弾性", "バック", "カーブエディタ_H" }
 
 local function bounce_out(x)
   local n1, d1 = 7.5625, 2.75
@@ -105,7 +105,7 @@ local function bounce_out(x)
 end
 
 -- 0..1 の位置 x を 0..1 の割合にする関数。直線と瞬間は nil（呼び手がそのまま扱う）。
--- n = 反復の回数（奇数は終わりの値、偶数は始めの値で終わる。原作の移動タイプ 2 以上と同じ）、fn = カーブエディタ2 のスロットの関数
+-- n = 反復の回数（奇数は終わりの値、偶数は始めの値で終わる。原作の移動タイプ 2 以上と同じ）、fn = カーブエディタ_H のスロットの関数
 function M.curve(kind, n, fn)
   kind = floor(tonumber(kind) or 0)
   if kind == 2 then
@@ -609,10 +609,10 @@ function M.call(holder, fn, ...)
   return nil
 end
 
------------------------------------------------------------------------------ カーブエディタ2 のスロット（補間 = カーブエディタ2）
+----------------------------------------------------------------------------- カーブエディタ_H のスロット（補間 = カーブエディタ_H）
 
--- 式の前置き（関数群）は @カーブエディタ2.tra2 の _PRELUDE を、Live ファイルの場所は同じ tra2 の _bfile を読み取って使う。
--- CurveEditor2 の定義を写さないため。tra2 の書き方が変わって読めなければ nil とエラーを返す（呼び手は直線にする）。
+-- 式の前置き（関数群）は @カーブエディタ_H.tra2 の _PRELUDE を、Live ファイルの場所は同じ tra2 の _bfile を読み取って使う。
+-- CurveEditor_H の定義を写さないため。tra2 の書き方が変わって読めなければ nil とエラーを返す（呼び手は直線にする）。
 -- スロットの切り出しは tra2 の _get_fn と同じ（@.live.N の節。無い・空なら return t）
 local ce2_cache = {}
 
@@ -634,10 +634,10 @@ function M.ce2_slot(slot, opt)
   if not tra2 then
     local d = script_dir()
     if not d then return nil, "スクリプトのフォルダが分からない", "" end
-    tra2 = d .. "CurveEditor2" .. BS .. "@カーブエディタ2.tra2"
+    tra2 = d .. "CurveEditor_H" .. BS .. "@カーブエディタ_H.tra2"
   end
   local ttext = M.read_text(tra2)
-  if not ttext then return nil, "カーブエディタ2 の tra2 が無い: " .. tra2, "" end
+  if not ttext then return nil, "カーブエディタ_H の tra2 が無い: " .. tra2, "" end
   ttext = ttext:gsub("\r\n", "\n")
   local prelude = ttext:match("local _PRELUDE = %[==%[\n(.-\n)%]==%]")
   -- Live ファイルの場所: v1.10 までは `local _bfile = "…"`、それより後は `local _bfile = _C.live_path` の後の
@@ -668,7 +668,7 @@ function M.ce2_slot(slot, opt)
       if s:match("%S") then code = s end
     end
     code = code:gsub("%s+$", "")
-    local chunk, err = loadstring(prelude .. code .. "\nend", "=CurveEditor2")
+    local chunk, err = loadstring(prelude .. code .. "\nend", "=CurveEditor_H")
     fn = false
     if chunk then
       local ok, made = pcall(chunk)
