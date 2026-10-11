@@ -3314,3 +3314,441 @@ for _, t in ipairs(batches(1)) do res[#res + 1] = t end
 obj.pixelshader("ps_ll_apply", "object", res, {
   L_LO, dg, K, B, sr, alpha_d, beta_t, strength / 100, EPS, sat_gain,
 }, "copy", "clamp")
+
+@暗所視
+--information:暗所視@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@darkness:暗さ,0,100,70,0.1
+--track@threshold:中間視しきい値,0,100,70,0.1
+--track@acuity:視力低下,0,20,2.5,0.01
+--track@sharp:エッジの鋭さ,1,3,1.25,0.01
+--track@shift:色シフト,0,200,100,0.1
+--track@dim:明るさを落とす,0,100,0,0.1
+--track@noise:ノイズ,0,100,30,0.1
+--select@noise_motion:ノイズの動き=0,止める=0,フレームごと=1
+--track@seed:シード,0,9999,0,1
+--[[pixelshader@ps_sv_down:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 src_size;
+};
+// 1/2 に縮める（2x2 の平均。乗算済みのまま。はみ出した画素は数えない）
+float4 ps_sv_down(float4 pos : SV_Position) : SV_Target {
+    int2 p = int2(pos.xy) * 2;
+    int2 m = int2(src_size) - int2(1, 1);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    float n = 0.0;
+    [unroll] for (int j = 0; j < 2; j++) {
+        [unroll] for (int i = 0; i < 2; i++) {
+            int2 q = p + int2(i, j);
+            float w = (q.x <= m.x && q.y <= m.y) ? 1.0 : 0.0;
+            acc += src.Load(int3(min(q, m), 0)) * w;
+            n += w;
+        }
+    }
+    return acc / max(n, 1.0);
+}
+]]
+--[[pixelshader@ps_sv_blur:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 size;
+    float2 dir;
+    float sigma;
+    float radius;
+};
+// 1 方向のガウスぼかし（乗算済みのまま）。外は透明として足さない（最後に α で割るので縁の色が薄まらない）
+float4 ps_sv_blur(float4 pos : SV_Position) : SV_Target {
+    float2 p = floor(pos.xy);
+    int r = int(radius);
+    float inv2s2 = 1.0 / max(2.0 * sigma * sigma, 0.0001);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    [loop] for (int k = -r; k <= r; k++) {
+        float2 q = p + dir * float(k);
+        float inside = (q.x >= 0.0 && q.y >= 0.0 && q.x < size.x && q.y < size.y) ? 1.0 : 0.0;
+        float w = exp(-float(k * k) * inv2s2);
+        float2 qc = clamp(q, float2(0.0, 0.0), size - float2(1.0, 1.0));
+        acc += src.Load(int3(int(qc.x), int(qc.y), 0)) * (w * inside);
+        wsum += w;
+    }
+    return acc / max(wsum, 0.0001);
+}
+]]
+--[[pixelshader@ps_sv_final:
+Texture2D src : register(t0);
+Texture2D b1 : register(t1);
+Texture2D b2 : register(t2);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float3 tint;
+    float darkness;
+    float threshold;
+    float sharp;
+    float noise;
+    float seed;
+    float frame;
+    float use_blur;
+    float dim;
+};
+float3 sv_lin(float3 c) {
+    float3 a = abs(c);
+    return sign(c) * ((a <= 0.04045) ? a / 12.92 : pow((a + 0.055) / 1.055, 2.4));
+}
+float3 sv_enc(float3 c) {
+    float3 a = abs(c);
+    return sign(c) * ((a <= 0.0031308) ? a * 12.92 : 1.055 * pow(a, 1.0 / 2.4) - 0.055);
+}
+// 画素・シード・フレームごとの整数ハッシュ（0〜1）。同じ入力なら同じ値（ちらつかない）
+float sv_hash(int2 p, uint s, uint f) {
+    uint h = ((uint)p.x * 1597334677u) ^ ((uint)p.y * 3812015801u) ^ (s * 2654435761u) ^ (f * 2246822519u);
+    h = h ^ (h >> 16);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16);
+    return (float)(h & 0x00ffffffu) / 16777216.0;
+}
+// 暗いほど（表示上の明るさ Y' がしきい値より下）桿体の見え方へ寄せる: 色が抜けて青寄り・細部がぼける・粒が出る。
+// 桿体の明るさは Larson ほか 1997 の近似（白で 1 に正規化）。しきい値より明るい画素は 1 段階も変えない
+float4 ps_sv_final(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.Load(int3(int(pos.x), int(pos.y), 0));
+    if (c.a < 1.0 / 1024.0) return c;
+    float3 s = c.rgb / c.a;
+    float3 lw = float3(0.2126, 0.7152, 0.0722);
+    float yp = dot(saturate(s), lw);
+    float k = darkness * (1.0 - smoothstep(0.0, threshold, yp));
+    if (k <= 0.0) return c;
+    float4 l1 = (use_blur > 0.5) ? b1.SampleLevel(smp, uv, 0) : c;
+    float4 l2 = (use_blur > 0.5) ? b2.SampleLevel(smp, uv, 0) : c;
+    float4 low = l1 + (sharp - 1.0) * (l1 - l2);
+    float3 ls = (low.a > 0.0001) ? max(low.rgb / low.a, float3(0.0, 0.0, 0.0)) : s;
+    float3 ll = sv_lin(ls);
+    float X = dot(ll, float3(0.4124, 0.3576, 0.1805));
+    float Y = dot(ll, lw);
+    float Z = dot(ll, float3(0.0193, 0.1192, 0.9505));
+    float V = (X > 0.000001) ? max(Y * (1.33 * (1.0 + (Y + Z) / X) - 1.68) / 2.573, 0.0) : 0.0;
+    float g = (sv_hash(int2(pos.xy), (uint)seed, (uint)frame) - 0.5) * 0.2 * noise * k * sqrt(V + 0.01);
+    // 明るさを落とす: 暗い所ほど（k に比例して）全体を暗くする
+    float3 o = (lerp(sv_lin(s), V * tint, k) + g) * (1.0 - dim * k);
+    return float4(sv_enc(max(o, float3(0.0, 0.0, 0.0))) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- 暗所視。暗い所ほど、桿体の見え方（色が抜けて青寄り・細部がぼける・粒が出る）に寄せる。明るい所は昼の見え方のまま。
+-- 仕様: AI/specifications/20261009_暗所視_H_spec.md。検証器: AI/scripts/Filters_H/verify_scotopic.py
+-- 大きさは変えない（出入りとも obj.w x obj.h）のでフィルタオブジェクトにも置ける
+
+if darkness <= 0 then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+
+-- 夜の色: (0.75, 0.88, 1.25) を Rec.709 の明るさ 1 に正規化し、色シフトで白から寄せる（明るさは変わらない）
+local T = { 0.75, 0.88, 1.25 }
+local tl = 0.2126 * T[1] + 0.7152 * T[2] + 0.0722 * T[3]
+local k = shift / 100
+local tint = {}
+for i = 1, 3 do tint[i] = 1 + (T[i] / tl - 1) * k end
+
+obj.copybuffer("cache:sv/src", "object")
+local use_blur = acuity >= 0.3
+local b1, b2 = "cache:sv/src", "cache:sv/src"
+if use_blur then
+  -- σ > 4 は 1/2 でぼかす（σ も 1/2）。2 段目は 1 段目をもう一度ぼかす（合わせて σ√2）
+  local base, bw, bh, s = "cache:sv/src", w, h, acuity
+  if acuity > 4 then
+    bw, bh, s = math.ceil(w / 2), math.ceil(h / 2), acuity / 2
+    obj.clearbuffer("cache:sv/d", bw, bh)
+    obj.pixelshader("ps_sv_down", "cache:sv/d", {"cache:sv/src"}, { w, h }, "copy", "dot")
+    base = "cache:sv/d"
+  end
+  local r = math.max(1, math.ceil(3 * s))
+  local function blur(from, to)
+    obj.clearbuffer("cache:sv/t", bw, bh)
+    obj.pixelshader("ps_sv_blur", "cache:sv/t", {from}, { bw, bh, 1, 0, s, r }, "copy", "dot")
+    obj.clearbuffer(to, bw, bh)
+    obj.pixelshader("ps_sv_blur", to, {"cache:sv/t"}, { bw, bh, 0, 1, s, r }, "copy", "dot")
+  end
+  blur(base, "cache:sv/b1")
+  blur("cache:sv/b1", "cache:sv/b2")
+  b1, b2 = "cache:sv/b1", "cache:sv/b2"
+end
+
+obj.pixelshader("ps_sv_final", "object", {"cache:sv/src", b1, b2}, {
+  tint[1], tint[2], tint[3], darkness / 100,
+  math.max(threshold / 100, 0.001), sharp, noise / 100, math.floor(seed + 0.5),
+  (noise_motion == 1) and obj.frame or 0, use_blur and 1 or 0, dim / 100,
+}, "copy", "clamp")
+
+@ホログラム箔
+--information:ホログラム箔@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@strength:強さ,0,100,100,0.1
+--select@target:対象=0,アルファ=0,輝度=1,アルファ×輝度=2
+--select@angle_src:角度の取得元=0,カメラ=0,オブジェクトの回転=1,手動=2
+--track@sensitivity:角度感度,-400,400,100,0.1
+--track@manual_x:角度X,-180,180,0,0.1
+--track@manual_y:角度Y,-180,180,0,0.1
+--track@parallax:視差,0,200,50,0.1
+--color@foil_color:箔色,0xe8f4ff
+--track@rainbow:虹色,0,200,100,0.1
+--track@bump:凹凸,0,300,80,0.1
+--track@line_density:細線密度,10,500,120,0.1
+--track@line_angle:細線角度,-180,180,35,0.1
+--select@line_basis:細線の基準=0,面に固定=0,画面で一定=1
+--track@sparkle:きらめき,0,200,45,0.1
+--track@motion:動き,-200,200,20,0.1
+--track@seed:シード,0,10000,0,1
+--group:潜像,false
+--select@latent_mode:潜像モード=0,なし=0,ギロシェ=1,画像アトラス=2
+--track@latent_amount:潜像の強さ,0,200,100,0.1
+--track@latent_angle:潜像の角度,-90,90,0,0.1
+--track@latent_range:角度範囲,1,180,30,0.1
+--track@latent_soft:切替補間,0,100,50,0.1
+--file@atlas_file:アトラス画像
+--select@atlas_frames:フレーム数=4,2=2,3=3,4=4,5=5,6=6,7=7,8=8,9=9,10=10,11=11,12=12,13=13,14=14,15=15,16=16
+--group
+--hide@manual_x:angle_src~=2
+--hide@manual_y:angle_src~=2
+--hide@latent_amount:latent_mode==0
+--hide@latent_angle:latent_mode==0
+--hide@latent_range:latent_mode==0
+--hide@latent_soft:latent_mode==0
+--hide@atlas_file:latent_mode~=2
+--hide@atlas_frames:latent_mode~=2
+--[[pixelshader@ps_hf_main:
+Texture2D src : register(t0);
+Texture2D atlas : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float3 foil_lin;
+    float strength;
+    float2 tilt;
+    float2 line_n;
+    float2 size;
+    float period;
+    float rainbow;
+    float bump;
+    float sparkle;
+    float motion_phase;
+    float seed_phase;
+    float target_mode;
+    float parallax;
+    float seed;
+    float latent_mode;
+    float latent_vis;
+    float atlas_i0;
+    float atlas_i1;
+    float atlas_t;
+    float atlas_frames;
+};
+float3 hf_lin(float3 c) {
+    float3 a = abs(c);
+    return sign(c) * ((a <= 0.04045) ? a / 12.92 : pow((a + 0.055) / 1.055, 2.4));
+}
+float3 hf_enc(float3 c) {
+    float3 a = abs(c);
+    return sign(c) * ((a <= 0.0031308) ? a * 12.92 : 1.055 * pow(a, 1.0 / 2.4) - 0.055);
+}
+float hf_g(float x, float mu, float s1, float s2) {
+    float t = (x - mu) / ((x < mu) ? s1 : s2);
+    return exp(-0.5 * t * t);
+}
+// 波長 [nm] の単色の色（Wyman ほか 2013 の CIE 1931 等色関数の近似 → リニア sRGB）。最も強い成分を 1 にそろえる
+float3 hf_spectrum(float l) {
+    float X = 1.056 * hf_g(l, 599.8, 37.9, 31.0) + 0.362 * hf_g(l, 442.0, 16.0, 26.7) - 0.065 * hf_g(l, 501.1, 20.4, 26.2);
+    float Y = 0.821 * hf_g(l, 568.8, 46.9, 40.5) + 0.286 * hf_g(l, 530.9, 16.3, 31.1);
+    float Z = 1.217 * hf_g(l, 437.0, 11.8, 36.0) + 0.681 * hf_g(l, 459.0, 26.0, 13.8);
+    float3 rgb = float3(3.2406 * X - 1.5372 * Y - 0.4986 * Z,
+                        -0.9689 * X + 1.8758 * Y + 0.0415 * Z,
+                        0.0557 * X - 0.2040 * Y + 1.0570 * Z);
+    rgb = max(rgb, float3(0.0, 0.0, 0.0));
+    return rgb / max(max(rgb.r, max(rgb.g, rgb.b)), 0.001);
+}
+float hf_hash(int2 c, uint s) {
+    uint h = ((uint)c.x * 1597334677u) ^ ((uint)c.y * 3812015801u) ^ (s * 2654435761u);
+    h = h ^ (h >> 16);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16);
+    return (float)(h & 0x00ffffffu) / 16777216.0;
+}
+// 箔の高さ（凹凸の元）: 対象がアルファならアルファ、それ以外は輝度
+float hf_height(int2 p) {
+    int2 q = clamp(p, int2(0, 0), int2(size) - int2(1, 1));
+    float4 c = src.Load(int3(q, 0));
+    if (target_mode < 0.5) return c.a;
+    float3 s = (c.a > 0.0001) ? c.rgb / c.a : float3(0.0, 0.0, 0.0);
+    return dot(saturate(s), float3(0.2126, 0.7152, 0.0722)) * c.a;
+}
+// ギロシェ（紙幣の地紋のような、ゆらいだ同心の細線を 2 方向に重ねたもの）。面の中心から
+float hf_guilloche(float2 pos) {
+    float2 q = (pos - size * 0.5) / max(size.x, size.y) * 2.0;
+    float r = length(q);
+    float th = atan2(q.y, q.x);
+    float ph = seed_phase * 6.2831853;
+    float a = pow(0.5 + 0.5 * cos(6.2831853 * (r * 22.0 + 1.4 * sin(9.0 * th + r * 9.0 + ph))), 12.0);
+    float b = pow(0.5 + 0.5 * cos(6.2831853 * (r * 22.0 + 1.4 * sin(-9.0 * th + r * 9.0 - ph))), 12.0);
+    return max(a, b) * (1.0 - smoothstep(0.85, 1.0, r));
+}
+// 画像アトラス（横に並べたコマ）の 1 コマを、面の uv で読む。乗算済みのまま
+float4 hf_atlas(float i, float2 uv) {
+    float2 a = float2((i + clamp(uv.x, 0.0005, 0.9995)) / atlas_frames, clamp(uv.y, 0.0005, 0.9995));
+    return atlas.SampleLevel(smp, a, 0);
+}
+// 見る角度で色が流れる回折の虹色・細線・疑似凹凸・きらめき（＋角度で浮かぶ潜像）を、面の反射として元の色にスクリーンで重ねる。
+// 模様はオブジェクトの画素に貼り付く（面と一緒に動くのが正しい）
+float4 ps_hf_main(float4 pos : SV_Position) : SV_Target {
+    int2 ip = int2(pos.xy);
+    float4 c = src.Load(int3(ip, 0));
+    if (c.a < 1.0 / 1024.0) return c;
+    float3 s = c.rgb / c.a;
+    float luma = dot(saturate(s), float3(0.2126, 0.7152, 0.0722));
+    float mask = (target_mode < 0.5) ? 1.0 : ((target_mode < 1.5) ? luma : luma * c.a);
+    float2 grad = float2(hf_height(ip + int2(1, 0)) - hf_height(ip - int2(1, 0)),
+                         hf_height(ip + int2(0, 1)) - hf_height(ip - int2(0, 1))) * 0.5;
+    float2 q = (pos.xy - size * 0.5) / max(size.x, size.y) * parallax;
+    float2 tv = tilt + q + grad * bump;
+    float sa = dot(tv, line_n);
+    float sb = dot(tv, float2(-line_n.y, line_n.x));
+    float u = dot(pos.xy, line_n) / period;
+    float lam = 380.0 + 320.0 * frac(sa * 0.6 + u * 0.03 + seed_phase);
+    float3 rb = hf_spectrum(lam);
+    float lines = pow(0.5 + 0.5 * cos(6.2831853 * u), 4.0);
+    float refl = lines * (0.5 + 0.5 * cos(4.0 * sa + motion_phase));
+    int2 cell = int2(floor(pos.xy / 4.0));
+    float r = hf_hash(cell, (uint)seed);
+    float on = (frac(r * 31.0 + 4.0 * length(tilt) + motion_phase * 0.37) > 1.0 - 0.02 * sparkle) ? 1.0 : 0.0;
+    float2 f = frac(pos.xy / 4.0) - 0.5;
+    float spark = on * saturate(1.0 - length(f) * 2.0);
+    // 照り: 角度と面の位置で虹色の強さを変える（全面に白を乗せると色が薄まるので、白い反射は細線の山だけに）
+    float g = 0.5 + 0.5 * cos(2.6 * sa + 1.7 * sb + 3.5 * dot(q, float2(0.6, -0.8)) / max(parallax, 0.01) + motion_phase * 0.5);
+    float sheen = 0.15 + 0.85 * g * g;
+    float3 foil = foil_lin * (0.06 + 0.5 * refl * refl) + rb * rainbow * (0.25 + 0.75 * lines) * sheen + spark;
+    if (latent_mode > 0.5 && latent_vis > 0.0) {
+        if (latent_mode < 1.5) {
+            foil += latent_vis * hf_guilloche(pos.xy) * (foil_lin + 0.5 * rb);
+        } else {
+            float2 uv = pos.xy / size;
+            float4 la = lerp(hf_atlas(atlas_i0, uv), hf_atlas(atlas_i1, uv), atlas_t);
+            float3 ls = (la.a > 0.0001) ? la.rgb / la.a : float3(0.0, 0.0, 0.0);
+            foil += latent_vis * hf_lin(saturate(ls)) * la.a;
+        }
+    }
+    float3 base = hf_lin(s);
+    float3 scr = 1.0 - (1.0 - saturate(base)) * (1.0 - saturate(foil));
+    float3 o = lerp(base, scr, strength * mask);
+    return float4(hf_enc(max(o, float3(0.0, 0.0, 0.0))) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- ホログラム箔。見る角度（カメラ・オブジェクトの回転・手動）で色が流れる回折の虹色に、細線・疑似凹凸・きらめきを重ねる。
+-- 潜像（ギロシェ・画像アトラス）は、決めた角度の範囲で浮かぶ。
+-- 仕様: AI/specifications/20261009_ホログラム箔_H_spec.md。検証器: AI/scripts/Filters_H/verify_foil.py
+-- 1 パスで大きさは変えない。アトラスは obj.load で読んで cache へ退避し、元のオブジェクトを戻す
+-- （lua.txt: フィルタオブジェクトでも、終わったときに大きさが元に戻っていればよい）
+
+if strength <= 0 then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+
+-- 角度（度）。カメラはカメラからオブジェクトへの向きと、オブジェクト自身の回転の差。カメラ制御の外では回転に落とす
+local rx = (obj.getvalue("rx") or 0) + obj.rx
+local ry = (obj.getvalue("ry") or 0) + obj.ry
+local ax, ay = ry, rx
+if angle_src == 2 then
+  ax, ay = manual_x, manual_y
+elseif angle_src == 0 and obj.getoption("camera_mode") ~= 0 then
+  local cam = obj.getoption("camera_param")
+  if cam and cam.x and cam.z then
+    local px = (obj.getvalue("x") or 0) + obj.ox
+    local py = (obj.getvalue("y") or 0) + obj.oy
+    local pz = (obj.getvalue("z") or 0) + obj.oz
+    local vx, vy, vz = px - cam.x, py - cam.y, pz - cam.z
+    ax = math.deg(math.atan2(vx, vz)) - ry
+    ay = math.deg(math.atan2(vy, vz)) - rx
+  end
+end
+local k = math.rad(sensitivity / 100)
+local th = math.rad(line_angle)
+local fr, fg, fb = RGB(tonumber(foil_color) or 0xe8f4ff)
+local function lin(v)
+  v = v / 255
+  return (v <= 0.04045) and v / 12.92 or ((v + 0.055) / 1.055) ^ 2.4
+end
+local sd = math.floor(seed + 0.5)
+-- シードの位相（黄金比で散らす）と、動き 100% で 1 秒に半周する時間の位相
+local seed_phase = (sd * 0.6180339887) % 1
+local motion_phase = obj.time * motion / 100 * math.pi
+
+-- 細線の周期（オブジェクトの画素）。100% で 6px。画面で一定なら拡大率で割る（拡大すると面の上では細くなる）
+local period = 6 / (line_density / 100)
+if line_basis == 1 then
+  local zoom = (obj.getvalue("zoom") or 100) / 100 * obj.zoom
+  period = period / math.max(zoom, 0.01)
+end
+period = math.max(period, 1.5)
+
+-- 潜像。角度 X（取得元の角度、度）が「潜像の角度 ± 角度範囲/2」にあるときに浮かぶ
+local function smooth(e0, e1, x)
+  if e1 <= e0 then return (x < e0) and 0 or 1 end
+  local t = math.min(math.max((x - e0) / (e1 - e0), 0), 1)
+  return t * t * (3 - 2 * t)
+end
+local mode, vis, i0, i1, tt, nf = latent_mode, 0, 0, 0, 0, 1
+local half = latent_range / 2
+local soft = latent_soft / 100
+local d = math.abs(ax - latent_angle)
+local res_atlas = "object"
+if mode == 1 then
+  vis = 1 - smooth(half * (1 - soft), half, d)
+elseif mode == 2 then
+  -- コマを角度範囲に並べ、隣のコマとの境で切替補間の幅だけ混ぜる。範囲の外は切替補間の幅で消える
+  nf = atlas_frames
+  local ok = false
+  if atlas_file ~= nil and atlas_file ~= "" then
+    obj.copybuffer("cache:hf/src", "object")
+    local called, result = pcall(obj.load, "image", atlas_file)
+    if called and result and obj.w > 0 then
+      obj.copybuffer("cache:hf/atlas", "object")
+      ok = true
+    end
+    obj.copybuffer("object", "cache:hf/src")
+    if not ok then
+      local key = "Filters_H:HF:load:" .. atlas_file
+      if global[key] == nil then
+        global[key] = "1"
+        print("@warn", "[ホログラム箔@Filters_H] アトラス画像を読み込めません: " .. atlas_file)
+      end
+    end
+  end
+  if ok then
+    local fpos = (ax - (latent_angle - half)) / math.max(latent_range, 0.001) * nf - 0.5
+    fpos = math.min(math.max(fpos, 0), nf - 1)
+    i0 = math.floor(fpos)
+    i1 = math.min(i0 + 1, nf - 1)
+    local t = fpos - i0
+    tt = smooth(0.5 - soft / 2, 0.5 + soft / 2, t)
+    vis = 1 - smooth(half, half + math.max(latent_range * soft / 2, 0.001), d)
+    res_atlas = "cache:hf/atlas"
+  else
+    mode = 0
+  end
+end
+
+obj.pixelshader("ps_hf_main", "object", {"object", res_atlas}, {
+  lin(fr), lin(fg), lin(fb), strength / 100,
+  ax * k, ay * k, -math.sin(th), math.cos(th),
+  w, h, period, rainbow / 100,
+  bump / 100, sparkle / 100, motion_phase, seed_phase,
+  target, parallax / 100, sd, mode,
+  vis * latent_amount / 100, i0, i1, tt,
+  nf,
+}, "copy", "clamp")
