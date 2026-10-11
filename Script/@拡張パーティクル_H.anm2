@@ -587,7 +587,7 @@ local sig_rest = "|" .. table.concat(sig_ext, "|") .. "|" .. ser(e_emit) .. ser(
 sig = table.concat(sig_parts, ",") .. sig_rest
 -- 焼き付けのシグネチャ（v0.16.0）: 動き（位置と回転が決まる値）だけ。拡大率・透過率のトラックバーは入れない（読んだ後に今の値で計算し直す）。
 -- 計算の後に位置を動かすもの（回転・子粒子・軌跡・形へ集まる・格子・音の広がり）も入れる。
--- 形へ集まるの「向きをそろえる」は拡大率も変えるので、そのときは見た目の値も入れる（計算し直さない）
+-- 形へ集まるの「回転と大きさをそろえる」は拡大率も変えるので、そのときは見た目の値も入れる（計算し直さない）
 local LOOK_NAMES = { zoom0 = true, zoom1 = true, alpha0 = true, alpha1 = true }
 bake_keep_look = X.gather and X.gather.align
 local motion_parts = {}
