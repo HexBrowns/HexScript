@@ -1,9 +1,10 @@
 --[[
-キーイング_H.anm2（マット調整 v1.01 / スピル除去 v1.01 / トラックマット v1.03）
+キーイング_H.anm2（マット調整 v1.01 / スピル除去 v1.01 / トラックマット v1.03 / 動体抽出 v1.00）
 
   マット調整   : アルファを 収縮／膨張 → エッジぼかし → レベル補正 の順で整える（マルチパス）
   スピル除去   : 背景色の回り込み（スピル）を中和する（1 パス）
   トラックマット : 他レイヤーの輝度／アルファでマスクする
+  動体抽出     : 前のフレーム（または動画ファイルの別の時刻）との差が大きい所だけを残す。枠・ターゲット選択・グリッド画像つき
 
 適用順は マット調整 → スピル除去 を推奨（α を整えてから RGB の被りを取る）。
 
@@ -483,3 +484,566 @@ obj.pixelshader("ps_trackmatte", "tempbuffer", { "tempbuffer", "object" }, {
   matte_strength / 100,
 }, "copy", "clamp")
 obj.copybuffer("object", "tempbuffer")
+
+@動体抽出
+--information:動体抽出@キーイング_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--group:比較
+--select@src_mode:比較元=0,履歴=0,動画ファイル=1
+--file@movie:動画ファイル
+--hide@movie:src_mode==0
+--select@ref_mode:比較先=0,前のフレーム=0,基準の時刻=1
+--hide@ref_mode:src_mode==0
+--track@interval:比較フレーム間隔,1,30,1,1
+--track@ref_time:基準の時刻,0,36000,0,0.01
+--hide@ref_time:ref_mode==0
+--track@movie_offset:動画のずれ,-36000,36000,0,0.01
+--hide@movie_offset:src_mode==0
+--select@no_prev:比較元が無いとき=0,何も残さない=0,すべて残す=1
+--group:検出
+--track@threshold:しきい値,0,100,10,0.1
+--track@softness:境界の幅,0,50,5,0.1
+--track@pre_blur:ぼかし,0,50,2,0.1
+--track@smooth:マスクの滑らかさ,0,100,4,0.1
+--check@gradient:強度グラデーション,0
+--check@use_color:色の差,0
+--check@invert:反転,0
+--group:対象
+--track@noise:ノイズ除去,0,100000,0,1
+--select@target:ターゲット選択=0,すべて=0,面積が大きい順=1,最も近い順=2
+--track@count:個数,1,32,1,1
+--hide@count:target==0
+--track@target_x:ターゲット座標X,-4000,4000,0,0.1
+--hide@target_x:target~=2
+--track@target_y:ターゲット座標Y,-4000,4000,0,0.1
+--hide@target_y:target~=2
+--check@show_frame:対象表示（枠）,0
+--select@frame_shape:枠の形状=0,四角=0,輪郭=1
+--hide@frame_shape:show_frame==0
+--color@frame_color:枠の色,0x30ff60
+--hide@frame_color:show_frame==0
+--track@frame_width:枠の太さ,1,20,3,0.1
+--hide@frame_width:show_frame==0
+--group:表示
+--select@out_mode:出力=0,切り抜き=0,マスク=1,着色=2,元のまま=3
+--color@tint:着色の色,0xff3030
+--hide@tint:out_mode~=2
+--track@tint_amount:着色の強さ,0,100,60,0.1
+--hide@tint_amount:out_mode~=2
+--check@grid:グリッド画像,0
+--file@grid_file:配置する画像
+--hide@grid_file:grid==0
+--track@grid_pitch:グリッド間隔,8,1000,64,1
+--hide@grid_pitch:grid==0
+--group:品質
+--select@res:解像度=2,等倍=1,1/2=2,1/4=4
+--[[pixelshader@ps_md_lum:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 size;
+    float div;
+    float color_mode;
+};
+// 作業解像度の 1 画素 = 元の画像の div x div 画素の平均。比較元の動画は元の画像の大きさに引き伸ばして読む（uv で読む）。
+// 明るさ（色の差なら Y・Cb・Cr）を rgb に置く。乗算済みのまま（透明な所は黒）
+float4 ps_md_lum(float4 pos : SV_Position) : SV_Target {
+    int2 ip = int2(pos.xy);
+    int n = int(div);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    [loop] for (int j = 0; j < n; j++) {
+        [loop] for (int i = 0; i < n; i++) {
+            float2 p = float2(ip) * div + float2(float(i) + 0.5, float(j) + 0.5);
+            acc += src.SampleLevel(smp, p / size, 0);
+        }
+    }
+    acc /= float(n * n);
+    float y = dot(acc.rgb, float3(0.2126, 0.7152, 0.0722));
+    float cb = 0.5;
+    float cr = 0.5;
+    if (color_mode > 0.5) {
+        cb = 0.5 + (acc.b - y) / 1.8556;
+        cr = 0.5 + (acc.r - y) / 1.5748;
+    }
+    return float4(saturate(y), saturate(cb), saturate(cr), 1.0);
+}
+]]
+--[[pixelshader@ps_md_blur:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 size;
+    float2 dir;
+    float sigma;
+    float radius;
+    float cut;
+};
+// 1 方向のガウスぼかし。cut = 1 なら最後に 0.5 で切り直す（マスクの穴とギザギザを埋める）
+float4 ps_md_blur(float4 pos : SV_Position) : SV_Target {
+    int2 ip = int2(pos.xy);
+    int2 mx = int2(size) - int2(1, 1);
+    int r = int(radius);
+    float3 acc = float3(0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    [loop] for (int k = -r; k <= r; k++) {
+        float wk = exp(-0.5 * float(k * k) / (sigma * sigma));
+        int2 q = clamp(ip + int2(dir) * k, int2(0, 0), mx);
+        acc += src.Load(int3(q, 0)).rgb * wk;
+        wsum += wk;
+    }
+    float3 v = acc / wsum;
+    if (cut > 0.5) {
+        v = smoothstep(float3(0.45, 0.45, 0.45), float3(0.55, 0.55, 0.55), v);
+    }
+    return float4(v, 1.0);
+}
+]]
+--[[pixelshader@ps_md_pack:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 work;
+    float color_mode;
+};
+// 読み戻し（8bit・ストレート）に耐える形に詰める。値は 7bit の奇数 (2k+1)/255、アルファは 1。
+// 明るさだけなら 1 テクセルに横の 3 画素、色の差なら 1 画素の Y・Cb・Cr
+float md_enc(float v) {
+    return (2.0 * round(saturate(v) * 127.0) + 1.0) / 255.0;
+}
+float4 ps_md_pack(float4 pos : SV_Position) : SV_Target {
+    int2 ip = int2(pos.xy);
+    if (color_mode > 0.5) {
+        float3 c = src.Load(int3(ip, 0)).rgb;
+        return float4(md_enc(c.r), md_enc(c.g), md_enc(c.b), 1.0);
+    }
+    int x0 = ip.x * 3;
+    int wx = int(work.x);
+    float a0 = src.Load(int3(x0, ip.y, 0)).r;
+    float a1 = (x0 + 1 < wx) ? src.Load(int3(x0 + 1, ip.y, 0)).r : 0.0;
+    float a2 = (x0 + 2 < wx) ? src.Load(int3(x0 + 2, ip.y, 0)).r : 0.0;
+    return float4(md_enc(a0), md_enc(a1), md_enc(a2), 1.0);
+}
+]]
+--[[pixelshader@ps_md_diff:
+Texture2D cur : register(t0);
+Texture2D prev : register(t1);
+cbuffer constant0 : register(b0) {
+    float2 work;
+    float threshold;
+    float softness;
+    float gradient;
+    float color_mode;
+};
+// 詰めた 2 枚（今と比較元）の差からマスクを作る。どちらも同じ詰め方を通っているので、止まった所の差は 0。
+// 読み戻しが切り捨てだと (2k+1)/255 は 2k になる（RGBA16F の値がわずかに小さい）。+0.25 で 2k も 2k+1 も k に戻す
+float md_dec(float v) {
+    return floor(v * 127.5 + 0.25) / 127.0;
+}
+float4 ps_md_diff(float4 pos : SV_Position) : SV_Target {
+    uint2 ip = uint2(pos.xy);
+    float d = 0.0;
+    if (color_mode > 0.5) {
+        float3 a = cur.Load(int3(int2(ip), 0)).rgb;
+        float3 b = prev.Load(int3(int2(ip), 0)).rgb;
+        d = max(abs(md_dec(a.r) - md_dec(b.r)), max(abs(md_dec(a.g) - md_dec(b.g)), abs(md_dec(a.b) - md_dec(b.b))));
+    } else {
+        uint tx = ip.x / 3u;
+        uint ch = ip.x - tx * 3u;
+        float4 a = cur.Load(int3(int(tx), int(ip.y), 0));
+        float4 b = prev.Load(int3(int(tx), int(ip.y), 0));
+        float va = (ch == 0u) ? a.r : ((ch == 1u) ? a.g : a.b);
+        float vb = (ch == 0u) ? b.r : ((ch == 1u) ? b.g : b.b);
+        d = abs(md_dec(va) - md_dec(vb));
+    }
+    float m = 0.0;
+    if (gradient > 0.5) {
+        m = saturate((d - threshold) / max(1.0 - threshold, 0.001));
+    } else if (softness < 0.0001) {
+        m = (d >= threshold) ? 1.0 : 0.0;
+    } else {
+        m = smoothstep(threshold - softness * 0.5, threshold + softness * 0.5, d);
+    }
+    return float4(m, m, m, 1.0);
+}
+]]
+--[[pixelshader@ps_md_cell:
+Texture2D msk : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 work;
+    float cw;
+};
+// マスクを 4px 角の格子（元の画像の画素）に縮める。マスの中に 0.5 を超える画素が 1 つでもあれば 1
+float4 ps_md_cell(float4 pos : SV_Position) : SV_Target {
+    int2 ip = int2(pos.xy);
+    int n = int(cw);
+    int2 mx = int2(work) - int2(1, 1);
+    float v = 0.0;
+    [loop] for (int j = 0; j < n; j++) {
+        [loop] for (int i = 0; i < n; i++) {
+            v = max(v, msk.Load(int3(clamp(ip * n + int2(i, j), int2(0, 0), mx), 0)).r);
+        }
+    }
+    v = (v > 0.5) ? 1.0 : 0.0;
+    return float4(v, v, v, 1.0);
+}
+]]
+--[[pixelshader@ps_md_apply:
+Texture2D src : register(t0);
+Texture2D msk : register(t1);
+Texture2D kp : register(t2);
+Texture2D grd : register(t3);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float4 boxes[32];
+    float4 tint;
+    float4 fcol;
+    float2 size;
+    float2 wsize;
+    float2 gsize;
+    float out_mode;
+    float invert;
+    float use_keep;
+    float cell;
+    float show_frame;
+    float frame_shape;
+    float nbox;
+    float grid_on;
+    float grid_pitch;
+};
+// 動いた所のマスク（残した成分だけ）。p は元の画像の画素。wsize = 作業解像度 x div（作業解像度の端の画素がはみ出す分も含めた大きさ）
+float md_mask(float2 p) {
+    float m = msk.SampleLevel(smp, p / wsize, 0).r;
+    if (use_keep > 0.5) {
+        uint kw = 0;
+        uint kh = 0;
+        kp.GetDimensions(kw, kh);
+        int2 c = clamp(int2(floor(p / cell)), int2(0, 0), int2(int(kw) - 1, int(kh) - 1));
+        m *= kp.Load(int3(c, 0)).r;
+    }
+    return m;
+}
+// 出力（乗算済み）: 切り抜き / マスク（白黒・不透明）/ 着色 / 元のまま。その上にグリッド画像と枠を重ねる
+float4 ps_md_apply(float4 pos : SV_Position) : SV_Target {
+    float2 p = pos.xy;
+    float4 c = src.Load(int3(int2(p), 0));
+    float mk = md_mask(p);
+    float m = (invert > 0.5) ? 1.0 - mk : mk;
+    float4 o = c;
+    if (out_mode < 0.5) {
+        o = c * m;
+    } else if (out_mode < 1.5) {
+        o = float4(m, m, m, 1.0);
+    } else if (out_mode < 2.5) {
+        float k = tint.a * m;
+        o = float4(c.rgb + (tint.rgb * c.a - c.rgb) * k, c.a);
+    }
+    if (grid_on > 0.5 && m > 0.0) {
+        float2 q = p - size * 0.5;
+        float2 f = q / grid_pitch - floor(q / grid_pitch);
+        float s = min(grid_pitch / gsize.x, grid_pitch / gsize.y);
+        float2 ipx = (f * grid_pitch - (float2(grid_pitch, grid_pitch) - gsize * s) * 0.5) / s;
+        if (ipx.x >= 0.0 && ipx.y >= 0.0 && ipx.x < gsize.x && ipx.y < gsize.y) {
+            float4 g = grd.SampleLevel(smp, ipx / gsize, 0) * m;
+            o = g + o * (1.0 - g.a);
+        }
+    }
+    if (show_frame > 0.5) {
+        float wd = fcol.a;
+        bool on = false;
+        if (frame_shape < 0.5) {
+            [loop] for (int i = 0; i < int(nbox); i++) {
+                float4 b = boxes[i];
+                bool outer = p.x >= b.x - wd && p.x < b.z + wd && p.y >= b.y - wd && p.y < b.w + wd;
+                bool inner = p.x >= b.x && p.x < b.z && p.y >= b.y && p.y < b.w;
+                if (outer && !inner) {
+                    on = true;
+                }
+            }
+        } else if (mk > 0.5) {
+            [unroll] for (int k = 0; k < 8; k++) {
+                float th = 0.7853982 * float(k);
+                float2 dv = float2(cos(th), sin(th));
+                if (md_mask(p + dv * wd) <= 0.5 || md_mask(p + dv * wd * 0.5) <= 0.5) {
+                    on = true;
+                }
+            }
+        }
+        if (on) {
+            o = float4(fcol.rgb, 1.0);
+        }
+    }
+    return o;
+}
+]]
+
+local obj, math = obj, math
+local ffi = require("ffi")
+
+-- 動体抽出: 前のフレーム（または動画ファイルの別の時刻）との差が大きい所だけを残す。
+-- 仕様: AI/specifications/20261009_動体抽出_H_spec.md。検証器: AI/scripts/動体抽出_H/verify_motion.py
+-- 前のフレームは cache に残せない（1 フレームの描画ごとに破棄される）ので、作業解像度の明るさを詰めて読み戻し、
+-- Lua のグローバル表の ffi の領域にリングで持つ。オブジェクト自身の移動（標準描画の X・Y）は見ない。画面の動きはフィルタオブジェクトで
+
+local G = _MOTION_EXTRACT_H or { states = {}, calls = 0, warned = {} }
+_MOTION_EXTRACT_H = G
+local function warn_once(key, msg)
+  if not G.warned[key] then
+    G.warned[key] = true
+    print("@warn", "[動体抽出@キーイング_H] " .. msg)
+  end
+end
+
+local w, h = obj.w, obj.h
+if w < 2 or h < 2 then return end
+local div = (res == 4) and 4 or ((res == 1) and 1 or 2)
+local lw, lh = math.ceil(w / div), math.ceil(h / div)
+local color = (use_color == 1) and 1 or 0
+local pw = (color == 1) and lw or math.ceil(lw / 3)
+local K = math.max(1, math.floor(interval + 0.5))
+local grad = (gradient == 1) and 1 or 0
+
+-- 1 方向ずつのガウスぼかし（a → b → a）。cut = 1 なら最後に 0.5 で切り直す
+local function blur(a, b, sigma, cut)
+  if sigma < 0.3 then return end
+  local r = math.min(64, math.ceil(sigma * 3))
+  obj.clearbuffer(b, lw, lh)
+  obj.pixelshader("ps_md_blur", b, {a}, { lw, lh, 1, 0, sigma, r, 0 }, "copy")
+  obj.pixelshader("ps_md_blur", a, {b}, { lw, lh, 0, 1, sigma, r, cut }, "copy")
+end
+
+-- 今の object（元の画像か動画のフレーム）→ 明るさ → ぼかし → 詰める
+local function prepare(a, packed)
+  obj.clearbuffer(a, lw, lh)
+  obj.pixelshader("ps_md_lum", a, {"object"}, { w, h, div, color }, "copy", "clamp")
+  blur(a, "cache:md/b", pre_blur / div, 0)
+  obj.clearbuffer(packed, pw, lh)
+  obj.pixelshader("ps_md_pack", packed, {a}, { lw, lh, color }, "copy")
+end
+
+obj.copybuffer("cache:md/src", "object")
+local have_prev = false
+
+if src_mode == 1 then
+  -- 動画ファイル: 今と比較元の 2 枚をその場で読む（履歴を持たない。シークしても同じ絵になる）
+  local nf, rate, scale = 0, 0, 0
+  if movie ~= nil and movie ~= "" then nf, rate, scale = obj.load("movie.info", movie) end
+  if nf == nil or nf <= 0 or rate == nil or rate <= 0 then
+    warn_once("movie:" .. tostring(movie), "動画ファイルを読めない: " .. tostring(movie))
+    return
+  end
+  local fps = rate / scale
+  local function clampf(n) return math.max(0, math.min(nf - 1, n)) end
+  local n1 = clampf(math.floor((obj.time + movie_offset) * fps + 0.5))
+  local n0 = (ref_mode == 1) and clampf(math.floor(ref_time * fps + 0.5)) or (n1 - K)
+  obj.load("movie.frame", movie, n1)
+  prepare("cache:md/a", "cache:md/pk")
+  if n0 >= 0 then
+    obj.load("movie.frame", movie, n0)
+    prepare("cache:md/c", "cache:md/pp")
+    have_prev = true
+  end
+  obj.copybuffer("object", "cache:md/src")
+else
+  -- 履歴: 今のフレームを詰めて読み戻し、リングの f の枠へ。f − 間隔 の枠が同じ番号・同じ設定のときだけ比較元にする
+  prepare("cache:md/a", "cache:md/pk")
+  local key = table.concat({ obj.scene_id or 0, obj.getinfo("origin_scene_id") or 0, obj.id or 0, obj.index or 0 }, "/")
+  local sig = table.concat({ lw, lh, pw, color, div, pre_blur }, ",")
+  local now = obj.getinfo("clock") or 0
+  local st = G.states[key]
+  if st == nil or st.K ~= K then
+    st = { K = K, ring = {} }
+    G.states[key] = st
+  end
+  st.used = now
+  local n = pw * lh * 4
+  if n * (K + 1) > 128 * 1024 * 1024 then
+    warn_once("mem:" .. key, "履歴が 128 MB を超えるので持たない（比較フレーム間隔か解像度を下げる）")
+  else
+    local f = obj.frame
+    local data, dw, dh = obj.getpixeldata("cache:md/pk")
+    if data ~= nil and dw == pw and dh == lh then
+      local slot = st.ring[f % (K + 1)]
+      if slot == nil or slot.n ~= n then
+        slot = { buf = ffi.new("uint8_t[?]", n), n = n }
+        st.ring[f % (K + 1)] = slot
+      end
+      ffi.copy(slot.buf, data, n)
+      slot.frame, slot.sig = f, sig
+      local pv = st.ring[(f - K) % (K + 1)]
+      if pv ~= nil and pv.frame == f - K and pv.sig == sig and pv.n == n then
+        obj.clearbuffer("cache:md/pp", pw, lh)
+        local q, qw, qh = obj.getpixeldata("cache:md/pp")
+        if q ~= nil and qw == pw and qh == lh then
+          ffi.copy(q, pv.buf, n)
+          obj.putpixeldata("cache:md/pp", q, pw, lh)
+          have_prev = true
+        end
+      end
+    end
+  end
+  -- 使われないまま 10 秒たった履歴を捨てる（300 回に 1 回見る）
+  G.calls = G.calls + 1
+  if G.calls % 300 == 0 then
+    for k, s in pairs(G.states) do
+      if s.used ~= nil and now - s.used > 10 then G.states[k] = nil end
+    end
+  end
+end
+
+-- マスク（作業解像度）
+obj.clearbuffer("cache:md/m", lw, lh)
+if have_prev then
+  obj.pixelshader("ps_md_diff", "cache:md/m", {"cache:md/pk", "cache:md/pp"}, {
+    lw, lh, threshold / 100, softness / 100, grad, color,
+  }, "copy")
+  blur("cache:md/m", "cache:md/b", smooth / div, (grad == 1) and 0 or 1)
+else
+  obj.clearbuffer("cache:md/m", lw, lh, (no_prev == 1) and 0xffffff or 0x000000)
+end
+
+-- 対象: マスクを 4px 角の格子で読み戻して連結成分を取り、ノイズ除去・ターゲット選択で残す成分を決める
+local use_keep, nbox = 0, 0
+local boxes = {}
+for i = 1, 128 do boxes[i] = 0 end
+local keep_tex = "cache:md/zero"
+obj.clearbuffer("cache:md/zero", 1, 1)
+if noise > 0 or target ~= 0 or (show_frame == 1 and frame_shape == 0) then
+  local cw = 4 / div
+  local gw, gh = math.ceil(lw / cw), math.ceil(lh / cw)
+  obj.clearbuffer("cache:md/cg", gw, gh)
+  obj.pixelshader("ps_md_cell", "cache:md/cg", {"cache:md/m"}, { lw, lh, cw }, "copy")
+  local data, dw, dh = obj.getpixeldata("cache:md/cg")
+  if data ~= nil and dw == gw and dh == gh then
+    local N = gw * gh
+    if G.ccn ~= N then
+      G.ccn = N
+      G.lab = ffi.new("int32_t[?]", N)
+      G.par = ffi.new("int32_t[?]", N + 1)
+    end
+    local p = ffi.cast("const uint8_t*", data)
+    local lab, par = G.lab, G.par
+    local nl = 0
+    local function find(x)
+      while par[x] ~= x do
+        par[x] = par[par[x]]
+        x = par[x]
+      end
+      return x
+    end
+    local function join(l, m2)
+      if l == 0 then return m2 end
+      local a, b = find(l), find(m2)
+      if a < b then par[b] = a elseif b < a then par[a] = b end
+      return l
+    end
+    -- 1 回目: 左・左上・上・右上を見てラベルを付け、つながりを記録する（8 近傍）
+    for y = 0, gh - 1 do
+      for x = 0, gw - 1 do
+        local i = y * gw + x
+        if p[i * 4] > 127 then
+          local l = 0
+          if x > 0 and lab[i - 1] > 0 then l = lab[i - 1] end
+          if y > 0 then
+            local u = i - gw
+            if x > 0 and lab[u - 1] > 0 then l = join(l, lab[u - 1]) end
+            if lab[u] > 0 then l = join(l, lab[u]) end
+            if x < gw - 1 and lab[u + 1] > 0 then l = join(l, lab[u + 1]) end
+          end
+          if l == 0 then
+            nl = nl + 1
+            par[nl] = nl
+            l = nl
+          end
+          lab[i] = l
+        else
+          lab[i] = 0
+        end
+      end
+    end
+    -- 2 回目: 根にまとめて、成分ごとの面積・外接矩形・重心を数える
+    local area, x0, y0, x1, y1, sx, sy = {}, {}, {}, {}, {}, {}, {}
+    for y = 0, gh - 1 do
+      for x = 0, gw - 1 do
+        local i = y * gw + x
+        local l = lab[i]
+        if l > 0 then
+          local r = find(l)
+          lab[i] = r
+          if area[r] == nil then
+            area[r], x0[r], y0[r], x1[r], y1[r], sx[r], sy[r] = 0, x, y, x, y, 0, 0
+          end
+          area[r] = area[r] + 1
+          if x < x0[r] then x0[r] = x end
+          if x > x1[r] then x1[r] = x end
+          if y < y0[r] then y0[r] = y end
+          if y > y1[r] then y1[r] = y end
+          sx[r] = sx[r] + x
+          sy[r] = sy[r] + y
+        end
+      end
+    end
+    local comps = {}
+    local tx, ty = target_x + w / 2, target_y + h / 2
+    for r, a in pairs(area) do
+      if a * 16 >= noise then
+        local cx, cy = (sx[r] / a + 0.5) * 4, (sy[r] / a + 0.5) * 4
+        comps[#comps + 1] = { r = r, a = a, d = (cx - tx) ^ 2 + (cy - ty) ^ 2,
+          b = { x0[r] * 4, y0[r] * 4, math.min((x1[r] + 1) * 4, w), math.min((y1[r] + 1) * 4, h) } }
+      end
+    end
+    if target == 2 then
+      table.sort(comps, function(u, v) return u.d < v.d end)
+    else
+      table.sort(comps, function(u, v) return u.a > v.a end)
+    end
+    local nkeep = (target == 0) and #comps or math.min(#comps, math.max(1, math.floor(count + 0.5)))
+    local kept = {}
+    for i = 1, nkeep do kept[comps[i].r] = true end
+    -- 枠の矩形は面積の大きい順に 32 個まで
+    local list = {}
+    for i = 1, nkeep do list[i] = comps[i] end
+    table.sort(list, function(u, v) return u.a > v.a end)
+    for i = 1, math.min(32, #list) do
+      local b = list[i].b
+      boxes[i * 4 - 3], boxes[i * 4 - 2], boxes[i * 4 - 1], boxes[i * 4] = b[1], b[2], b[3], b[4]
+      nbox = i
+    end
+    -- 残す成分の印を同じ格子で書き戻す
+    obj.clearbuffer("cache:md/kp", gw, gh)
+    local q, qw, qh = obj.getpixeldata("cache:md/kp")
+    if q ~= nil and qw == gw and qh == gh then
+      local o = ffi.cast("uint8_t*", q)
+      for i = 0, N - 1 do
+        local v = (lab[i] > 0 and kept[lab[i]]) and 255 or 0
+        o[i * 4], o[i * 4 + 1], o[i * 4 + 2], o[i * 4 + 3] = v, v, v, 255
+      end
+      obj.putpixeldata("cache:md/kp", q, gw, gh)
+      keep_tex, use_keep = "cache:md/kp", 1
+    end
+  end
+end
+
+-- グリッド画像: 画像を読んで cache に写し、オブジェクトは元に戻す
+local grid_tex, gsw, gsh, grid_on = "cache:md/zero", 1, 1, 0
+if grid == 1 and grid_file ~= nil and grid_file ~= "" then
+  if obj.load("image", grid_file) and obj.w > 0 and obj.h > 0 then
+    gsw, gsh = obj.w, obj.h
+    obj.copybuffer("cache:md/grid", "object")
+    grid_tex, grid_on = "cache:md/grid", 1
+  else
+    warn_once("grid:" .. tostring(grid_file), "配置する画像を読めない: " .. tostring(grid_file))
+  end
+  obj.copybuffer("object", "cache:md/src")
+end
+
+local tr, tg, tb = RGB(tint)
+local fr, fg, fb = RGB(frame_color)
+local c = {}
+for i = 1, 128 do c[i] = boxes[i] end
+local rest = {
+  tr / 255, tg / 255, tb / 255, tint_amount / 100,
+  fr / 255, fg / 255, fb / 255, frame_width,
+  w, h, lw * div, lh * div, gsw, gsh,
+  out_mode, (invert == 1) and 1 or 0, use_keep, 4, (show_frame == 1) and 1 or 0, frame_shape, nbox, grid_on, grid_pitch,
+}
+for i = 1, #rest do c[128 + i] = rest[i] end
+obj.pixelshader("ps_md_apply", "object", {"cache:md/src", "cache:md/m", keep_tex, grid_tex}, c, "copy", "clamp")
