@@ -33,7 +33,7 @@ AviUtl ExEdit2 向けに作ったスクリプト集です。設定ダイアロ�
 | <img src="images/HexBrowns.Filters_H_thumbnail.png" width="160">      | `@Filters_H.anm2`  | フィルム調の加工 22 種（グリッチ、グレイン、ハレーション、ライトリーク、ビネット、アナモルフィックフレア、リキッドディストーション、シマー、フォグヘイズ、フィルムバーン、カラーグレード、リフト・ガンマ・ゲイン、バレル歪み、ノイズオーバーレイ、バイブランス、HSL選択補正、LUT適用、色調転写、局所トーン補正、ローカルラプラシアン、暗所視、ホログラム箔） | [docs](docs/Filtersフィルタ使用ガイド.md) |
 | <img src="images/HexBrowns.OpticalBokeh_thumbnail.png" width="160">   | `@光学系ボケ.anm2`      | レンズで撮ったようなボケ 4 種（玉ボケ、レンズぼかし、チルトシフト、球面収差ボケ）                                                                                                                                          | [docs](docs/光学系ボケ.md)            |
 | <img src="images/HexBrowns.Keying_H_thumbnail.png" width="160">       | `@キーイング_H.anm2`    | 背景を抜いた素材の仕上げ 4 種（マット調整、スピル除去、トラックマット、動体抽出＝前のフレームとの差で動いた所だけ残す）                                                                                                                       | [docs](docs/キーイング_H.md)          |
-| <img src="images/HexBrowns.Lighting2D_H_thumbnail.gif" width="160">   | `@2Dライティング_H.anm2` | 平たい素材に立体の光と陰を足す 2 種（大域照明＝明るい所を光源にして、物で遮りながら光を広げ影を落とす / 環境遮蔽＝くぼみ・溝・接触部に陰を落とす）                                                                                                        | [docs](docs/2Dライティング_H.md)       |
+| <img src="images/HexBrowns.Lighting2D_H_thumbnail.gif" width="160">   | `@2Dライティング_H.anm2` | 平たい素材に立体の光と陰を足す 3 種（大域照明＝明るい所を光源にして、物で遮りながら光を広げ影を落とす / 環境遮蔽＝くぼみ・溝・接触部に陰を落とす / 光の帯＝表面をなめる光沢の帯）                                                                                                        | [docs](docs/2Dライティング_H.md)       |
 | <img src="images/HexBrowns.RangeWarning_H_thumbnail.png" width="160"> | `レンジ警告_H.anm2`     | 白飛び・黒潰れ・色域外の画素をゼブラで示す検査用の効果                                                                                                                                                         | [docs](docs/レンジ警告_H.md)          |
 
 ### 変形・配置
@@ -116,7 +116,7 @@ YMM4のプラグインの説明を元にAviUtl2向けに作ったものです（
 | `sin揺れ_HB.anm2` | 帯ごとにずらした正弦波で揺らす | [docs](docs/sin揺れ_HB.md) |
 | `@図形グラデーション_H.anm2` | 形はそのままに、中身をグラデーションで塗り替える | [docs](docs/図形グラデーション_H.md) |
 | `レベル補正_H.anm2` | 黒点・白点・中間調と出力の範囲で明るさを整える | [docs](docs/レベル補正_H.md) |
-| `個別遅延_H.anm2` | テキストの文字などの個別オブジェクトを 1 つずつ遅らせて動かす。最後の中間点で止まったものから消せる | [docs](docs/個別遅延_H.md) |
+| `個別遅延_H.anm2` | テキストの文字などの個別オブジェクトを 1 つずつ遅らせて動かす。遅れにベジェで緩急を付けられ（配り方）、最後の中間点で止まったものから消せる | [docs](docs/個別遅延_H.md) |
 
 ## フォーク
 

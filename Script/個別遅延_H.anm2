@@ -1,4 +1,4 @@
---information:個別遅延_H v1.00 by HexBrowns
+--information:個別遅延_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@delay:遅延,-1000,1000,100,0.01
@@ -6,6 +6,9 @@
 --track@shake_amt:時間ブレ,0,1000,0
 --select@order:順番=0,番号順=0,右から=1,上から=2,中央から左右へ=3,中央から上下へ=4,中央から外へ=5
 --check@reverse:逆順,0
+--select@dist_mode:配り方=0,等間隔=0,ベジェ=1
+--value@dist_bezier:配り方のベジェ,{0.42,0,0.58,1}
+--hide@dist_bezier:dist_mode~=1
 --check@hide_last:最後の中間点で非表示,0
 --group:詳細設定,false
 --check@DN:遅延の時間補正,1
@@ -22,9 +25,10 @@
 --group
 
 --[[
-個別遅延_H v1.00
+個別遅延_H v1.10
 
 原作: Script/@DelayMove.anm2 の「Delay個別」（AviUtl2 移植版。作者・ライセンスの表記なし）。
+v1.10: 配り方（等間隔 / ベジェ）を足した。順番の位置をベジェで写して、遅れに緩急を付ける（After Effects の Lazy に当たる）。
 個別オブジェクトを中間点などで動かしたとき、個別オブジェクトごとに動きを遅らせる。
 
 原作から変えたところ
@@ -195,10 +199,51 @@ else
   Index = 1
 end
 
+-- 配り方（v1.10。AE の Lazy に当たる）: 順番の位置 0〜1 を、(0,0)-(x1,y1)-(x2,y2)-(1,1) のベジェで写す。
+-- 等間隔 では使わない。x は 0〜1 に収める（時間の成分が単調になるように）
+local function dist_curve(u)
+  local b = dist_bezier
+  if type(b) ~= "table" then return u end
+  local x1 = math.min(math.max(tonumber(b[1]) or 0.42, 0), 1)
+  local y1 = tonumber(b[2]) or 0
+  local x2 = math.min(math.max(tonumber(b[3]) or 0.58, 0), 1)
+  local y2 = tonumber(b[4]) or 1
+  local lo, hi, s = 0, 1, u
+  for _ = 1, 40 do
+    local w = 1 - s
+    local x = 3 * w * w * s * x1 + 3 * w * s * s * x2 + s * s * s
+    if x < u then lo = s else hi = s end
+    s = (lo + hi) * 0.5
+  end
+  local w = 1 - s
+  return 3 * w * w * s * y1 + 3 * w * s * s * y2 + s * s * s
+end
+-- 位置 p（lo〜hi の範囲）を配り方で写す
+local function distribute(p, lo, hi)
+  if dist_mode ~= 1 or not (hi > lo) then return p end
+  local u = math.min(math.max((p - lo) / (hi - lo), 0), 1)
+  return lo + (hi - lo) * dist_curve(u)
+end
+
 local Order1        = order
 local Order2        = Order2 or 0
 if Order2=="debug" then Order2=0 dbg=2 end
 local Pattern     = Index
+-- 配り方（v1.10）: 番号順では、最初と最後の個別オブジェクトの順位（上の Index と同じ式）の間で写す
+if Order1==0 and obj.getoption("multi_object") and obj.num > 1 then
+  local function index_of(i)
+    local v = i
+    if fullrand==1 then v = v + 1 end
+    if check0 then v = obj.num - v end
+    if DN==1 then
+      if (Order2==0) then v = v/(obj.num-1)*10 else v = v/(obj.num)*10 end
+    end
+    return v
+  end
+  local a, b = index_of(0), index_of(obj.num - 1)
+  if a > b then a, b = b, a end
+  Pattern = distribute(Pattern, a, b)
+end
 local X,Y,Z       = obj.ox-obj.cx*zoom,obj.oy-obj.cy*zoom,obj.oz
 local mag = mag or {100,100}
 local magp,magr=mag[1]/100,mag[2]/100
@@ -271,7 +316,8 @@ else
         Pattern = 1-math.sqrt(X^2+Y^2) / math.sqrt((XX)^2+(YY)^2)      --内
    end
   end
-  Pattern=Pattern*10
+  -- 配り方（v1.10）: 位置の順位は 0〜1 なので、そのまま写す
+  Pattern=distribute(Pattern, 0, 1)*10
  end
 
 

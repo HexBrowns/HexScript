@@ -1,11 +1,14 @@
 --[[
-2Dライティング_H v1.00 by HexBrowns
+2Dライティング_H v1.10 by HexBrowns
 MIT No Attribution (MIT-0) / Copyright (c) 2026 HexBrowns
 
   環境遮蔽 : 明るさ（またはアルファ）を高さとみなし、くぼみ・接触部に陰を落とす 2D のアンビエントオクルージョン
   大域照明 : 明るい所を光源にして、不透明な所で遮りながら光を周りへ広げて照らす 2D の大域照明（Radiance Cascades）
+  光の帯   : オブジェクトの不透明な所を、光の帯がなめるように横切る（ライトスイープ）
 
-仕様: AI/specifications/20261009_環境遮蔽_H_spec.md / 20261009_大域照明_H_spec.md
+仕様: AI/specifications/20261009_環境遮蔽_H_spec.md / 20261009_大域照明_H_spec.md / 20261012_2Dライティング_H_光の帯_spec.md
+
+v1.10: 光の帯を足した（既存の 2 つは変えていない）
 ]]
 
 @環境遮蔽
@@ -567,3 +570,148 @@ obj.pixelshader("ps_gi_comp", "object", {"cache:gi/src", "cache:gi/f"}, {
   div * 2 * g0w, div * 2 * g0h, sw, sh, ambient / 100, surface / 100, air / 100, (light_only == 1) and 1 or 0, threshold / 100, margin,
   rim,
 }, "copy", "clamp")
+
+@光の帯
+--information:光の帯@2Dライティング_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@progress:進行,0,100,50,0.1
+--select@sweep_loop:繰り返し=0,しない=0,一方向=1,往復=2
+--hide@progress:sweep_loop>0
+--track@sweep_time:移動時間,0.1,60,1,0.01
+--hide@sweep_time:sweep_loop==0
+--track@pause:待ち時間,0,60,2,0.01
+--hide@pause:sweep_loop==0
+--select@shape:形=0,直線=0,放射=1
+--track@angle:角度,-3600,3600,120,0.1
+--hide@angle:shape==1
+--track@band_width:幅,0,4000,40,0.1
+--track@softness:柔らかさ,0,4000,40,0.1
+--track@intensity:強さ,0,500,100,0.1
+--color@light_color:光の色,0xffffff
+--select@blend:合成=1,加算=0,スクリーン=1,覆い焼き=2,通常=3
+--track@edge:縁を強く,0,500,0,0.1
+--track@edge_width:縁の幅,1,200,4,0.1
+--[[pixelshader@ps_ls_main:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float3 light_col;
+    float intensity;
+    float2 size;
+    float2 dir;
+    float band_c;
+    float half_w;
+    float soft;
+    float shape;
+    float blend_mode;
+    float edge_amt;
+    float edge_r;
+    float edge_clamp;
+};
+// 帯の重み: 直線は中心からの位置を進む向き dir に投影した値、放射は中心からの距離。帯の中心 band_c から
+// half_w までは 1、そこから soft の幅で 0 へ（smoothstep）。光は不透明な所にだけ乗り、α は変えない（乗算済みのまま）
+float4 ps_ls_main(float4 pos : SV_Position) : SV_Target {
+    float4 c = src.Load(int3(int2(pos.xy), 0));
+    float a = saturate(c.a);
+    if (a <= 0.000001) return c;
+    float2 p = pos.xy - size * 0.5;
+    float s = (shape > 0.5) ? abs(length(p) - band_c) : abs(dot(p, dir) - band_c);
+    float wgt = 1.0 - smoothstep(half_w, half_w + max(soft, 0.0001), s);
+    if (wgt <= 0.0) return c;
+    // 縁を強く: 縁の幅 edge_r と その半分の 8 方向の α の最小を見て、内側の縁ほど 1 に近い量 e を作る
+    // （半分の輪で欠けていれば 1、外の輪だけで欠けていれば 0.5）。外は透明として数える（フィルタオブジェクトでは端の値）
+    float e = 0.0;
+    if (edge_amt > 0.0) {
+        int2 m = int2(size) - int2(1, 1);
+        float amin1 = a;
+        float amin2 = a;
+        [loop] for (int k = 0; k < 8; k++) {
+            float th = 0.7853982 * float(k);
+            float2 u = float2(cos(th), sin(th));
+            int2 q1 = int2(floor(pos.xy + u * edge_r));
+            int2 q2 = int2(floor(pos.xy + u * (edge_r * 0.5)));
+            bool in1 = q1.x >= 0 && q1.y >= 0 && q1.x <= m.x && q1.y <= m.y;
+            bool in2 = q2.x >= 0 && q2.y >= 0 && q2.x <= m.x && q2.y <= m.y;
+            float a1 = (in1 || edge_clamp > 0.5) ? saturate(src.Load(int3(clamp(q1, int2(0, 0), m), 0)).a) : 0.0;
+            float a2 = (in2 || edge_clamp > 0.5) ? saturate(src.Load(int3(clamp(q2, int2(0, 0), m), 0)).a) : 0.0;
+            amin1 = min(amin1, a1);
+            amin2 = min(amin2, a2);
+        }
+        e = saturate(max(a - amin2, 0.5 * (a - amin1)));
+    }
+    float lw = wgt * intensity * (1.0 + edge_amt * e);
+    float3 st = saturate(c.rgb / a);
+    float3 lc = light_col * lw;
+    float3 o = st;
+    if (blend_mode < 0.5) {
+        o = saturate(st + lc);
+    } else if (blend_mode < 1.5) {
+        o = 1.0 - (1.0 - st) * (1.0 - saturate(lc));
+    } else if (blend_mode < 2.5) {
+        o = saturate(st / max(1.0 - saturate(lc), 0.0001));
+    } else {
+        o = lerp(st, light_col, saturate(lw));
+    }
+    return float4(o * a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- 光の帯（ライトスイープ）。オブジェクトの不透明な所を、光の帯が端から端へ横切る。1 パスで大きさを変えないので
+-- フィルタオブジェクトにも置ける。仕様: AI/specifications/20261012_2Dライティング_H_光の帯_spec.md。
+-- 検証器: AI/scripts/2Dライティング_H/verify_light_sweep.py
+-- 進行 0% / 100% は帯（幅の半分 + 柔らかさ）がちょうどオブジェクトの外に出る位置。直線はオブジェクトの四隅を進む向きへ
+-- 投影した範囲、放射は中心から角までの距離を端から端とする
+
+if intensity <= 0 then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+
+local prog = progress / 100
+if sweep_loop > 0 then
+  -- 繰り返し: 移動時間で端から端へ動き、待ち時間だけ外で止まる。往復は戻りも同じ
+  local dur = math.max(sweep_time, 0.01)
+  local wait = math.max(pause, 0)
+  local t = math.max(obj.time, 0)
+  if sweep_loop == 1 then
+    local ph = math.fmod(t, dur + wait)
+    prog = math.min(ph / dur, 1)
+  else
+    local ph = math.fmod(t, 2 * (dur + wait))
+    if ph < dur then
+      prog = ph / dur
+    elseif ph < dur + wait then
+      prog = 1
+    elseif ph < 2 * dur + wait then
+      prog = 1 - (ph - dur - wait) / dur
+    else
+      prog = 0
+    end
+  end
+end
+-- 端（0 と 1）では帯がすべて外にあるので描かない
+if prog <= 0 or prog >= 1 then return end
+
+local hw = math.max(band_width, 0) / 2
+local sf = math.max(softness, 0)
+local reach = hw + sf
+if reach <= 0 then return end
+-- 角度: 図形グラデーション_H の線形と同じ向き（0 で下から上、90 で左から右、時計回り）
+local rad = angle * math.pi / 180
+local dx, dy = math.sin(rad), -math.cos(rad)
+local center
+if shape == 1 then
+  center = -reach + prog * (math.sqrt(w * w + h * h) / 2 + 2 * reach)
+else
+  local half = (w * math.abs(dx) + h * math.abs(dy)) / 2
+  center = -half - reach + prog * (2 * half + 2 * reach)
+end
+local lr, lg, lb = RGB(tonumber(light_color) or 0xffffff)
+
+obj.pixelshader("ps_ls_main", "object", {"object"}, {
+  lr / 255, lg / 255, lb / 255, intensity / 100,
+  w, h, dx, dy,
+  center, hw, sf, shape,
+  blend, edge / 100, edge_width, obj.getinfo("filter") and 1 or 0,
+}, "copy", "dot")
