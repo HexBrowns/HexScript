@@ -93,5 +93,6 @@ SOFTWARE.
 | `sin揺れ_HB.anm2` | 「Sin揺れ(調整版)」（発想と式の骨格。コードは書き直し） | 作者・ライセンス |
 | `@図形グラデーション_H.anm2` | しけもち 氏「グラデーションジェネレーター」（v2.00 で機能を取り込んだ。 https://note.com/sikemoti/n/n23f4da3cd318 ） | ライセンス |
 | `レベル補正_H.anm2` | しけもち 氏「レベル補正」（項目の構成。 https://note.com/sikemoti/n/n9b1843bfb32f ）、こんにゃくねこ 氏「Level」（CC0-1.0） | しけもち 氏版のライセンス |
+| `個別遅延_H.anm2` | `@DelayMove.anm2` の「Delay個別」（AviUtl2 への移植版） | 作者・ライセンス |
 
 連絡先: https://github.com/HexBrowns
