@@ -311,7 +311,7 @@ end
 obj.copybuffer("object", "tempbuffer")
 
 @ハレーション
---information:ハレーション@Filters_H v1.40 by HexBrowns
+--information:ハレーション@Filters_H v1.50 by HexBrowns
 --label:HexScript
 --filter
 --track@threshold:しきい値,0,100,70,0.1
@@ -323,6 +323,15 @@ obj.copybuffer("object", "tempbuffer")
 --color@tint:色合い,0xFF8866
 --select@blend_mode:合成=0,加算=0,オーバーレイ=1,スクリーン=2
 --select@blur_engine:ぼかし方式=0,標準=0,高品質(Basic_S)=1
+-- v1.50（強化デバッグ 7.5）: 速くした。v1.40 は 6 回のぼかしをすべて元の大きさ（広げた大きさ）で掛け、バッファの写しが
+-- 12 回あった（FHD の既定で効果ぶん約 21ms、16384x960 で約 171ms。実機 2026-10-13）。v1.50 は
+--   コア（しきい値を超えた部分 + ごく小さいぼかし）は元の大きさのまま。小ぼかし・大ぼかしは、コアを 2 倍まで縮小した
+--   画像でぼかし（1 回の範囲が縮小した画像で 小 4・大 8 画素を下回らない分だけ。範囲は等倍で同じ）、最後の合成で
+--   バイリニアで戻す。高品質（小数ぼかし@Basic_S）は縮小しない。
+--   ハローの和（大 x 0.7 + 小 x 0.85 + コア）は合成のシェーダーで取る（tempbuffer と obj.draw をやめた）。
+--   cache は 元・コア・小・大 の 4 枚。枠（EffectUtils_Budget）に収まらない大きさ（4K）ではコアも縮小し、
+--   それでも収まらない大きさ（16384x960 など）では効果を掛けずに素通しする（警告を 1 回出す）。
+--   検証器: AI/scripts/Filters_H/verify_halation_speed.py（v1.40 との見た目の差・枠）
 -- v1.40: 色空間（HSV / Oklch）を足した。HSV は v1.31 と同じ式。Oklch では明るさ（Oklab の L）と色相の向きを保ったまま
 -- 色相シフトで回し、彩度で C を倍にする（sRGB に無い色は C を下げて収める。共有部品 AI/tools/assets/colorspace.hlsl）。
 -- 検証器: AI/scripts/Filters_H/verify_colorspace_ext.py / 仕様: AI/specifications/20261013_色空間拡張_spec.md
@@ -343,6 +352,9 @@ cbuffer constant0 : register(b0) {
     float tint_g;
     float tint_b;
     float color_space;
+    float2 cb_step;   // v1.50: 入力の画素 / 出力の画素（縮小しないなら 1）
+    float2 cb_src;    // v1.50: 入力の大きさ
+    float cb_taps;    // v1.50: 1 行・1 列あたりに読む画素の数（縮小しないなら 1）
 };
 // ==== colorspace.hlsl ここから（AI/tools/sync_colorspace.py が書き写す。直すのは正本） ====
 // colorspace.hlsl v1.01 — 色空間の変換・補間・色相回転・色差（HexBrowns）
@@ -789,8 +801,9 @@ float3 hsv2rgb(float3 c) {
     float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
     return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
 }
-float4 ps_halation_pure(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-    float4 c = src.Sample(smp, uv);
+// 1 画素ぶんのハローの元。v1.50 で v1.40 の ps_halation_pure の本体をそのまま移した（文は 1 つも変えていない。
+// 入力の画素 c を引数で受け取る。verify_colorspace_ext.py がこの本体と直す前の本文を文ごとに比べる）
+float4 halation_pure_px(float4 c) {
     if (c.a <= 0.001) return float4(0,0,0,0);
     float3 rgb = c.rgb / c.a;
     float lum = luminance(rgb);
@@ -810,18 +823,82 @@ float4 ps_halation_pure(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Ta
     }
     return float4(halo * intensity * c.a, c.a);
 }
+// v1.50: 出力の 1 画素は入力の [floor(pos) x cb_step, + cb_step) を覆い、覆う割合で重みを付けて平均する
+// （縮小しないとき cb_step = 1・cb_taps = 1 で、v1.40 と同じく 1 画素をそのまま読む）。
+// 読む回数 cb_taps x cb_taps は画素によらず同じ。入力の外の画素は重みが 0 になる（端で読む位置だけ詰める）
+float4 ps_halation_pure(float4 pos : SV_Position) : SV_Target {
+    float2 a = floor(pos.xy) * cb_step;
+    float2 b = a + cb_step;
+    int2 p0 = int2(floor(a));
+    int m = int(cb_taps + 0.5);
+    int2 smax = int2(cb_src) - int2(1, 1);
+    float4 acc = float4(0, 0, 0, 0);
+    [loop]
+    for (int ky = 0; ky < m; ky++) {
+        int py = p0.y + ky;
+        float wy = saturate(min(b.y, float(py) + 1.0) - max(a.y, float(py)));
+        [loop]
+        for (int kx = 0; kx < m; kx++) {
+            int px = p0.x + kx;
+            float wx = saturate(min(b.x, float(px) + 1.0) - max(a.x, float(px)));
+            int2 q = clamp(int2(px, py), int2(0, 0), smax);
+            acc += halation_pure_px(src.Load(int3(q, 0))) * (wx * wy);
+        }
+    }
+    return acc / (cb_step.x * cb_step.y);
+}
+]]
+-- v1.50: 縮小（平均）。ps_halation_pure の縮小と同じ読み方で、色はそのまま
+--[[pixelshader@ps_halation_down:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 cb_step;   // 入力の画素 / 出力の画素
+    float2 cb_src;    // 入力の大きさ
+    float cb_taps;    // 1 行・1 列あたりに読む画素の数（ceil(cb_step) + 1）
+};
+float4 ps_halation_down(float4 pos : SV_Position) : SV_Target {
+    float2 a = floor(pos.xy) * cb_step;
+    float2 b = a + cb_step;
+    int2 p0 = int2(floor(a));
+    int m = int(cb_taps + 0.5);
+    int2 smax = int2(cb_src) - int2(1, 1);
+    float4 acc = float4(0, 0, 0, 0);
+    [loop]
+    for (int ky = 0; ky < m; ky++) {
+        int py = p0.y + ky;
+        float wy = saturate(min(b.y, float(py) + 1.0) - max(a.y, float(py)));
+        [loop]
+        for (int kx = 0; kx < m; kx++) {
+            int px = p0.x + kx;
+            float wx = saturate(min(b.x, float(px) + 1.0) - max(a.x, float(px)));
+            int2 q = clamp(int2(px, py), int2(0, 0), smax);
+            acc += src.Load(int3(q, 0)) * (wx * wy);
+        }
+    }
+    return acc / (cb_step.x * cb_step.y);
+}
 ]]
 --[[pixelshader@ps_halation_blend:
 Texture2D src : register(t0);
-Texture2D halo_tex : register(t1);
+Texture2D core_tex : register(t1);
+Texture2D blur_a_tex : register(t2);
+Texture2D blur_b_tex : register(t3);
 SamplerState smp : register(s0);
 cbuffer constant0 : register(b0) {
     float blend_mode;
     float spill;
+    float2 core_scale;    // v1.50: 各バッファは画像と同じ中心で、元の画像の uv を 0.5 + (uv - 0.5) x scale で読む
+    float2 blur_a_scale;
+    float2 blur_b_scale;
 };
 float4 ps_halation_blend(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float4 base = src.Sample(smp, uv);
-    float4 halo = halo_tex.Sample(smp, uv);
+    // v1.50: ハロー = 大ぼかし x 0.7 + 小ぼかし x 0.85 + コア（v1.40 は tempbuffer へ加算で描いてから読んでいた。同じ和）。
+    // 小ぼかし・大ぼかしは縮小した画像なので、ここでバイリニアで戻す
+    float2 d = uv - 0.5;
+    float4 halo = blur_b_tex.Sample(smp, 0.5 + d * blur_b_scale) * 0.7;
+    halo += blur_a_tex.Sample(smp, 0.5 + d * blur_a_scale) * 0.85;
+    halo += core_tex.Sample(smp, 0.5 + d * core_scale);
     float3 halorgb = halo.rgb;
     if (halo.a > 0.001) halorgb = halo.rgb / halo.a;
     // 形の内側（v1.30 と同じ式）。透明な画素は元の画素のまま
@@ -854,6 +931,7 @@ float4 ps_halation_blend(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_T
 
 local obj, math = obj, math
 local color = require("EffectUtils_ColorGrade")
+local budget = require("EffectUtils_Budget")
 
 if intensity <= 0 then return end
 
@@ -897,22 +975,87 @@ end
 
 -- 形の外へ光を出すのは 加算 / スクリーン の通常のオブジェクトだけ（オーバーレイは下地が要る合成なので出さない）
 local spill = (not is_filter and blend_mode ~= 1) and 1 or 0
-local sp0 = math.max(spread, 1)
+local sp = math.max(spread, 1)
+
+-- ぼかしの範囲（等倍の画素）と回数。v1.40 と同じ値
+--   コア: しきい値の境界はそのままだと 1px 単位の硬い段差になり、外側をどれだけぼかしても
+--   「貼り付けたような浮いた境目」に見えてしまう。ごく小さいぼかしで段差自体を無くす
+--   小ぼかし（締まったコア発光）: 高品質時は 1 回、標準時は角を目立たなくするため 2 回に分けてぼかす
+--   大ぼかし（広がる柔らかい発光）: 高品質時は 1 回、標準時は 3 回に分けて大きくぼかし多角形状の角を平均化する
+local r_core = sp * 0.12
+local r_a, n_a = sp * 0.25, 2
+local r_b, n_b = sp * 0.4, 3
+if use_hq_blur then
+  r_a, n_a = sp * 0.5, 1
+  r_b, n_b = sp * 1.2, 1
+end
+
+-- v1.50: 小ぼかし・大ぼかしの縮小率（等倍の何画素を 1 画素にするか）。1 回のぼかしの範囲が、縮小した画像で
+-- min_r 画素を下回らない分だけ縮める（SCALE_MAX 倍まで）。範囲が min_r 以下なら縮めない（v1.40 と同じ大きさ）。
+--   合成は形の内側でハローの色を α で割ったストレートの色のまま足す（v1.30 からの式）ので、ハローの α が 0.001 を
+--   超える所でハローの色が段になって現れる。縮小すると α の裾がわずかに伸び、この段の位置と裾の色の混ざり方が変わる。
+--   裾を決めるのは大ぼかしなので、大ぼかしは小ぼかしより控えめに縮め（min_r 8 と 4）、どちらも 2 倍までにした
+--   （机上の写しで、v1.40 との差が地色に重ねて 256 階調の 8 以内・段のずれが 1.6 画素以内。verify_halation_speed.py）。
+--   高品質（小数ぼかし@Basic_S）は 1 回で大きくぼかすので縮めない（v1.40 と同じ大きさ。ハローの和の取り方だけ変えた）
+local SCALE_MAX = 2
+local function ratio_for(r, min_r)
+  if use_hq_blur or r <= min_r then return 1 end
+  local k = r / math.max(min_r, math.ceil(r / SCALE_MAX))
+  if k < 1.25 then return 1 end
+  return k
+end
+local K_a, K_b = ratio_for(r_a, 4), ratio_for(r_b, 8)
+
+-- 標準の「ぼかし」が 1 回で各辺を広げる量の見積もり（高品質は「サイズ固定」で広げない）
+local function grow(r)
+  if use_hq_blur then return 0 end
+  return math.floor(r + 0.5)
+end
+
+-- 作業の大きさの見積もり。w, h はぼかす前の画像（広げた後）、k0 はコアの縮小率（枠に収まらないときだけ 1 より大きい）。
+-- cache は 元（w x h）・コア・小ぼかし・大ぼかし の 4 枚（tempbuffer は使わない）。戻り値は 合計ドット数, コアの幅, 高さ
+local function plan(w, h, k0)
+  local cw, ch = math.max(1, math.ceil(w / k0)), math.max(1, math.ceil(h / k0))
+  local g0 = grow(r_core * cw / w)
+  local Cw, Ch = cw + 2 * g0, ch + 2 * g0
+  local kc = w / cw
+  local function small(K, r, n)
+    local step = K / kc
+    local sw, sh = Cw, Ch
+    if step > 1 then
+      sw, sh = math.max(1, math.ceil(Cw / step)), math.max(1, math.ceil(Ch / step))
+    end
+    local g = n * grow(r / (kc * Cw / sw))
+    return (sw + 2 * g) * (sh + 2 * g)
+  end
+  return w * h + Cw * Ch + small(K_a, r_a, n_a) + small(K_b, r_b, n_b), cw, ch
+end
+
+-- コアの縮小率。枠（EffectUtils_Budget.BUDGET）に収まるまで 5% ずつ上げる。CORE_SCALE_MAX でも収まらなければ nil
+local CORE_SCALE_MAX = 4
+local function plan_core(w, h)
+  local k0 = 1
+  while true do
+    local total, cw, ch = plan(w, h, k0)
+    if total <= budget.BUDGET then return k0, cw, ch end
+    if k0 >= CORE_SCALE_MAX then return nil end
+    k0 = math.min(k0 * 1.05, CORE_SCALE_MAX)
+  end
+end
+
+local W0, H0 = obj.w, obj.h
+if not plan_core(W0, H0) then
+  -- 元の画像を退避するだけで枠に収まらない（16384x960 など）。進むとバッファが黙って捨てられるので素通しにする
+  budget.refuse("ハレーション@Filters_H", W0, H0)
+  return
+end
+
 if spill == 1 then
   -- ハローの届く距離は、コアの小ぼかしと大ぼかしの範囲の和（標準 0.12 + 0.4 × 3、高品質 0.12 + 1.2。どちらも 1.32 倍）
-  local reach = math.ceil(sp0 * 1.32) + PAD_MARGIN
-  local W0, H0 = obj.w, obj.h
-  -- 確保する cache 5 枚と tempbuffer 1 枚。標準の「ぼかし」は core / blur_a / blur_b を範囲のぶん膨らませる
-  local g1, g2, g3 = 0, 0, 0
-  if not use_hq_blur then
-    g1 = math.floor(sp0 * 0.12 + 0.5)
-    g2 = g1 + 2 * math.floor(sp0 * 0.25 + 0.5)
-    g3 = g1 + 3 * math.floor(sp0 * 0.4 + 0.5)
-  end
+  local reach = math.ceil(sp * 1.32) + PAD_MARGIN
+  -- plan_pad（複製）は CACHE_BUDGET（1500 万）と比べるので、コアを縮めずに済む EffectUtils_Budget.BUDGET（1400 万）に読み替える
   local function cost(px, py)
-    local bw, bh = W0 + 2 * px, H0 + 2 * py
-    return 3 * bw * bh + (bw + 2 * g1) * (bh + 2 * g1)
-      + (bw + 2 * g2) * (bh + 2 * g2) + (bw + 2 * g3) * (bh + 2 * g3)
+    return (plan(W0 + 2 * px, H0 + 2 * py, 1)) + (CACHE_BUDGET - budget.BUDGET)
   end
   local pad_x, pad_y = plan_pad(reach, reach, W0, H0, cost)
   if pad_x > 0 or pad_y > 0 then
@@ -920,69 +1063,63 @@ if spill == 1 then
   end
 end
 
--- 標準の「ぼかし」には「サイズ固定」が無く、呼ぶたびにバッファが拡張される。
--- 以降 obj.w/obj.h は拡張後の値になるので、元サイズを退避して tempbuffer の基準に使う。
 local ow, oh = obj.w, obj.h
+local k0, cw, ch = plan_core(ow, oh)
+if not k0 then
+  -- 広げたぶんで収まらなくなった（plan_pad が枠を見ているので起きないはずの安全弁）
+  budget.refuse("ハレーション@Filters_H", ow, oh)
+  return
+end
 
+local function taps_for(sx, sy)
+  if sx == 1 and sy == 1 then return 1 end
+  return math.ceil(math.max(sx, sy)) + 1
+end
+
+-- [1] コア: しきい値を超えた部分を抜き出す（枠に収まらない大きさでは縮小しながら）→ ごく小さいぼかし。
+--     元の画像は cache に退避する（ぼかしは object にしか掛けられないため）
 obj.copybuffer("cache:halation/src", "object")
-obj.setoption("drawtarget", "tempbuffer", ow, oh)
-obj.pixelshader("ps_halation_pure", "tempbuffer", "object", {
+local sx0, sy0 = ow / cw, oh / ch
+if cw ~= ow or ch ~= oh then
+  obj.clearbuffer("object", cw, ch)
+end
+obj.pixelshader("ps_halation_pure", "object", "cache:halation/src", {
   th, intensity / 100, hue_shift / 360, saturation / 100, tr, tg, tb, color_space,
+  sx0, sy0, ow, oh, taps_for(sx0, sy0),
 })
-obj.copybuffer("cache:halation/core", "tempbuffer")
-
-local sp = math.max(spread, 1)
-
--- しきい値の境界はそのままだと1px単位の硬い段差になり、外側をどれだけぼかしても
--- 「貼り付けたような浮いた境目」に見えてしまう。ごく小さいぼかしで段差自体を無くす。
-obj.copybuffer("object", "cache:halation/core")
-apply_blur(sp * 0.12)
+apply_blur(r_core / sx0)
+local Cw, Ch = obj.w, obj.h
 obj.copybuffer("cache:halation/core", "object")
 
--- 締まったコア発光：高品質時は1回、標準時は角を目立たなくするため2回に分けてぼかす
-obj.copybuffer("object", "cache:halation/core")
-if use_hq_blur then
-  apply_blur(sp * 0.5)
-else
-  apply_blur(sp * 0.25)
-  apply_blur(sp * 0.25)
+-- [2] 小ぼかし・大ぼかし: コアを縮小してからぼかす（ぼかしの範囲は等倍で v1.40 と同じ）。
+--     戻り値は合成で読むときの uv の倍率（バッファが覆う等倍の幅に対する元の画像の幅の比）
+local function blurred(K, r, n, name)
+  local kx, ky = sx0, sy0   -- 1 画素が覆う等倍の画素
+  local step = K / sx0
+  if step > 1 then
+    local sw, sh = math.max(1, math.ceil(Cw / step)), math.max(1, math.ceil(Ch / step))
+    local stx, sty = Cw / sw, Ch / sh
+    obj.clearbuffer("object", sw, sh)
+    obj.pixelshader("ps_halation_down", "object", "cache:halation/core", { stx, sty, Cw, Ch, taps_for(stx, sty) })
+    kx, ky = sx0 * stx, sy0 * sty
+  else
+    obj.copybuffer("object", "cache:halation/core")
+  end
+  for _ = 1, n do
+    apply_blur(r / kx)
+  end
+  obj.copybuffer(name, "object")
+  return ow / (obj.w * kx), oh / (obj.h * ky)
 end
-obj.copybuffer("cache:halation/blur_a", "object")
+local asx, asy = blurred(K_a, r_a, n_a, "cache:halation/blur_a")
+local bsx, bsy = blurred(K_b, r_b, n_b, "cache:halation/blur_b")
 
--- 広がる柔らかい発光：高品質時は1回、標準時は3回に分けて大きくぼかし多角形状の角を平均化する
-obj.copybuffer("object", "cache:halation/core")
-if use_hq_blur then
-  apply_blur(sp * 1.2)
-else
-  apply_blur(sp * 0.4)
-  apply_blur(sp * 0.4)
-  apply_blur(sp * 0.4)
-end
-obj.copybuffer("cache:halation/blur_b", "object")
-
--- コア + 小ぼかし + 大ぼかし を加算合成してハローを作る
--- ここを obj.w にすると、ぼかしで膨らんだサイズで halo が作られ、
--- 最後の合成で uv がずれてハローが内側に縮み、画面端に枠が出る。
-obj.setoption("drawtarget", "tempbuffer", ow, oh)
-obj.clearbuffer("tempbuffer")
-obj.setoption("blend", "add")
-
-obj.copybuffer("object", "cache:halation/blur_b")
-obj.draw(0, 0, 0, 1, 0.7)
-
-obj.copybuffer("object", "cache:halation/blur_a")
-obj.draw(0, 0, 0, 1, 0.85)
-
-obj.copybuffer("object", "cache:halation/core")
-obj.draw()
-
-obj.setoption("blend", "none")
-obj.copybuffer("cache:halation/halo", "tempbuffer")
-
+-- [3] コア + 小ぼかし x 0.85 + 大ぼかし x 0.7 をハローにして合成する（ハローの和は合成のシェーダーで取る）。
+--     どのバッファも元の画像と同じ中心なので、uv を中心から倍率で伸ばして読む（ぼかしで膨らんだ分は外に出て読まれない）
 obj.copybuffer("object", "cache:halation/src")
-obj.pixelshader("ps_halation_blend", "object", {"object", "cache:halation/halo"}, {
-  blend_mode, spill,
-})
+obj.pixelshader("ps_halation_blend", "object",
+  { "cache:halation/src", "cache:halation/core", "cache:halation/blur_a", "cache:halation/blur_b" },
+  { blend_mode, spill, ow / (Cw * sx0), oh / (Ch * sy0), asx, asy, bsx, bsy }, "copy", "clamp")
 
 @ライトリーク
 --information:ライトリーク@Filters_H v2.10 by HexBrowns

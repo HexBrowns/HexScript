@@ -264,18 +264,22 @@ local function circumcircle(ax, ay, bx, by, cx, cy)
   return cx0, cy0, dist2(ax, ay, cx0, cy0)
 end
 
-local function in_circumcircle(tri, px, py, pts)
-  local a, b, c = pts[tri[1]], pts[tri[2]], pts[tri[3]]
-  local cx, cy, r2 = circumcircle(a.x, a.y, b.x, b.y, c.x, c.y)
-  if not cx then return false end
-  return dist2(px, py, cx, cy) <= r2 * (1 + 1e-10)
-end
-
 local function orient(ax, ay, bx, by, cx, cy)
   return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
 end
 
 --- 三角形を {i,j,k}（1始まりの点インデックス、CCW）の配列で返す。
+---
+--- 2026-10-13（ローポリ化 v3.30・強化デバッグ 7.5）: 結果を 1 つも変えずに速くした。
+---   旧版は点を 1 つ足すたびに、すべての三角形の外接円を作り直して調べていた（点数の 2 乗。
+---   メッシュのアニメでは毎フレーム）。
+---   1. 外接円は三角形を作ったときに 1 回だけ計算して持つ（式と引数の順は旧版と同じなので値も同じ）
+---   2. この先に足す点の y の最小値（fut_min）より外接円が上にある三角形は、もう「悪い三角形」に
+---      なれないので、調べる列（active）から外して done へ移す
+---   悪い三角形の並び・境界の辺の並び・新しい三角形の並びは旧版と同じになる（done の三角形は旧版でも
+---   悪い三角形にならない）。旧版の tris の並びは「作った順」なので、最後に作った順（seq）で並べ直す。
+---   旧版の判定は「外接円の中か」を毎回 circumcircle から求めて dist2(p, 中心) <= r2 * (1 + 1e-10) で見ていた。
+---   旧版と同じ結果になることの検査: AI/scripts/ローポリ/verify_speed.py
 function EffectUtils_Lowpoly.delaunay(points)
   local n = #points
   if n < 3 then return {} end
@@ -303,7 +307,31 @@ function EffectUtils_Lowpoly.delaunay(points)
   pts[p2] = { x = midx, y = midy + 20 * dmax }
   pts[p3] = { x = midx + 20 * dmax, y = midy - dmax }
 
-  local tris = { { p1, p2, p3 } }
+  -- fut_min[i] = 点 i 以降（i を含む）の y の最小値。fut_min[n + 1] は +∞
+  local fut_min = {}
+  fut_min[n + 1] = math.huge
+  for i = n, 1, -1 do
+    local y = pts[i].y
+    local m = fut_min[i + 1]
+    fut_min[i] = (y < m) and y or m
+  end
+
+  -- 三角形 {a, b, c, seq = 作った順, cx, cy, r2, rr = 外接円の半径に余裕を足したもの}。
+  -- 外接円の無い（3 点が一直線の）三角形は cx = nil（旧版の判定は常に「外」）
+  local seq = 0
+  local function make_tri(a, b, c)
+    seq = seq + 1
+    local pa, pb, pc = pts[a], pts[b], pts[c]
+    local cx, cy, r2 = circumcircle(pa.x, pa.y, pb.x, pb.y, pc.x, pc.y)
+    local rr = nil
+    if cx then
+      rr = math_sqrt(r2) * (1 + 1e-6) + 1e-6
+    end
+    return { a, b, c, seq = seq, cx = cx, cy = cy, r2 = r2, rr = rr }
+  end
+
+  local active = { make_tri(p1, p2, p3) }
+  local done = {}
 
   local function edge_key(a, b)
     if a > b then a, b = b, a end
@@ -312,27 +340,40 @@ function EffectUtils_Lowpoly.delaunay(points)
 
   for i = 1, n do
     local px, py = pts[i].x, pts[i].y
+    local ymin_next = fut_min[i + 1]
     local bad = {}
-    for ti = 1, #tris do
-      if in_circumcircle(tris[ti], px, py, pts) then
-        bad[#bad + 1] = ti
+    local kept = {}
+    for ti = 1, #active do
+      local t = active[ti]
+      local cx = t.cx
+      -- 旧版と同じ判定（dist2(px, py, cx, cy) <= r2 * (1 + 1e-10)）
+      local inside = false
+      if cx then
+        local dx, dy = px - cx, py - t.cy
+        inside = dx * dx + dy * dy <= t.r2 * (1 + 1e-10)
+      end
+      if inside then
+        bad[#bad + 1] = t
+      elseif (not cx) or (ymin_next - t.cy > t.rr) then
+        -- この先のどの点も外接円に入らない（y の差だけで半径を超える）。もう調べない
+        done[#done + 1] = t
+      else
+        kept[#kept + 1] = t
       end
     end
 
     -- bad 三角形の中で1回だけ現れる辺 = 空洞の境界
     local edge_count = {}
     for bi = 1, #bad do
-      local t = tris[bad[bi]]
+      local t = bad[bi]
       edge_count[edge_key(t[1], t[2])] = (edge_count[edge_key(t[1], t[2])] or 0) + 1
       edge_count[edge_key(t[2], t[3])] = (edge_count[edge_key(t[2], t[3])] or 0) + 1
       edge_count[edge_key(t[3], t[1])] = (edge_count[edge_key(t[3], t[1])] or 0) + 1
     end
 
     local boundary = {}
-    local is_bad = {}
     for bi = 1, #bad do
-      local t = tris[bad[bi]]
-      is_bad[bad[bi]] = true
+      local t = bad[bi]
       local e = { { t[1], t[2] }, { t[2], t[3] }, { t[3], t[1] } }
       for ei = 1, 3 do
         local a, b = e[ei][1], e[ei][2]
@@ -342,29 +383,28 @@ function EffectUtils_Lowpoly.delaunay(points)
       end
     end
 
-    local kept = {}
-    for ti = 1, #tris do
-      if not is_bad[ti] then
-        kept[#kept + 1] = tris[ti]
-      end
-    end
-    tris = kept
-
+    active = kept
     for bi = 1, #boundary do
       local a, b = boundary[bi][1], boundary[bi][2]
       -- 新しい点と合わせて CCW にそろえる
       if orient(pts[a].x, pts[a].y, pts[b].x, pts[b].y, px, py) < 0 then
         a, b = b, a
       end
-      tris[#tris + 1] = { a, b, i }
+      active[#active + 1] = make_tri(a, b, i)
     end
   end
 
+  -- 旧版の並び（作った順）に戻す
+  local all = {}
+  for ti = 1, #done do all[#all + 1] = done[ti] end
+  for ti = 1, #active do all[#all + 1] = active[ti] end
+  table.sort(all, function(u, v) return u.seq < v.seq end)
+
   local result = {}
-  for ti = 1, #tris do
-    local t = tris[ti]
+  for ti = 1, #all do
+    local t = all[ti]
     if t[1] <= n and t[2] <= n and t[3] <= n then
-      result[#result + 1] = t
+      result[#result + 1] = { t[1], t[2], t[3] }
     end
   end
   return result
@@ -684,6 +724,137 @@ function EffectUtils_Lowpoly.append_tri_batch(consts, recs, start_i, batch_n)
     k = k + 12
   end
   return n
+end
+
+-- 場所ごとのバッチ（ローポリ化 v3.30・強化デバッグ 7.5） ------------------------
+--
+-- 旧版の @通常 は三角形を Delaunay の出力順に 256 個ずつ区切って塗っていた。どのバッチも画面全体に散らばるので、
+-- 1 画素はバッチごとに最大 256 個の三角形を調べ（FHD の既定で 7 バッチ、1 画素あたり約 1,700 回）、
+-- これが 1 フレームの時間のほとんどだった（効果ぶん約 23ms。実機 2026-10-13）。
+-- ここでは三角形の重心で画面を縦横に二分していき、近い三角形を同じバッチにまとめる（k-d 木の葉）。
+-- 各バッチには頂点の外接矩形を付け、シェーダーは矩形の外の画素をループの前に抜ける。
+-- 1 画素が調べる三角形は、自分の入るバッチ（と矩形が重なる隣のバッチ）の分だけになる。
+-- ループの回数（バッチの三角形数）は画素によらず同じで、矩形の判定はループの外の 1 回だけ。
+
+-- tris（get_mesh の戻り値。メッシュのメモ化と同じ表）ごとに区切り方を覚える。表が捨てられたら一緒に消える
+local batch_cache = setmetatable({}, { __mode = "k" })
+
+--- 三角形の番号（tris の添字）を場所ごとのバッチに分ける。
+--- 戻り値: { { idx = {番号...}, x0, y0, x1, y1 }, ... }（x0..y1 は頂点の外接矩形）。各バッチは batch_n 個以下。
+function EffectUtils_Lowpoly.spatial_batches(points, tris, batch_n)
+  batch_n = batch_n or BATCH_SIZE
+  local per = batch_cache[tris]
+  if per and per[batch_n] then
+    return per[batch_n]
+  end
+
+  local n = #tris
+  local gx, gy = {}, {}
+  local order = {}
+  for i = 1, n do
+    local t = tris[i]
+    local a, b, c = points[t[1]], points[t[2]], points[t[3]]
+    gx[i] = (a.x + b.x + c.x) / 3
+    gy[i] = (a.y + b.y + c.y) / 3
+    order[i] = i
+  end
+
+  local batches = {}
+  local function emit(lo, hi)
+    -- batch_n を超えたら（割り切れない端数で 1 個はみ出すとき）前から切る
+    local s = lo
+    while s <= hi do
+      local e = math_min(hi, s + batch_n - 1)
+      local idx = {}
+      local x0, y0, x1, y1 = math.huge, math.huge, -math.huge, -math.huge
+      for k = s, e do
+        local ti = order[k]
+        idx[#idx + 1] = ti
+        local t = tris[ti]
+        for v = 1, 3 do
+          local p = points[t[v]]
+          if p.x < x0 then x0 = p.x end
+          if p.y < y0 then y0 = p.y end
+          if p.x > x1 then x1 = p.x end
+          if p.y > y1 then y1 = p.y end
+        end
+      end
+      batches[#batches + 1] = { idx = idx, x0 = x0, y0 = y0, x1 = x1, y1 = y1 }
+      s = e + 1
+    end
+  end
+
+  -- order[lo..hi] を c 個のバッチに分ける。重心の広がりが大きい向きで並べ、個数の比で切る
+  local function split(lo, hi, c)
+    local len = hi - lo + 1
+    if c <= 1 or len <= batch_n then
+      emit(lo, hi)
+      return
+    end
+    local mnx, mny, mxx, mxy = math.huge, math.huge, -math.huge, -math.huge
+    for k = lo, hi do
+      local ti = order[k]
+      local x, y = gx[ti], gy[ti]
+      if x < mnx then mnx = x end
+      if y < mny then mny = y end
+      if x > mxx then mxx = x end
+      if y > mxy then mxy = y end
+    end
+    local key = (mxx - mnx >= mxy - mny) and gx or gy
+    local sub = {}
+    for k = lo, hi do sub[#sub + 1] = order[k] end
+    -- 同じ値は番号の順（並べ方を毎回同じにする）
+    table.sort(sub, function(u, v)
+      local ku, kv = key[u], key[v]
+      if ku ~= kv then return ku < kv end
+      return u < v
+    end)
+    for k = 1, len do order[lo + k - 1] = sub[k] end
+    local cl = math_floor(c / 2)
+    local cut = lo + math_floor(len * cl / c)
+    split(lo, cut - 1, cl)
+    split(cut, hi, c - cl)
+  end
+
+  if n > 0 then
+    split(1, n, math_ceil(n / batch_n))
+  end
+
+  per = per or {}
+  per[batch_n] = batches
+  batch_cache[tris] = per
+  return batches
+end
+
+--- consts の末尾に 1 バッチ分を追加する（append_tri_batch の、番号の列を渡す版）。
+--- recs は build_tri_records の戻り値（tris の添字のまま）。レイアウトは append_tri_batch と同じで、
+--- batch_n に満たない分は 0 で埋める。返り値は詰めた三角形数。
+function EffectUtils_Lowpoly.append_tri_list(consts, recs, idx, batch_n)
+  local k = #consts
+  local m = #idx
+  for i = 1, batch_n do
+    local r = (i <= m) and recs[idx[i]] or nil
+    if r then
+      consts[k + 1] = r.x0
+      consts[k + 2] = r.y0
+      consts[k + 3] = r.x1
+      consts[k + 4] = r.y1
+      consts[k + 5] = r.x2
+      consts[k + 6] = r.y2
+      consts[k + 7] = r.p0
+      consts[k + 8] = r.p1
+      consts[k + 9] = r.p2
+      consts[k + 10] = r.p3
+      consts[k + 11] = 0
+      consts[k + 12] = 0
+    else
+      for j = 1, 12 do
+        consts[k + j] = 0
+      end
+    end
+    k = k + 12
+  end
+  return math_min(m, batch_n)
 end
 
 EffectUtils_Lowpoly.MAX_POINTS = MAX_POINTS

@@ -17,12 +17,19 @@ v3.20 で「ばらつきの色空間」を足した（仕様 AI/specifications/2
 Oklch では色相・彩度・明度の変化が h・C・L に掛かる（彩度 ±100% は C の ±0.32）。既定の HSV は v3.11 と同じ計算。
 検証器: AI/scripts/ローポリ/verify_colorspace_ext.py
 
+v3.30（通常のみ。強化デバッグ 7.5）で「通常」を速くした。
+  1. 三角形を場所ごとのバッチにまとめ（EffectUtils_Lowpoly.spatial_batches）、各バッチの外接矩形の外の画素は
+     ループの前に抜ける。旧版はどのバッチも画面全体に散らばり、1 画素が全バッチの三角形を調べていた
+  2. 共有モジュールの Delaunay を、結果を変えずに速くした（外接円を持ち回り、もう変わらない三角形を調べない）
+  絵が変わるのは、三角形の辺がちょうど画素の中心を通る所だけ（どちらの三角形の色になるかが入れ替わりうる）。
+  検証器: AI/scripts/ローポリ/verify_speed.py
+
 ※このコメント内で行頭に @ を置かないこと。ホストはブロックコメントの中も走査し、
   行頭 @ をセクション区切りとして扱うため、偽のスクリプトがエフェクト一覧に並ぶ。
 ]]
 
 @通常
---information:通常@ローポリ化 v3.20 by HexBrowns
+--information:通常@ローポリ化 v3.30 by HexBrowns
 --label:HexScript
 --filter
 
@@ -63,6 +70,7 @@ cbuffer Params : register(b0) {
     float4 meta;      // w, h, tri_count, show_edges
     float4 edge;      // r, g, b, edge_width
     float4 opt;       // has_hsv, ばらつきの色空間（3 = HSV、7 = Oklch。v3.20）, 0, 0
+    float4 bbox;      // このバッチの三角形の外接矩形 x0, y0, x1, y1（画素。1 画素の余裕込み。v3.30）
     float4 tri[768];  // 256 tris * 3 float4
 };
 
@@ -555,6 +563,10 @@ void add_tap(float2 p, float2 inv, inout float3 acc, inout float asum, inout flo
 
 float4 ps_lp_fill(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target {
     float2 pos = sv_pos.xy;
+    // v3.30: バッチは場所ごとにまとめてあるので、外接矩形の外の画素はどの三角形にも入らない。ループの前に抜ける
+    if (pos.x < bbox.x || pos.y < bbox.y || pos.x > bbox.z || pos.y > bbox.w) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
     int count = (int)meta.z;
     float2 inv = float2(1.0 / max(meta.x, 1.0), 1.0 / max(meta.y, 1.0));
 
@@ -685,13 +697,17 @@ obj.clearbuffer("object", img_w, img_h)
 
 local er, eg, eb = lp.color_to_rgb01(edge_color)
 local batch = lp.BATCH_SIZE
-for start = 1, #recs, batch do
+-- v3.30: 場所ごとのバッチ（メッシュごとに覚える）。三角形の番号（ばらつきの乱数）は Delaunay の出力順のまま
+local batches = lp.spatial_batches(points, tris, batch)
+for bi = 1, #batches do
+  local b = batches[bi]
   local consts = {
     img_w, img_h, 0, is_edges and 1 or 0,
     er, eg, eb, edge_width,
     has_hsv, var_space or 3, 0, 0,
+    b.x0 - 1, b.y0 - 1, b.x1 + 1, b.y1 + 1,
   }
-  local n = lp.append_tri_batch(consts, recs, start, batch)
+  local n = lp.append_tri_list(consts, recs, b.idx, batch)
   consts[3] = n
   obj.pixelshader("ps_lp_fill", "object", lp.SRC_CACHE, consts, "draw", "clamp")
 end
