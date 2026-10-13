@@ -1,7 +1,8 @@
 --[[
-ShapeDistort_H.anm2 v1.04
+ShapeDistort_H.anm2 v1.10
 
-図形変形フィルタ 4 種（回転 / 放射 / 方向 / ジグザグ）を HLSL 1 パスで実装したもの。
+図形変形フィルタ 5 種（回転 / 放射 / 方向 / ジグザグ / 無限ズーム）を HLSL 1 パスで実装したもの。
+6 種目のパペットだけは三角網を obj.drawpoly で描く（変形の計算は puppet.mod2）。
 
 成り立ち
   - ShapeDistort.anm2（HLSL・モード切替式）と @ShapeDistort.anm2（ZigzagModule.mod2 依存の
@@ -49,6 +50,18 @@ v1.04（2026-09-27、ジグザグだけ）
     （正方形・リッジ数 8 なら量 10 前後から）。順に重ねると、行や列を滑らせるだけの写しを 2 回重ねるので裂けない
     （方向を角度 0 と 90 で 2 回掛けたのと同じ仕組み。ずれの大きさと波の間隔は元の画像で数える）
   - 「重ねる順」（横→縦 / 縦→横）を足した。順番で絵が変わる
+
+v1.10（2026-10-12、無限ズームとパペットを足した。既存の 4 セクションは変えていない）
+  - 無限ズーム（ドロステ効果）。画像の中に、不動点を中心に縮小（と回転）した自分自身を入れ子に重ね、
+    ズームを 1 進めるごとに 1 段入る。ズームの小数部だけで絵が決まるので、どこまで動かしても継ぎ目なくループする
+  - 1 パスのピクセルシェーダー。cache と tempbuffer は使わない。大きさを変えないのでフィルタオブジェクトでも動く
+  - 仕様: AI/specifications/20261012_ShapeDistort_H_無限ズーム_spec.md
+    検証器: AI/scripts/ShapeDistort_H/verify_infinite_zoom.py
+  - パペット（After Effects のパペットツール）。絵のアルファから三角網を作り、ピン（最大 8 本）に引かれて
+    自然に曲がるよう変形して三角形ごとに描く。変形の計算は puppet.mod2（AI/plugins/Puppet_H/、Script/Puppet_H/ に置く）。
+    別のレイヤーに付いていく・自動の揺れ・硬さピン・重なりピンを持つ。フィルタオブジェクトには対応しない
+  - 仕様: AI/specifications/20261012_ShapeDistort_H_パペット_spec.md
+    検証器: AI/scripts/ShapeDistort_H/verify_puppet.py
 
 ※このコメント内で行頭に @ を置かないこと。ホストはブロックコメントの中も走査し、
   行頭 @ をセクション区切りとして扱うため、偽のスクリプトがエフェクト一覧に並ぶ。
@@ -733,3 +746,495 @@ else
     0, 0, obj.w, obj.h, 0,
   }, "copy", (wrap == 1) and "loop" or "clamp")
 end
+
+@無限ズーム
+--information:無限ズーム@ShapeDistort_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+
+--group:変形
+--track@zoom:ズーム,-1000,1000,0,0.01
+--select@zoom_dir:向き=0,寄る=0,引く=1
+--track@ratio:縮小率,10,90,50,0.1
+--track@step_rot:回転,-360,360,0,0.1
+--group
+
+--group:中心
+--track@center_x:中心X,-4000,4000,0,0.1
+--track@center_y:中心Y,-4000,4000,0,0.1
+--trackgroup@center_x,center_y:中心
+--group
+
+--group:継ぎ目,0
+--track@feather:継ぎ目のなじませ,0,500,0,0.1
+--track@frame_w:枠の幅,0,500,0,0.1
+--color@frame_col:枠の色,ffffff
+--group
+
+--group:品質,0
+--track@levels:段の数,1,32,8,1
+--select@aa:アンチエイリアス=1,なし=0,2x2=1,4x4=2
+--group
+
+--[[pixelshader@ps_sd_droste:
+cbuffer P : register(b0) {
+    float2 center;       // 0-1  不動点（元の画像の uv）
+    float2 resolution;   // 2-3  画像の大きさ（px）
+    float3 frame_color;  // 4-6  枠の色（0-1。不透明で塗るので乗算済みと同じ）
+    float frame_width;   // 7    枠の幅（高さ = 1 の単位）
+    float zoom_t;        // 8    ズームの進行の小数部 [0, 1)。Lua で折り返して渡す
+    float log_s;         // 9    ln(縮小率)。負
+    float step_rot;      // 10   1 段ごとの回転（ラジアン）
+    float max_levels;    // 11   1 画素で重ねる段（覆う段だけを数える）の数の上限
+    float feather;       // 12   継ぎ目のなじませの幅（高さ = 1 の単位）
+    float aa_n;          // 13   1 軸あたりの副標本の数（1 / 2 / 4）
+};
+
+Texture2D tex : register(t0);
+SamplerState smp : register(s0);
+
+// 入れ子の平面 P: 段 n（整数）の複製は、不動点を中心に s^n 倍・n x 回転 した元の画像。
+// 内側の段（n が大きい＝小さい複製）ほど上に重なる。P(s R(回転) y) = P(y)（1 段ずらしても同じ平面）。
+// 出力の画素 x（不動点から、高さ = 1 の等方な空間）は y = s^t R(t x 回転) x を読む。t = 1 で t = 0 と同じ絵に戻る。
+// 段 n の複製の上での位置は u = s^-n R(-n x 回転) y。u が元の画像の中なら、その段がこの画素を覆う。
+// 透明な所は下（外側）の段が透ける。手前から奥へ（n の大きい方から）乗算済みのまま重ねる。
+// 覆わない段（画像の外）は「段の数」に数えない。縮小率が大きく中心が辺に近いと覆わない段が続くので、
+// 調べる段は別に 64 段で打ち切る（縮小率 90% でも r_in / r_out が 0.9^64 = 0.001 までの中心なら届く）
+float4 ps_sd_droste(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float aspect = resolution.x / max(resolution.y, 1.0);
+    // 不動点から最も遠い角までの距離。|u| がこれより大きい段は画像の外（覆わない）
+    float ext_x = max(abs(center.x), abs(1.0 - center.x)) * aspect;
+    float ext_y = max(abs(center.y), abs(1.0 - center.y));
+    float r_out = max(sqrt(ext_x * ext_x + ext_y * ext_y), 1e-4);
+    float inv_log_s = 1.0 / min(log_s, -1e-4);
+
+    float zs = exp(zoom_t * log_s);
+    float za = zoom_t * step_rot;
+    float zc = cos(za);
+    float zn = sin(za);
+
+    int n_aa = (int)clamp(aa_n, 1.0, 4.0);
+    int n_lev = (int)clamp(max_levels, 1.0, 32.0);
+    float fa = (float)n_aa;
+
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    [loop]
+    for (int sy = 0; sy < 4; sy++) {
+        if (sy >= n_aa) break;
+        [loop]
+        for (int sx = 0; sx < 4; sx++) {
+            if (sx >= n_aa) break;
+            float2 sub = (float2((float)sx, (float)sy) + 0.5) / fa - 0.5;
+            float2 xq = (uv + sub / resolution - center) * float2(aspect, 1.0);
+            float2 yq = float2(xq.x * zc - xq.y * zn, xq.x * zn + xq.y * zc) * zs;
+            float ry = max(length(yq), 1e-6);
+            // 覆いうる最も内側の段: s^-n |y| <= r_out となる最大の n
+            float n_top = floor(log(ry / r_out) * inv_log_s);
+            float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+            int hit = 0;
+            [loop]
+            for (int k = 0; k < 64; k++) {
+                if (hit >= n_lev || acc.a >= 0.999) break;
+                float n = n_top - (float)k;
+                float ang = -n * step_rot;
+                float ca = cos(ang);
+                float sa = sin(ang);
+                float2 u = float2(yq.x * ca - yq.y * sa, yq.x * sa + yq.y * ca) * exp(-n * log_s);
+                float2 iuv = center + u / float2(aspect, 1.0);
+                // 辺までの距離（高さ = 1 の単位）。負なら元の画像の外
+                float edge = min(min(iuv.x * aspect, (1.0 - iuv.x) * aspect), min(iuv.y, 1.0 - iuv.y));
+                if (edge >= 0.0) {
+                    hit += 1;
+                    // ループの中なので勾配を使わない SampleLevel で読む（Sample は X3570 になりうる）
+                    float4 col = tex.SampleLevel(smp, iuv, 0);
+                    if (edge < frame_width) {
+                        col = float4(frame_color, 1.0);
+                    }
+                    float wgt = (feather > 0.0) ? saturate(edge / feather) : 1.0;
+                    acc += (1.0 - acc.a) * col * wgt;
+                }
+            }
+            sum += acc;
+        }
+    }
+    return sum / (fa * fa);
+}
+]]
+
+-- 1 パスで描く。大きさを変えず、cache と tempbuffer も使わない（フィルタオブジェクトでも同じ）。
+-- 絵は進行 t の小数部だけで決まる（P は 1 段ずらしても同じ平面）ので、ここで折り返して渡す。
+-- 大きな t のまま渡すと、シェーダーの s^t が float32 で潰れる
+local W0, H0 = obj.w, obj.h
+local t = zoom * ((zoom_dir == 1) and -1 or 1)
+t = t - math.floor(t)
+if t >= 1 then t = 0 end
+local s = math.min(math.max(ratio / 100, 0.01), 0.99)
+local aa_n = ({ [0] = 1, [1] = 2, [2] = 4 })[aa] or 2
+local col = math.floor(tonumber(frame_col) or 0xffffff)
+local fr = math.floor(col / 65536) % 256 / 255
+local fg = math.floor(col / 256) % 256 / 255
+local fb = col % 256 / 255
+obj.pixelshader("ps_sd_droste", "object", "object", {
+  0.5 + center_x / math.max(W0, 1), 0.5 + center_y / math.max(H0, 1),
+  W0, H0,
+  fr, fg, fb,
+  frame_w / math.max(H0, 1),
+  t, math.log(s), math.rad(step_rot), levels,
+  feather / math.max(H0, 1), aa_n,
+}, "copy", "clamp")
+
+@パペット
+--information:パペット@ShapeDistort_H v1.00 by HexBrowns
+--label:HexScript
+
+--group:ピン
+--select@pin_n:ピンの数=3,1=1,2=2,3=3,4=4,5=5,6=6,7=7,8=8
+--check@place_mode:元の位置を打つ,0
+--value@pin_base:ピンの元の位置,{}
+--group
+
+--group:ピンのずれ
+--track@p1x:ピン1X,-4000,4000,0,0.1
+--track@p1y:ピン1Y,-4000,4000,0,0.1
+--trackgroup@p1x,p1y:ピン1
+--track@p2x:ピン2X,-4000,4000,0,0.1
+--track@p2y:ピン2Y,-4000,4000,0,0.1
+--trackgroup@p2x,p2y:ピン2
+--hide@p2x:pin_n<2
+--hide@p2y:pin_n<2
+--track@p3x:ピン3X,-4000,4000,0,0.1
+--track@p3y:ピン3Y,-4000,4000,0,0.1
+--trackgroup@p3x,p3y:ピン3
+--hide@p3x:pin_n<3
+--hide@p3y:pin_n<3
+--track@p4x:ピン4X,-4000,4000,0,0.1
+--track@p4y:ピン4Y,-4000,4000,0,0.1
+--trackgroup@p4x,p4y:ピン4
+--hide@p4x:pin_n<4
+--hide@p4y:pin_n<4
+--track@p5x:ピン5X,-4000,4000,0,0.1
+--track@p5y:ピン5Y,-4000,4000,0,0.1
+--trackgroup@p5x,p5y:ピン5
+--hide@p5x:pin_n<5
+--hide@p5y:pin_n<5
+--track@p6x:ピン6X,-4000,4000,0,0.1
+--track@p6y:ピン6Y,-4000,4000,0,0.1
+--trackgroup@p6x,p6y:ピン6
+--hide@p6x:pin_n<6
+--hide@p6y:pin_n<6
+--track@p7x:ピン7X,-4000,4000,0,0.1
+--track@p7y:ピン7Y,-4000,4000,0,0.1
+--trackgroup@p7x,p7y:ピン7
+--hide@p7x:pin_n<7
+--hide@p7y:pin_n<7
+--track@p8x:ピン8X,-4000,4000,0,0.1
+--track@p8y:ピン8Y,-4000,4000,0,0.1
+--trackgroup@p8x,p8y:ピン8
+--hide@p8x:pin_n<8
+--hide@p8y:pin_n<8
+--group
+
+--group:付いていく,0
+--value@follow:付いていくレイヤー,{0,0,0,0,0,0,0,0}
+--group
+
+--group:揺れ,0
+--track@wig_amp:揺れの強さ,0,500,0,0.1
+--track@wig_freq:揺れの速さ,0,20,1,0.01
+--track@wig_seed:揺れのシード,0,10000,0,1
+--value@wig_w:揺れの効き方,{100,100,100,100,100,100,100,100}
+--group
+
+--group:硬さピン,0
+--select@starch_n:硬さピンの数=0,なし=0,1=1,2=2,3=3,4=4
+--value@starch_pos:硬さピンの位置,{}
+--hide@starch_pos:starch_n==0
+--value@starch_v:硬さピンの半径と強さ,{}
+--hide@starch_v:starch_n==0
+--group
+
+--group:重なりピン,0
+--select@ovl_n:重なりピンの数=0,なし=0,1=1,2=2,3=3,4=4
+--value@ovl_pos:重なりピンの位置,{}
+--hide@ovl_pos:ovl_n==0
+--value@ovl_v:重なりピンの前後と半径,{}
+--hide@ovl_v:ovl_n==0
+--group
+
+--group:三角網,0
+--track@detail:細かさ,4,100,30,1
+--track@iters:反復回数,0,20,4,1
+--check@show_mesh:三角網を表示,0
+--group
+
+--[[pixelshader@ps_pp_grid:
+cbuffer P : register(b0) {
+    float2 src_size;     // 0-1  元の絵の大きさ（px）
+    float2 cell;         // 2-3  1 マスの大きさ（px）
+};
+
+Texture2D src : register(t0);
+
+// 1 マス（出力の 1 画素）の中の 8x8 点のアルファの最大を R に書く。
+// A = 1 で書くので、読み戻し（ストレートの RGBA8）でも R はそのまま（0〜255）
+float4 ps_pp_grid(float4 pos : SV_Position) : SV_Target {
+    float2 base = floor(pos.xy) * cell;
+    int2 lim = max(int2(src_size) - int2(1, 1), int2(0, 0));
+    float m = 0.0;
+    [loop]
+    for (int j = 0; j < 8; j++) {
+        [loop]
+        for (int i = 0; i < 8; i++) {
+            float2 p = base + (float2((float)i, (float)j) + 0.5) * (cell / 8.0);
+            int2 q = clamp(int2(p), int2(0, 0), lim);
+            m = max(m, src.Load(int3(q, 0)).a);
+        }
+    }
+    return float4(m, 0.0, 0.0, 1.0);
+}
+]]
+
+local obj, math = obj, math
+
+-- パペット: 絵のアルファから三角網を作り、ピンに引かれて自然に曲がるよう変形して、三角形ごとに obj.drawpoly で描く。
+-- 変形の計算（三角網・As-Rigid-As-Possible・描く順）は puppet.mod2（AI/plugins/Puppet_H/。Script/Puppet_H/ に置く）。
+-- 仕様: AI/specifications/20261012_ShapeDistort_H_パペット_spec.md / 検証器: AI/scripts/ShapeDistort_H/verify_puppet.py
+--
+-- 座標はすべて「オブジェクトの中心を原点とする、元の絵の画素」（y は下向き）。obj.setanchor の既定（オブジェクト座標）と同じ。
+-- ピンの今の位置 = 元の位置（ピンの元の位置）＋ ずれ（ピンNX / ピンNY）＋ 付いていくレイヤーの動き ＋ 揺れ
+-- 「元の位置を打つ」の間は変形せず、元の位置・硬さピン・重なりピンのアンカーを出す（変形していない絵の上で打つため）。
+-- それ以外は、ピンごとに「ずれ」のアンカーを元の位置からのオフセットで出す（ドラッグでずれのトラックに値が入る）
+
+local W0, H0 = obj.w, obj.h
+if W0 < 1 or H0 < 1 then return end
+local G = _PUPPET_H or { warned = {}, list = {}, wire = {} }
+_PUPPET_H = G
+
+-- 配列の i 番目の数（無い・数でないなら d）
+local function num(t, i, d)
+  local v = (type(t) == "table") and tonumber(t[i]) or nil
+  if v == nil or v ~= v or v == math.huge or v == -math.huge then return d end
+  return v
+end
+local np = math.max(1, math.min(8, math.floor(pin_n + 0.5)))
+local ns = math.max(0, math.min(4, math.floor(starch_n + 0.5)))
+local no = math.max(0, math.min(4, math.floor(ovl_n + 0.5)))
+local is_place = (place_mode == 1)
+
+-- 配列が足りないときの既定の位置（絵の大きさに対する割合を画素に丸める）
+local DEF_PIN = { {0, -0.35}, {0, 0.35}, {-0.35, 0}, {0.35, 0}, {-0.3, -0.3}, {0.3, -0.3}, {-0.3, 0.3}, {0.3, 0.3} }
+local DEF_SUB = { {0, 0}, {0, -0.2}, {0, 0.2}, {-0.2, 0} }
+local function points(arr, count, def)
+  local out = {}
+  for k = 1, count do
+    out[2 * k - 1] = num(arr, 2 * k - 1, math.floor(def[k][1] * W0 + 0.5))
+    out[2 * k] = num(arr, 2 * k, math.floor(def[k][2] * H0 + 0.5))
+  end
+  return out
+end
+local base = points(pin_base, np, DEF_PIN)
+local spos = points(starch_pos, ns, DEF_SUB)
+local opos = points(ovl_pos, no, DEF_SUB)
+
+-- 硬さピン {x, y, 半径, 強さ(0〜1)}・重なりピン {x, y, 前後, 半径}。値の配列は 1 本につき 2 つ（既定 半径 100・強さ 100 / 前後 50・半径 100）
+local starch, ovl = {}, {}
+for k = 1, ns do
+  starch[#starch + 1] = spos[2 * k - 1]
+  starch[#starch + 1] = spos[2 * k]
+  starch[#starch + 1] = math.max(0, num(starch_v, 2 * k - 1, 100))
+  starch[#starch + 1] = math.max(0, math.min(100, num(starch_v, 2 * k, 100))) / 100
+end
+for k = 1, no do
+  ovl[#ovl + 1] = opos[2 * k - 1]
+  ovl[#ovl + 1] = opos[2 * k]
+  ovl[#ovl + 1] = math.max(-100, math.min(100, num(ovl_v, 2 * k - 1, 50)))
+  ovl[#ovl + 1] = math.max(0, num(ovl_v, 2 * k, 100))
+end
+
+-- アンカー（呼ぶ順と回数は、ピンの数・モードが同じ間は変わらない）
+local PX = { p1x, p2x, p3x, p4x, p5x, p6x, p7x, p8x }
+local PY = { p1y, p2y, p3y, p4y, p5y, p6y, p7y, p8y }
+if is_place then
+  local function circle(cx, cy, r, col)
+    if not (r > 0) then return end
+    local t = {}
+    for i = 0, 23 do
+      local a = i * math.pi / 12
+      t[2 * i + 1] = cx + r * math.cos(a)
+      t[2 * i + 2] = cy + r * math.sin(a)
+    end
+    obj.setanchor(t, 24, "loop", "color", col)
+  end
+  obj.setanchor("pin_base", np, base)
+  if ns > 0 then
+    obj.setanchor("starch_pos", ns, "color", 0x40c0ff, spos)
+    for k = 1, ns do circle(starch[4 * k - 3], starch[4 * k - 2], starch[4 * k - 1], 0x40c0ff) end
+  end
+  if no > 0 then
+    obj.setanchor("ovl_pos", no, "color", 0xff9040, opos)
+    for k = 1, no do circle(ovl[4 * k - 3], ovl[4 * k - 2], ovl[4 * k], 0xff9040) end
+  end
+else
+  for k = 1, np do
+    obj.setanchor("p" .. k .. "x,p" .. k .. "y", 0, "line", "offset", base[2 * k - 1], base[2 * k])
+  end
+end
+
+-- ピンの今の位置
+local cur = {}
+if is_place then
+  for i = 1, 2 * np do cur[i] = base[i] end
+else
+  -- 付いていく: 指定したレイヤーのオブジェクトの基準座標の、そのオブジェクトの最初の位置からの動き。
+  -- 画面の上の動きなので、このオブジェクトの回転と拡大率を戻して画素に直す（画面で 100px 動けばピンも画面で 100px）
+  local rz = math.rad((tonumber((obj.getvalue("rz"))) or 0) + (obj.rz or 0))
+  local sx = (tonumber((obj.getvalue("sx"))) or 1) * (obj.sx or 1)
+  local sy = (tonumber((obj.getvalue("sy"))) or 1) * (obj.sy or 1)
+  if math.abs(sx) < 1e-6 then sx = (sx < 0) and -1e-6 or 1e-6 end
+  if math.abs(sy) < 1e-6 then sy = (sy < 0) and -1e-6 or 1e-6 end
+  local cr, sr = math.cos(rz), math.sin(rz)
+  local function follow_of(L)
+    L = math.floor(L + 0.5)
+    if L < 1 or L == obj.layer then return 0, 0 end
+    local key = "layer" .. L
+    if not (obj.getvalue(key)) then return 0, 0 end
+    local x = tonumber((obj.getvalue(key .. ".x")))
+    local y = tonumber((obj.getvalue(key .. ".y")))
+    if x == nil or y == nil then return 0, 0 end
+    -- 最初の位置: 相手の開始点（区間 0）の時刻 0 の値。区間の番号は相手の区間を指す（"layerN.time" で検証 IDL-02）ので、
+    -- 開始フレームの差から時刻を組まない（時刻の基準がどちらのオブジェクトかは lua.txt に無い。実機で確かめる V-4）
+    local x0 = tonumber((obj.getvalue(key .. ".x", 0, 0))) or x
+    local y0 = tonumber((obj.getvalue(key .. ".y", 0, 0))) or y
+    local dx, dy = x - x0, y - y0
+    return (cr * dx + sr * dy) / sx, (-sr * dx + cr * dy) / sy
+  end
+  -- 揺れ: 滑らかな 1 次元のノイズ（勾配ノイズ、-1〜1）。ピンと軸ごとに種と位相を変える
+  local function hash1(v)
+    local s = math.sin(v) * 43758.5453123
+    return s - math.floor(s)
+  end
+  local function gnoise(t, s)
+    local i = math.floor(t)
+    local f = t - i
+    local g0 = hash1(i * 127.1 + s * 311.7) * 2 - 1
+    local g1 = hash1((i + 1) * 127.1 + s * 311.7) * 2 - 1
+    local u = f * f * f * (f * (f * 6 - 15) + 10)
+    local a, b = g0 * f, g1 * (f - 1)
+    return 2 * (a + (b - a) * u)
+  end
+  local function wiggle(k)
+    local amp = wig_amp * num(wig_w, k, 100) / 100
+    if amp == 0 then return 0, 0 end
+    local s = wig_seed * 13 + k * 7
+    local t = obj.time * wig_freq
+    return amp * gnoise(t + hash1(s * 1.7) * 100, s), amp * gnoise(t + hash1(s * 2.3 + 5) * 100, s + 3)
+  end
+  for k = 1, np do
+    local fx, fy = follow_of(num(follow, k, 0))
+    local wx, wy = wiggle(k)
+    cur[2 * k - 1] = base[2 * k - 1] + PX[k] + fx + wx
+    cur[2 * k] = base[2 * k] + PY[k] + fy + wy
+  end
+end
+
+-- 「元の位置を打つ」の間は、三角網を表示するときだけ（変形しない三角網に線を重ねて）描く
+if is_place and show_mesh ~= 1 then return end
+
+local mod = obj.module("puppet")
+if not mod then
+  if not G.warned.mod then
+    G.warned.mod = true
+    print("@warn", "[パペット@ShapeDistort_H] puppet.mod2 が見つかりません（Script/Puppet_H/）")
+  end
+  return
+end
+
+-- 三角網の格子: 長い辺を「細かさ」マスに分ける（マスの 1 辺は 1 画素以上。小さな絵を画素より細かく割らない）。
+-- マスの大きさは端が細くならないよう W0 / gw x H0 / gh
+local dt = math.max(4, math.min(100, math.floor(detail + 0.5)))
+local cell = math.max(1, math.max(W0, H0) / dt)
+local gw = math.max(1, math.floor(W0 / cell + 0.5))
+local gh = math.max(1, math.floor(H0 / cell + 0.5))
+obj.clearbuffer("cache:puppet_h/grid", gw, gh)
+obj.pixelshader("ps_pp_grid", "cache:puppet_h/grid", {"object"}, { W0, H0, W0 / gw, H0 / gh }, "copy")
+local data, dw, dh = obj.getpixeldata("cache:puppet_h/grid")
+if data == nil or dw ~= gw or dh ~= gh then return end
+
+-- 前計算（三角網と行列の分解）はモジュールの中でオブジェクトごとに使い回す
+local id = string.format("%s/%s/%s/%s", tostring(obj.id), tostring(obj.effect_id), tostring(obj.index), tostring(obj.scene_id))
+local verts, ntri = mod.deform(id, data, gw, gh, W0, H0, base, cur, starch, ovl, math.floor(iters + 0.5))
+if type(verts) ~= "table" or type(ntri) ~= "number" or ntri <= 0 then return end
+
+-- 頂点の表（描く順。奥から前）。表は使い回す
+local list = G.list
+local m = 0
+local ex, ey = W0 / 2, H0 / 2
+for i = 0, ntri * 3 - 1 do
+  local b = i * 4
+  local x, y = verts[b + 1], verts[b + 2]
+  if x == nil or y == nil then break end
+  m = m + 1
+  local v = list[m]
+  if v == nil then
+    v = {}
+    list[m] = v
+  end
+  v[1], v[2], v[3], v[4], v[5] = x, y, 0, verts[b + 3], verts[b + 4]
+  if math.abs(x) > ex then ex = math.abs(x) end
+  if math.abs(y) > ey then ey = math.abs(y) end
+end
+m = m - m % 3
+if m <= 0 then return end
+for i = #list, m + 1, -1 do list[i] = nil end
+
+-- 描く先: 中心をそろえたまま、変形した絵が収まるまで上下・左右を同じだけ広げる（元の絵と画素の位置がそろう）。
+-- image_max に収め、総ドット数を SIZE_BUDGET 以下に抑える（重さの上限。はみ出した所は切れる）。
+-- tempbuffer は cache と 1600 万ドットの枠を共有する（au2-filter-object）ので、半分の 800 万までにする
+local SIZE_BUDGET = 8000000
+local max_w, max_h = obj.getinfo("image_max")
+max_w, max_h = max_w or 16384, max_h or 16384
+local pad_x = math.min(math.max(0, math.ceil(ex - W0 / 2)) + 2, math.max(0, math.floor((max_w - W0) / 2)))
+local pad_y = math.min(math.max(0, math.ceil(ey - H0 / 2)) + 2, math.max(0, math.floor((max_h - H0) / 2)))
+local px, py = 0, 0
+for k = 64, 0, -1 do
+  px, py = math.floor(pad_x * k / 64), math.floor(pad_y * k / 64)
+  if (W0 + 2 * px) * (H0 + 2 * py) <= SIZE_BUDGET then break end
+end
+local TW, TH = W0 + 2 * px, H0 + 2 * py
+
+obj.setoption("drawtarget", "tempbuffer", TW, TH)
+obj.drawpoly(list, 3)
+if show_mesh == 1 then
+  -- 三角網の線（辺ごとに幅 1.5px の四角。色はストレートで渡す: au2-shader-lua）
+  local wire = G.wire
+  local q = 0
+  local HW = 0.75
+  local function put(x, y)
+    q = q + 1
+    local v = wire[q]
+    if v == nil then
+      v = {}
+      wire[q] = v
+    end
+    v[1], v[2], v[3], v[4], v[5], v[6], v[7] = x, y, 0, 1, 0.82, 0.25, 0.9
+  end
+  for t = 0, m / 3 - 1 do
+    for e = 0, 2 do
+      local a = list[t * 3 + e + 1]
+      local c = list[t * 3 + (e + 1) % 3 + 1]
+      local dx, dy = c[1] - a[1], c[2] - a[2]
+      local len = math.sqrt(dx * dx + dy * dy)
+      if len > 1e-6 then
+        local nx, ny = -dy / len * HW, dx / len * HW
+        put(a[1] - nx, a[2] - ny)
+        put(c[1] - nx, c[2] - ny)
+        put(c[1] + nx, c[2] + ny)
+        put(a[1] + nx, a[2] + ny)
+      end
+    end
+  end
+  for i = #wire, q + 1, -1 do wire[i] = nil end
+  if q > 0 then obj.drawpoly(wire, 4) end
+end
+obj.setoption("drawtarget", "framebuffer")
+obj.copybuffer("object", "tempbuffer")

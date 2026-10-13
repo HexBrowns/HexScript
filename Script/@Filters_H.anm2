@@ -3752,3 +3752,1169 @@ obj.pixelshader("ps_hf_main", "object", {"object", res_atlas}, {
   vis * latent_amount / 100, i0, i1, tt,
   nf,
 }, "copy", "clamp")
+
+@多面体ガラス
+--information:多面体ガラス@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@strength:強さ,0,100,100,0.1
+--select@mode:モード=0,ボロノイ=0,三角形=1
+--track@cell:面サイズ,8,300,72,0.1
+--track@irregular:不規則さ,0,100,65,0.1
+--track@bump:凹凸,0,200,55,0.1
+--track@split_angle:分割角度,-180,180,0,0.1
+--track@wobble:ゆらぎ,-360,360,0,0.1
+--track@seed:シード,0,10000,0,1
+--track@refract:屈折,0,100,18,0.1
+--track@ior:屈折率,1,2.5,1.5,0.01
+--track@dispersion:分散,0,100,35,0.1
+--track@reflect:反射,0,200,55,0.1
+--track@sparkle:きらめき,0,200,40,0.1
+--track@edge:面境界,0,10,1,0.1
+--track@light_az:光源角度,-180,180,-35,0.1
+--track@light_el:光源高度,1,89,45,0.1
+--group:色ガラス,false
+--track@tint:色の濃さ,0,100,0,0.1
+--select@tint_mode:色の付け方=0,面ごとに散らす=0,単色=1
+--color@glass_color:ガラスの色,0x60a0ff
+--group
+--hide@irregular:mode==1
+--hide@glass_color:tint_mode==0
+--[[pixelshader@ps_fg_main:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float3 light;
+    float strength;
+    float3 tint_col;
+    float tint;
+    float2 size;
+    float2 rot;
+    float cell_px;
+    float irregular;
+    float bump;
+    float wobble_phase;
+    float seed;
+    float refract_px;
+    float ior;
+    float disp_b;
+    float reflect_amt;
+    float sparkle;
+    float sparkle_time;
+    float edge_px;
+    float mode;
+    float tint_mode;
+};
+static const float FG_ROW = 0.8660254;
+// 整数のハッシュ（ホログラム箔と同じ形。float の frac(sin) はシードが大きいと潰れる）
+uint fg_hash(int2 c, uint s) {
+    uint h = ((uint)c.x * 1597334677u) ^ ((uint)c.y * 3812015801u) ^ (s * 2654435761u);
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+float fg_u01(uint h) {
+    return float(h >> 8) * (1.0 / 16777216.0);
+}
+// ボロノイの種: 六角格子（奇数の行を 0.5 ずらし、行間 √3/2）に、不規則さ × ±0.5 のずれ。不規則さ 0 で正六角形の面
+float2 fg_seed(int2 c) {
+    uint s = (uint)seed;
+    float jx = fg_u01(fg_hash(c, s * 2u + 1u)) - 0.5;
+    float jy = fg_u01(fg_hash(c, s * 2u + 2u)) - 0.5;
+    float odd = float(((uint)c.y) & 1u);
+    return float2(float(c.x) + 0.5 * odd + jx * irregular, float(c.y) * FG_ROW + jy * irregular);
+}
+// 最も近い種（周り 5x5）と、面の縁までの距離（F1 の周り 5x5 の種との垂直二等分線までの最短。F2 − F1 では近似しない）
+void fg_voronoi(float2 q, out int2 id, out float edge) {
+    int j0 = (int)floor(q.y / FG_ROW);
+    float odd0 = float(((uint)j0) & 1u);
+    int i0 = (int)floor(q.x - 0.5 * odd0);
+    float best = 1e9;
+    int2 bc = int2(0, 0);
+    float2 bs = float2(0.0, 0.0);
+    [loop] for (int dj = -2; dj <= 2; dj++) {
+        [loop] for (int di = -2; di <= 2; di++) {
+            int2 c = int2(i0 + di, j0 + dj);
+            float2 s = fg_seed(c);
+            float d = dot(s - q, s - q);
+            if (d < best) {
+                best = d;
+                bc = c;
+                bs = s;
+            }
+        }
+    }
+    float m = 1e9;
+    [loop] for (int ej = -2; ej <= 2; ej++) {
+        [loop] for (int ei = -2; ei <= 2; ei++) {
+            if (ei == 0 && ej == 0) {
+                continue;
+            }
+            float2 s = fg_seed(bc + int2(ei, ej));
+            float2 dv = s - bs;
+            float len = length(dv);
+            if (len > 1e-5) {
+                m = min(m, dot(0.5 * (bs + s) - q, dv / len));
+            }
+        }
+    }
+    id = bc;
+    edge = m;
+}
+// 正三角形の敷き詰め（一辺 1）。斜交座標の整数部と上下で面の番号、縁は重心座標の最小 × 高さ
+void fg_tri(float2 q, out int2 id, out float edge) {
+    float a = q.x - q.y * 0.5773503;
+    float b = q.y / FG_ROW;
+    float ia = floor(a);
+    float ib = floor(b);
+    float fa = a - ia;
+    float fb = b - ib;
+    bool up = fa + fb > 1.0;
+    float m = up ? min(min(1.0 - fa, 1.0 - fb), fa + fb - 1.0) : min(min(fa, fb), 1.0 - fa - fb);
+    id = int2((int)ia * 2 + (up ? 1 : 0), (int)ib);
+    edge = m * FG_ROW;
+}
+float3 fg_fetch(float2 pp, float3 fallback) {
+    float4 c = src.SampleLevel(smp, pp / size, 0);
+    return (c.a > 0.0001) ? c.rgb / c.a : fallback;
+}
+float3 fg_hue(float h) {
+    float3 k = saturate(abs(frac(float3(h, h, h) + float3(0.0, 0.6666667, 0.3333333)) * 6.0 - 3.0) - 1.0);
+    return lerp(float3(1.0, 1.0, 1.0), k, 0.6);
+}
+// 面ごとに傾いたガラス: 屈折（チャンネルごとの屈折率で色分散）・Fresnel の反射・鏡面・面の縁・きらめき。アルファは元のまま
+float4 ps_fg_main(float4 pos : SV_Position) : SV_Target {
+    float2 p = pos.xy;
+    float4 c0 = src.Load(int3(int2(p), 0));
+    if (c0.a <= 0.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    float3 st0 = c0.rgb / c0.a;
+    float2 d = (p - size * 0.5) / cell_px;
+    float2 q = float2(rot.x * d.x + rot.y * d.y, -rot.y * d.x + rot.x * d.y);
+    int2 id = int2(0, 0);
+    float edge = 0.0;
+    if (mode < 0.5) {
+        fg_voronoi(q, id, edge);
+    } else {
+        fg_tri(q, id, edge);
+    }
+    uint s = (uint)seed;
+    float h1 = fg_u01(fg_hash(id, s * 7u + 11u));
+    float h2 = fg_u01(fg_hash(id, s * 7u + 12u));
+    float h3 = fg_u01(fg_hash(id, s * 7u + 13u));
+    float2 t = (float2(h1, h2) - 0.5) * 2.0 * bump;
+    float tl = length(t);
+    if (tl > 1.0) {
+        t /= tl;
+    }
+    float ph = wobble_phase * (0.5 + h3);
+    float cp = cos(ph);
+    float sp = sin(ph);
+    t = float2(cp * t.x - sp * t.y, sp * t.x + cp * t.y);
+    float3 n = normalize(float3(-t.x, -t.y, 1.0));
+    // Cauchy: n(λ) = ior + B·(1/λ² − 1/λ_G²)、λ = 0.65 / 0.55 / 0.45 µm
+    float kr = 0.0;
+    float kg = 0.0;
+    float kb = 0.0;
+    if (ior > 1.0001) {
+        kr = max(ior - 0.9389 * disp_b - 1.0, 0.0) / (ior - 1.0);
+        kg = 1.0;
+        kb = (ior + 1.6325 * disp_b - 1.0) / (ior - 1.0);
+    }
+    float2 base = n.xy * refract_px;
+    float3 refr = float3(0.0, 0.0, 0.0);
+    refr.r = fg_fetch(p + base * kr, st0).r;
+    refr.g = fg_fetch(p + base * kg, st0).g;
+    refr.b = fg_fetch(p + base * kb, st0).b;
+    float3 tc = tint_col;
+    if (tint_mode < 0.5) {
+        tc = fg_hue(fg_u01(fg_hash(id, s * 7u + 14u)));
+    }
+    refr *= lerp(float3(1.0, 1.0, 1.0), tc, tint);
+    float f0 = (ior - 1.0) / (ior + 1.0);
+    f0 *= f0;
+    float fr = f0 + (1.0 - f0) * pow(saturate(1.0 - n.z), 5.0);
+    float3 hv = normalize(light + float3(0.0, 0.0, 1.0));
+    float spec = pow(saturate(dot(n, hv)), 64.0);
+    float ed = 0.0;
+    if (edge_px > 0.0) {
+        ed = (1.0 - smoothstep(0.0, edge_px, edge * cell_px)) * (0.3 + 0.7 * spec);
+    }
+    float fl = 0.0;
+    if (sparkle > 0.0) {
+        uint k = (uint)floor(sparkle_time * 8.0 + h3 * 8.0);
+        float hs = fg_u01(fg_hash(id, s * 7u + 15u + k * 131u));
+        if (hs > 1.0 - 0.03 * sparkle) {
+            fl = pow(spec, 0.25);
+        }
+    }
+    float3 glass = refr * (1.0 - fr * reflect_amt) + (fr * 0.6 + spec + ed + fl) * reflect_amt;
+    // 鏡面・縁・きらめきを足すと 1 を超えるので収める（乗算済みで rgb ≤ a を保つ）
+    glass = saturate(glass);
+    float3 o = lerp(st0, glass, strength);
+    return float4(o * c0.a, c0.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- 多面体ガラス: 画像をボロノイ（または正三角形）の面に割り、面ごとに傾いたガラスとして屈折・色分散・反射・面の縁・きらめきを付ける。
+-- 仕様: AI/specifications/20261009_多面体ガラス_H_spec.md。検証器: AI/scripts/Filters_H/verify_facet.py
+-- 面は画像に貼り付く（オブジェクトを回すと面も回る）。オブジェクトの外は見えないので、背景ごと屈折させるならフィルタオブジェクトに置く
+
+if strength <= 0 then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+local az, el = math.rad(light_az), math.rad(light_el)
+local ang = math.rad(split_angle)
+local gr, gg, gb = RGB(glass_color)
+obj.pixelshader("ps_fg_main", "object", {"object"}, {
+  math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el), strength / 100,
+  gr / 255, gg / 255, gb / 255, tint / 100,
+  w, h, math.cos(ang), math.sin(ang),
+  cell, irregular / 100, bump / 100, math.rad(wobble) * obj.time,
+  seed, refract, ior, 0.02 * dispersion / 100,
+  reflect / 100, sparkle / 100, obj.time, edge,
+  mode, tint_mode,
+}, "copy", "clamp")
+
+@レンズの汚れ
+--information:レンズの汚れ@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@threshold:しきい値,0,100,60,0.1
+--track@spread:光の広がり,1,500,80,0.1
+--track@strength:汚れの強さ,0,400,100,0.1
+--track@density:汚れの量,0,100,50,0.1
+--track@dirt_size:汚れの大きさ,10,400,100,0.1
+--track@seed:シード,0,9999,0,1
+--select@color_mode:色=0,光の色=0,指定=1
+--color@dirt_color:汚れの色,0xFFF0DC
+--hide@dirt_color:color_mode==0
+--select@blend_mode:合成=0,加算=0,スクリーン=1
+--check@show_dirt:汚れを表示,0
+--[[pixelshader@ps_ld_bright:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 src_size;
+    float factor;
+    float threshold;
+};
+// factor x factor 画素の平均（はみ出した画素は数えない）。しきい値より明るい分だけを光として残す。
+// 光 = ストレートの色 x saturate((明るさ - しきい値) / (1 - しきい値)) x α。a は 1
+float4 ps_ld_bright(float4 pos : SV_Position) : SV_Target {
+    int fi = int(factor);
+    int2 p0 = int2(pos.xy) * fi;
+    int2 m = int2(src_size) - int2(1, 1);
+    float3 acc = float3(0.0, 0.0, 0.0);
+    float n = 0.0;
+    float knee = max(1.0 - threshold, 0.001);
+    [loop] for (int j = 0; j < fi; j++) {
+        [loop] for (int i = 0; i < fi; i++) {
+            int2 q = p0 + int2(i, j);
+            float inside = (q.x <= m.x && q.y <= m.y) ? 1.0 : 0.0;
+            float4 c = src.Load(int3(min(q, m), 0));
+            float3 s = (c.a > 0.001) ? c.rgb / c.a : float3(0.0, 0.0, 0.0);
+            float y = dot(s, float3(0.2126, 0.7152, 0.0722));
+            float k = saturate((y - threshold) / knee);
+            acc += s * (k * c.a * inside);
+            n += inside;
+        }
+    }
+    return float4(acc / max(n, 1.0), 1.0);
+}
+]]
+--[[pixelshader@ps_ld_blur:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 size;
+    float2 dir;
+    float sigma;
+    float radius;
+};
+// 1 方向のガウスぼかし。外は数えずに、内側の重みの和で割り直す（画面の端でも光が弱まらない）
+float4 ps_ld_blur(float4 pos : SV_Position) : SV_Target {
+    float2 p = floor(pos.xy);
+    int r = int(radius);
+    float inv2s2 = 1.0 / max(2.0 * sigma * sigma, 0.0001);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    [loop] for (int k = -r; k <= r; k++) {
+        float2 q = p + dir * float(k);
+        float inside = (q.x >= 0.0 && q.y >= 0.0 && q.x < size.x && q.y < size.y) ? 1.0 : 0.0;
+        float wt = exp(-float(k * k) * inv2s2) * inside;
+        float2 qc = clamp(q, float2(0.0, 0.0), size - float2(1.0, 1.0));
+        acc += src.Load(int3(int(qc.x), int(qc.y), 0)) * wt;
+        wsum += wt;
+    }
+    return acc / max(wsum, 0.0001);
+}
+]]
+--[[pixelshader@ps_ld_apply:
+Texture2D src : register(t0);
+Texture2D light_tex : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float3 dirt_rgb;
+    float strength;
+    float2 light_scale;
+    float cell;
+    float density;
+    float seed;
+    float color_mode;
+    float blend_mode;
+    float show_dirt;
+};
+// 升目・種ごとの整数ハッシュ（0〜1）。混ぜ方は @暗所視 の sv_hash と同じ。升目は負になり得るので底上げしてから uint にする
+float ld_hash(int2 c, uint k) {
+    uint2 u = uint2(c + int2(65536, 65536));
+    uint h = (u.x * 1597334677u) ^ (u.y * 3812015801u) ^ (k * 2654435761u);
+    h = h ^ (h >> 16);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16);
+    return float(h & 0x00ffffffu) / 16777216.0;
+}
+// 値ノイズ（格子の乱数を smoothstep でつなぐ。0〜1）
+float ld_vnoise(float2 p, uint k) {
+    float2 g = floor(p);
+    float2 fr = p - g;
+    float2 t = fr * fr * (3.0 - 2.0 * fr);
+    int2 gi = int2(g);
+    float a = ld_hash(gi, k);
+    float b = ld_hash(gi + int2(1, 0), k);
+    float c = ld_hash(gi + int2(0, 1), k);
+    float d = ld_hash(gi + int2(1, 1), k);
+    return lerp(lerp(a, b, t.x), lerp(c, d, t.x), t.y);
+}
+// ほこり: 升目 cs ごとに確率 prob で丸い粒を 1 つ置く（中心は升目の中、半径は cs の rmin〜rmax 倍で 1 以下。隣の升目までで足りる）。
+// 縁がわずかに明るい（ボケた粒の形）
+float ld_spots(float2 p, float cs, uint k, float prob, float rmin, float rmax, float soft) {
+    int2 g = int2(floor(p / cs));
+    float acc = 0.0;
+    [loop] for (int j = -1; j <= 1; j++) {
+        [loop] for (int i = -1; i <= 1; i++) {
+            int2 gc = g + int2(i, j);
+            float present = (ld_hash(gc, k) < prob) ? 1.0 : 0.0;
+            float2 ctr = (float2(gc) + float2(ld_hash(gc, k + 1u), ld_hash(gc, k + 2u))) * cs;
+            float rad = lerp(rmin, rmax, ld_hash(gc, k + 3u)) * cs;
+            float amp = lerp(0.35, 1.0, ld_hash(gc, k + 4u));
+            float d = length(p - ctr) / max(rad, 0.001);
+            float body = 1.0 - smoothstep(1.0 - soft, 1.0, d);
+            float rim = smoothstep(0.55, 0.95, d) * body * 0.35;
+            acc = max(acc, (body * 0.75 + rim) * amp * present);
+        }
+    }
+    return acc;
+}
+// 指紋: 升目 cs ごとに確率 prob で楕円の渦（同心の縞）を置く（中心は升目の 0.3〜0.7、半径は 0.45 升目まで）
+float ld_prints(float2 p, float cs, uint k, float prob, float ridge) {
+    int2 g = int2(floor(p / cs));
+    float acc = 0.0;
+    float wob = (ld_vnoise(p / max(ridge * 3.0, 1.0), k + 5u) - 0.5) * ridge * 1.5;
+    [loop] for (int j = -1; j <= 1; j++) {
+        [loop] for (int i = -1; i <= 1; i++) {
+            int2 gc = g + int2(i, j);
+            float present = (ld_hash(gc, k) < prob) ? 1.0 : 0.0;
+            float2 ctr = (float2(gc) + 0.3 + 0.4 * float2(ld_hash(gc, k + 1u), ld_hash(gc, k + 2u))) * cs;
+            float rad = lerp(0.25, 0.45, ld_hash(gc, k + 3u)) * cs;
+            float ang = ld_hash(gc, k + 4u) * 3.14159265;
+            float2 dv = p - ctr;
+            float2 rv = float2(dv.x * cos(ang) + dv.y * sin(ang), (dv.y * cos(ang) - dv.x * sin(ang)) * 1.35);
+            float d = length(rv);
+            float rings = 0.5 + 0.5 * cos(6.2831853 * (d + wob) / max(ridge, 0.5));
+            float mask = 1.0 - smoothstep(rad * 0.55, rad, d);
+            acc = max(acc, rings * mask * present * 0.6);
+        }
+    }
+    return acc;
+}
+// 傷: 升目 cs ごとに確率 prob で細い線分を置く（中心は升目の 0.3〜0.7、半分の長さは 0.3〜0.7 升目。隣の升目までで足りる）
+float ld_scratch(float2 p, float cs, uint k, float prob, float width_px) {
+    int2 g = int2(floor(p / cs));
+    float acc = 0.0;
+    [loop] for (int j = -1; j <= 1; j++) {
+        [loop] for (int i = -1; i <= 1; i++) {
+            int2 gc = g + int2(i, j);
+            float present = (ld_hash(gc, k) < prob) ? 1.0 : 0.0;
+            float2 ctr = (float2(gc) + 0.3 + 0.4 * float2(ld_hash(gc, k + 1u), ld_hash(gc, k + 2u))) * cs;
+            float ang = ld_hash(gc, k + 3u) * 3.14159265;
+            float half_len = lerp(0.3, 0.7, ld_hash(gc, k + 4u)) * cs;
+            float amp = lerp(0.3, 1.0, ld_hash(gc, k + 5u));
+            float2 dir_v = float2(cos(ang), sin(ang));
+            float2 dv = p - ctr;
+            float along = dot(dv, dir_v);
+            float t = clamp(along, -half_len, half_len);
+            float d = length(dv - dir_v * t);
+            float fade = 1.0 - smoothstep(half_len * 0.6, half_len, abs(along));
+            acc = max(acc, (1.0 - smoothstep(width_px * 0.5, width_px * 0.5 + 0.8, d)) * amp * fade * present);
+        }
+    }
+    return acc;
+}
+// 汚れ（0〜1）がある所に、ぼかした光を浮かべる。汚れはバッファの画素に固定（フィルタオブジェクトなら画面に固定）
+float4 ps_ld_apply(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c = src.Load(int3(int(pos.x), int(pos.y), 0));
+    float2 p = pos.xy;
+    uint s0 = uint(seed) * 7919u;
+    float cs = max(cell, 2.0);
+    float dens = saturate(density);
+    // 小さなほこり・大きなボケた粒・にじみ・指紋・傷を重ねる（どれも 0〜1。汚れの量 0 ではどれも 0）
+    float sp_small = ld_spots(p, cs, s0 + 11u, dens * 0.6, 0.12, 0.35, 0.35);
+    float sp_big = ld_spots(p, cs * 3.5, s0 + 31u, dens * 0.3, 0.25, 0.6, 0.6) * 0.7;
+    float fbm = ld_vnoise(p / (cs * 6.0), s0 + 51u) * 0.5 + ld_vnoise(p / (cs * 3.0), s0 + 52u) * 0.3 + ld_vnoise(p / (cs * 1.5), s0 + 53u) * 0.2;
+    float th = lerp(0.8, 0.45, dens);
+    float smear = smoothstep(th, th + 0.25, fbm) * 0.45 * saturate(dens * 5.0);
+    float fp_v = ld_prints(p, cs * 8.0, s0 + 71u, dens * 0.35, max(cs * 0.12, 2.0));
+    float sc_v = ld_scratch(p, cs * 5.0, s0 + 91u, dens * 0.5, max(cs * 0.03, 0.8));
+    float dirt = saturate(sp_small + sp_big + smear + fp_v + sc_v * 0.7);
+    if (show_dirt > 0.5) return float4(dirt * c.a, dirt * c.a, dirt * c.a, c.a);
+    if (c.a <= 0.001) return c;
+    // 光のバッファは縮小の端数の分だけ元より広いので、uv を縮めて合わせる
+    float3 lt = light_tex.SampleLevel(smp, uv * light_scale, 0).rgb;
+    float ly = dot(lt, float3(0.2126, 0.7152, 0.0722));
+    float3 glow = ((color_mode > 0.5) ? dirt_rgb * ly : lt) * (dirt * strength);
+    float3 s = c.rgb / c.a;
+    float3 o = s + glow;
+    if (blend_mode > 0.5) o = 1.0 - (1.0 - saturate(s)) * (1.0 - saturate(glow));
+    return float4(saturate(o) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- レンズの汚れ（Optical Flares / Deep Glow のレンズの汚れ）。しきい値より明るい所を大きくぼかした光が当たる所だけ、
+-- 手続きで作った汚れ（ほこり・ボケた粒・にじみ・指紋・傷。シードで変わる）が浮かぶ。汚れの無い所と光の無い所は 1 段階も変えない。
+-- 仕様: AI/specifications/20261012_Filters_H_AE候補_spec.md。検証器: AI/scripts/Filters_H/verify_ae_sections.py
+-- 大きさは変えない（出入りとも obj.w x obj.h）のでフィルタオブジェクトにも置ける
+
+local show = (show_dirt == 1)
+if strength <= 0 and not show then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+
+local function hex_rgb(v)
+  v = math.floor(tonumber(v) or 0)
+  return math.floor(v / 65536) % 256 / 255, math.floor(v / 256) % 256 / 255, v % 256 / 255
+end
+
+-- 光: 縮小（縮小後の σ が 12 px 以下になる 2 のべき。最小 4、最大 64）→ 横・縦のガウスぼかし
+local s = math.max(spread, 1)
+local f = 4
+while s / f > 12 and f < 64 do f = f * 2 end
+local lw, lh = math.max(1, math.ceil(w / f)), math.max(1, math.ceil(h / f))
+local sl = s / f
+local r = math.max(1, math.ceil(3 * sl))
+
+obj.copybuffer("cache:ld/src", "object")
+obj.clearbuffer("cache:ld/a", lw, lh)
+obj.pixelshader("ps_ld_bright", "cache:ld/a", {"cache:ld/src"}, { w, h, f, threshold / 100 }, "copy", "dot")
+obj.clearbuffer("cache:ld/b", lw, lh)
+obj.pixelshader("ps_ld_blur", "cache:ld/b", {"cache:ld/a"}, { lw, lh, 1, 0, sl, r }, "copy", "dot")
+obj.pixelshader("ps_ld_blur", "cache:ld/a", {"cache:ld/b"}, { lw, lh, 0, 1, sl, r }, "copy", "dot")
+
+-- 汚れの升目: 汚れの大きさ 100% で 40 px（画面の高さ 1080 px のとき。画面の高さに比例）
+local sh = obj.screen_h or h
+if sh == nil or sh < 1 then sh = h end
+local cell = math.max(2, 40 * dirt_size / 100 * sh / 1080)
+local dr, dg, db = hex_rgb(dirt_color)
+obj.pixelshader("ps_ld_apply", "object", {"cache:ld/src", "cache:ld/a"}, {
+  dr, dg, db, strength / 100,
+  w / (lw * f), h / (lh * f), cell, density / 100,
+  math.floor(seed + 0.5), color_mode, blend_mode, show and 1 or 0,
+}, "copy", "clamp")
+
+@古いフィルム
+--information:古いフィルム@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@scratch_amount:傷の量,0,100,30,0.1
+--track@scratch_width:傷の太さ,0.5,20,1.5,0.01
+--select@scratch_color:傷の色=0,白=0,黒=1,両方=2
+--track@dust_amount:ゴミの量,0,100,30,0.1
+--track@dust_size:ゴミの大きさ,0.5,30,3,0.01
+--select@dust_color:ゴミの色=2,白=0,黒=1,両方=2
+--track@weave:揺れ,0,50,2,0.01
+--track@flicker:明滅,0,100,15,0.1
+--track@seed:シード,0,9999,0,1
+--[[pixelshader@ps_of_main:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float4 scr[10];
+    float4 scr_y[10];
+    float2 img_size;
+    float2 offset;
+    float gain;
+    float frame;
+    float seed;
+    float dust_prob;
+    float dust_cell;
+    float dust_size;
+    float dust_color;
+    float pad0;
+};
+// 升目・種ごとの整数ハッシュ（0〜1）。混ぜ方は @暗所視 の sv_hash と同じ
+float of_hash(int2 c, uint k) {
+    uint2 u = uint2(c + int2(65536, 65536));
+    uint h = (u.x * 1597334677u) ^ (u.y * 3812015801u) ^ (k * 2654435761u);
+    h = h ^ (h >> 16);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16);
+    return float(h & 0x00ffffffu) / 16777216.0;
+}
+// 揺れでずらして読み、明滅を掛け、縦の傷とゴミ（粒と毛）を重ねる。傷とゴミはフィルムの座標（ずらした後）に描く
+float4 ps_of_main(float4 pos : SV_Position) : SV_Target {
+    float2 pf = pos.xy - offset;
+    float4 c = src.SampleLevel(smp, pf / img_size, 0);
+    if (c.a <= 0.001) return float4(0.0, 0.0, 0.0, 0.0);
+    float3 s = c.rgb / c.a * gain;
+    // 縦の傷: scr = (x, 半分の太さ, 濃さ（正は白・負は黒）, 0)、scr_y = (上端, 下端, 0, 0)。濃さ 0 の枠は描かない
+    [loop] for (int i = 0; i < 10; i++) {
+        float4 sa = scr[i];
+        float4 sb = scr_y[i];
+        float xx = sa.x + 0.8 * sin(pf.y * 0.013 + float(i) * 1.7);
+        float cov = 1.0 - smoothstep(sa.y, sa.y + 0.75, abs(pf.x - xx));
+        float vy = smoothstep(sb.x, sb.x + 20.0, pf.y) * (1.0 - smoothstep(sb.y - 20.0, sb.y, pf.y));
+        float tgt = (sa.z >= 0.0) ? 1.0 : 0.04;
+        s = lerp(s, float3(tgt, tgt, tgt), saturate(cov * vy * abs(sa.z)));
+    }
+    // ゴミ: 升目 dust_cell ごとに、コマごとの確率 dust_prob で粒（8 割）か毛（2 割）を 1 つ置く
+    // （中心は升目の 0.25〜0.75。粒の半径は 2.4 x 大きさ、毛の円弧の半径は 5 x 大きさまでで、どちらも隣の升目までで足りる）
+    int2 g = int2(floor(pf / dust_cell));
+    uint fs = uint(frame) * 9781u + uint(seed) * 6271u;
+    [loop] for (int j = -1; j <= 1; j++) {
+        [loop] for (int i2 = -1; i2 <= 1; i2++) {
+            int2 gc = g + int2(i2, j);
+            float present = (of_hash(gc, fs) < dust_prob) ? 1.0 : 0.0;
+            float2 ctr = (float2(gc) + 0.25 + 0.5 * float2(of_hash(gc, fs + 1u), of_hash(gc, fs + 2u))) * dust_cell;
+            float is_hair = (of_hash(gc, fs + 3u) < 0.2) ? 1.0 : 0.0;
+            float pol = (dust_color < 0.5) ? 1.0 : ((dust_color < 1.5) ? -1.0 : ((of_hash(gc, fs + 4u) < 0.5) ? 1.0 : -1.0));
+            float2 dv = pf - ctr;
+            float dl = length(dv);
+            float ang = atan2(dv.y, dv.x);
+            float rad = dust_size * lerp(0.4, 1.6, of_hash(gc, fs + 5u))
+                * (1.0 + 0.3 * sin(3.0 * ang + 6.2831853 * of_hash(gc, fs + 6u)) + 0.15 * sin(5.0 * ang + 6.2831853 * of_hash(gc, fs + 7u)));
+            float speck = 1.0 - smoothstep(rad - 0.8, rad + 0.4, dl);
+            float hr = dust_size * lerp(2.0, 5.0, of_hash(gc, fs + 8u));
+            float a0 = of_hash(gc, fs + 9u) * 6.2831853;
+            float span = lerp(1.0, 2.5, of_hash(gc, fs + 10u));
+            float am = a0 + span * 0.5;
+            float dth = atan2(sin(ang - am), cos(ang - am));
+            float2 e1 = ctr + hr * float2(cos(a0), sin(a0));
+            float2 e2 = ctr + hr * float2(cos(a0 + span), sin(a0 + span));
+            float d_end = min(length(pf - e1), length(pf - e2));
+            float dh = (abs(dth) <= span * 0.5) ? abs(dl - hr) : d_end;
+            float hw = max(0.35, dust_size * 0.12);
+            float hair = 1.0 - smoothstep(hw, hw + 0.8, dh);
+            float m = lerp(speck, hair, is_hair) * present;
+            float tgt2 = (pol > 0.0) ? 1.0 : 0.03;
+            s = lerp(s, float3(tgt2, tgt2, tgt2), saturate(m * 0.95));
+        }
+    }
+    return float4(saturate(s) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+local bit = bit or require("bit")
+
+-- 古いフィルム（MisFire / Retrograde）。縦の傷・ゴミ（粒と毛）・揺れ・明滅を 1 つで出す。
+-- 傷・揺れ・明滅の乱数は Lua で決め（フレームとシードから。同じフレームなら毎回同じ）、ゴミはシェーダーで升目ごとに決める。
+-- 仕様: AI/specifications/20261012_Filters_H_AE候補_spec.md。検証器: AI/scripts/Filters_H/verify_ae_sections.py
+-- 大きさは変えない（出入りとも obj.w x obj.h）のでフィルタオブジェクトにも置ける。揺れで空く端は端の色で埋める
+
+if scratch_amount <= 0 and dust_amount <= 0 and weave <= 0 and flicker <= 0 then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+
+local N_SCR = 10
+local f = obj.frame
+local sd = math.floor(seed + 0.5)
+local band, bxor, rshift, lshift, tobit = bit.band, bit.bxor, bit.rshift, bit.lshift, bit.tobit
+
+-- 32bit の積の下位 32bit（倍精度で厳密に扱える 16bit ずつに割る。EffectUtils_Lowpoly の mul32 と同じ）
+local function mul32(a, b)
+  local a0, a1 = band(a, 0xffff), band(rshift(a, 16), 0xffff)
+  local b0, b1 = band(b, 0xffff), band(rshift(b, 16), 0xffff)
+  return tobit(a0 * b0 + lshift(band(a0 * b1 + a1 * b0, 0xffff), 16))
+end
+local K1, K2, K3, K4, K5 = tobit(1597334677), tobit(3812015801), tobit(2654435761), tobit(2246822519), tobit(3266489917)
+-- 0〜1 の乱数（整数 3 つとシードから。混ぜ方は @暗所視 の sv_hash と同じ）
+local function rnd(a, b, c)
+  local x = bxor(mul32(tobit(a), K1), mul32(tobit(b), K2), mul32(tobit(c), K3), mul32(tobit(sd), K4))
+  x = bxor(x, rshift(x, 16))
+  x = mul32(x, K4)
+  x = bxor(x, rshift(x, 13))
+  x = mul32(x, K5)
+  x = bxor(x, rshift(x, 16))
+  return band(x, 0xffffff) / 16777216
+end
+-- 時間方向の値ノイズ（-1〜1）。period フレームごとの乱数を smoothstep でつなぐ
+local function slow(salt, period)
+  local t = f / period
+  local i = math.floor(t)
+  local u = t - i
+  u = u * u * (3 - 2 * u)
+  local a, b = rnd(i, salt, 11), rnd(i + 1, salt, 11)
+  return (a + (b - a) * u) * 2 - 1
+end
+-- コマごとの乱数（-1〜1）
+local function fast(salt)
+  return rnd(f, salt, 13) * 2 - 1
+end
+
+-- 揺れ（px。|ずれ| は 揺れ 以下）と明滅（明るさの倍率。1 ± 明滅 / 2 の中）
+local dx = weave * (0.5 * fast(1) + 0.5 * slow(2, 12))
+local dy = weave * (0.5 * fast(3) + 0.5 * slow(4, 12))
+local gain = 1 + flicker / 100 * 0.5 * (0.6 * fast(5) + 0.4 * slow(6, 8))
+
+-- 縦の傷: 枠 N_SCR 本。枠 i は 4〜23 フレームの区間ごとに、傷の量の確率で現れる。
+-- 区間の間は同じ所にいて少しずつ流れ、コマごとに濃さが揺れる（1 割のコマは消える）
+local params = {}
+local ys = {}
+local prob = scratch_amount / 100
+for i = 0, N_SCR - 1 do
+  local dur = 4 + math.floor(rnd(i, 7001, 1) * 20)
+  local phase = math.floor(rnd(i, 7002, 1) * dur)
+  local k = math.floor((f + phase) / dur)
+  local t = (f + phase) - k * dur
+  local x, hw, inten, y0, y1 = -1000, 0, 0, 0, 0
+  if rnd(i, k, 7003) < prob then
+    x = (rnd(i, k, 7004) + (rnd(i, k, 7005) - 0.5) * 0.004 * t) * w + (rnd(i, f, 7006) - 0.5)
+    hw = scratch_width * (0.5 + rnd(i, k, 7007)) * 0.5
+    local on = (rnd(i, f, 7008) < 0.9) and 1 or 0
+    inten = (0.35 + 0.65 * rnd(i, k, 7009)) * (0.6 + 0.4 * rnd(i, f, 7010)) * on
+    if scratch_color == 1 or (scratch_color == 2 and rnd(i, k, 7011) < 0.5) then inten = -inten end
+    if rnd(i, k, 7012) < 0.7 then
+      y0, y1 = -100, h + 100
+    else
+      y0 = rnd(i, k, 7013) * 0.6 * h
+      y1 = math.min(h + 100, y0 + (0.3 + rnd(i, k, 7014) * 0.4) * h)
+    end
+  end
+  params[#params + 1] = x
+  params[#params + 1] = hw
+  params[#params + 1] = inten
+  params[#params + 1] = 0
+  ys[#ys + 1] = y0
+  ys[#ys + 1] = y1
+  ys[#ys + 1] = 0
+  ys[#ys + 1] = 0
+end
+for i = 1, #ys do params[#params + 1] = ys[i] end
+
+-- ゴミ: 升目は 64 px（画面の高さ 1080 px のとき）か 大きさ x 12 の大きい方。コマごとの確率は ゴミの量 x 5%
+local sh = obj.screen_h or h
+if sh == nil or sh < 1 then sh = h end
+local scale = sh / 1080
+local tail = {
+  w, h, dx, dy,
+  gain, f, sd, dust_amount / 100 * 0.05,
+  math.max(64 * scale, dust_size * 12), dust_size, dust_color, 0,
+}
+for i = 1, #tail do params[#params + 1] = tail[i] end
+
+obj.pixelshader("ps_of_main", "object", {"object"}, params, "copy", "clamp")
+
+@自動レベル補正
+--information:自動レベル補正@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--select@method:方式=0,レベル補正=0,コントラスト=1,カラー=2
+--select@base:基準=0,基準のフレームで固定=0,コマごと=1
+--track@ref_time:基準の時刻(秒),0,3600,0,0.01
+--hide@ref_time:base==1
+--track@clip_black:黒のクリップ(%),0,10,0.1,0.01
+--track@clip_white:白のクリップ(%),0,10,0.1,0.01
+--track@strength:強さ,0,100,100,0.1
+--[[pixelshader@ps_al_down:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 src_size;
+    float2 dst_size;
+};
+// 縮小（1 画素は元の 4x4 点の平均。乗算済みのまま。getpixeldata はストレートの 8bit で返す）
+float4 ps_al_down(float4 pos : SV_Position) : SV_Target {
+    float2 ratio = src_size / max(dst_size, float2(1.0, 1.0));
+    float2 base = floor(pos.xy) * ratio;
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    [loop] for (int j = 0; j < 4; j++) {
+        [loop] for (int i = 0; i < 4; i++) {
+            float2 p = base + (float2(i, j) + 0.5) * 0.25 * ratio;
+            acc += src.SampleLevel(smp, p / src_size, 0);
+        }
+    }
+    return acc / 16.0;
+}
+]]
+--[[pixelshader@ps_al_apply:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float3 black_pt;
+    float strength;
+    float3 white_pt;
+};
+// チャンネルごとに 黒 → 0、白 → 1 へ伸ばす（外は詰める）。強さで元と混ぜる。ストレートで計算して乗算済みへ戻す
+float4 ps_al_apply(float4 pos : SV_Position) : SV_Target {
+    float4 c = src.Load(int3(int(pos.x), int(pos.y), 0));
+    if (c.a <= 0.001) return c;
+    float3 s = c.rgb / c.a;
+    float3 rng = max(white_pt - black_pt, float3(0.0001, 0.0001, 0.0001));
+    float3 o = saturate((s - black_pt) / rng);
+    return float4(lerp(s, o, strength) * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+local ffi = require("ffi")
+
+-- 自動レベル補正（After Effects の Auto Levels / Auto Contrast / Auto Color を 1 つに）。
+--   レベル補正: チャンネルごとに、クリップを除いた最暗・最明を 0〜1 へ伸ばす（色かぶりも取れる）
+--   コントラスト: 3 チャンネルをまとめた分布で、同じ黒・白を 3 チャンネルに使う（色相は変わらない）
+--   カラー: 明るさで最も暗い・最も明るい画素（クリップの割合ぶん）の平均の色を黒・白にする（シャドウ・ハイライトを中立に）
+-- 分布は長辺 256 px に縮めた画像を getpixeldata（ストレートの 8bit）で読み、Lua で数える（α で重み付け）。
+-- 基準のフレームで固定: 基準のフレームを描いたときの黒・白を Lua のグローバル表に持ち、ほかのフレームはそれを使う
+-- （cache は 1 フレームの描画ごとに破棄されるので持ち越せない。lua.txt の obj.copybuffer）。
+-- 基準のフレームをまだ描いていなければ、そのフレームの画像で補正する（警告を 1 回出す）。基準のフレームを描くたびに数え直す。
+-- 仕様: AI/specifications/20261012_Filters_H_AE候補_spec.md。検証器: AI/scripts/Filters_H/verify_ae_sections.py
+-- 大きさは変えない（出入りとも obj.w x obj.h）のでフィルタオブジェクトにも置ける
+
+if strength <= 0 then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+
+local G = _AUTO_LEVELS_FILTERS_H or { states = {}, warned = {}, count = 0 }
+_AUTO_LEVELS_FILTERS_H = G
+local function warn_once(key, msg)
+  if not G.warned[key] then
+    G.warned[key] = true
+    print("@warn", "[自動レベル補正@Filters_H] " .. msg)
+  end
+end
+
+-- 黒と白の差の下限（伸ばす倍率は 10 倍まで。ほぼ一色の絵で雑音を拡大しない）
+local MIN_RANGE = 0.1
+local cb, cw = clip_black / 100, clip_white / 100
+
+-- 低い側から数えて、重みの累計が 割合 x 総量 を超えた最初の値（0〜255）。割合 0 なら画素のある最も低い値
+local function low_of(hist, total, frac)
+  local lim, cum = frac * total, 0
+  for v = 0, 255 do
+    cum = cum + hist[v + 1]
+    if cum > lim then return v end
+  end
+  return 255
+end
+-- 高い側から同じように数える
+local function high_of(hist, total, frac)
+  local lim, cum = frac * total, 0
+  for v = 255, 0, -1 do
+    cum = cum + hist[v + 1]
+    if cum > lim then return v end
+  end
+  return 0
+end
+-- 明るさで暗い側（from_top = false）か明るい側から、重み 割合 x 総量 ぶんの画素の平均の色（0〜255）。
+-- 割合 0 なら端の 1 段だけの平均。sr などは段ごとの Σ 色 x α
+local function tail_color(wy, sr, sg, sb, total, frac, from_top)
+  local target = math.max(frac * total, 1e-9)
+  local acc, ar, ag, ab = 0, 0, 0, 0
+  local v0, v1, st = 0, 255, 1
+  if from_top then v0, v1, st = 255, 0, -1 end
+  for v = v0, v1, st do
+    local wv = wy[v + 1]
+    if wv > 0 then
+      local k = math.min(wv, target - acc) / wv
+      ar, ag, ab = ar + sr[v + 1] * k, ag + sg[v + 1] * k, ab + sb[v + 1] * k
+      acc = acc + wv * k
+      if acc >= target then break end
+    end
+  end
+  if acc <= 0 then return nil end
+  return ar / acc, ag / acc, ab / acc
+end
+-- 黒と白の差が下限より小さければ、真ん中を保って広げる
+local function widen(b, wt)
+  if wt - b < MIN_RANGE then
+    local m = (b + wt) * 0.5
+    return m - MIN_RANGE * 0.5, m + MIN_RANGE * 0.5
+  end
+  return b, wt
+end
+
+-- 縮めた画像を読み、{黒 r, g, b, 白 r, g, b}（0〜1）を返す。読めなければ nil, "read"、画素が無ければ nil, "empty"
+local function collect()
+  local long = math.max(w, h)
+  local t = math.min(256, long)
+  local sw = math.max(1, math.floor(w * t / long + 0.5))
+  local sh = math.max(1, math.floor(h * t / long + 0.5))
+  obj.clearbuffer("cache:al/small", sw, sh)
+  obj.pixelshader("ps_al_down", "cache:al/small", {"object"}, { w, h, sw, sh }, "copy", "clamp")
+  local data, dw, dh = obj.getpixeldata("cache:al/small")
+  if data == nil or dw ~= sw or dh ~= sh then return nil, "read" end
+  local px = ffi.cast("const uint8_t*", data)
+  local hr, hg, hb, wy, sr, sg, sb = {}, {}, {}, {}, {}, {}, {}
+  for v = 1, 256 do
+    hr[v], hg[v], hb[v], wy[v], sr[v], sg[v], sb[v] = 0, 0, 0, 0, 0, 0, 0
+  end
+  local total = 0
+  for i = 0, sw * sh - 1 do
+    local a = px[i * 4 + 3]
+    if a > 0 then
+      local r, g, b = px[i * 4], px[i * 4 + 1], px[i * 4 + 2]
+      hr[r + 1] = hr[r + 1] + a
+      hg[g + 1] = hg[g + 1] + a
+      hb[b + 1] = hb[b + 1] + a
+      local l = math.floor(0.2126 * r + 0.7152 * g + 0.0722 * b + 0.5) + 1
+      wy[l] = wy[l] + a
+      sr[l], sg[l], sb[l] = sr[l] + r * a, sg[l] + g * a, sb[l] + b * a
+      total = total + a
+    end
+  end
+  if total <= 0 then return nil, "empty" end
+  local bl, wh = { 0, 0, 0 }, { 1, 1, 1 }
+  if method == 1 then
+    local hc = {}
+    for v = 1, 256 do hc[v] = hr[v] + hg[v] + hb[v] end
+    local b, wt = widen(low_of(hc, total * 3, cb) / 255, high_of(hc, total * 3, cw) / 255)
+    bl, wh = { b, b, b }, { wt, wt, wt }
+  elseif method == 2 then
+    local r0, g0, b0 = tail_color(wy, sr, sg, sb, total, cb, false)
+    local r1, g1, b1 = tail_color(wy, sr, sg, sb, total, cw, true)
+    if r0 == nil or r1 == nil then return nil, "empty" end
+    local lo, hi = { r0, g0, b0 }, { r1, g1, b1 }
+    for c = 1, 3 do bl[c], wh[c] = widen(lo[c] / 255, hi[c] / 255) end
+  else
+    local hs = { hr, hg, hb }
+    for c = 1, 3 do bl[c], wh[c] = widen(low_of(hs[c], total, cb) / 255, high_of(hs[c], total, cw) / 255) end
+  end
+  return { bl[1], bl[2], bl[3], wh[1], wh[2], wh[3] }
+end
+
+local lv, why = nil, nil
+if base == 1 then
+  lv, why = collect()
+else
+  local fps = obj.framerate
+  if fps == nil or fps <= 0 then fps = 30 end
+  -- 秒の設定値は最も近いフレームに丸める（au2-lua-pitfalls）。オブジェクトの長さの中に収める
+  local ref = math.max(0, math.floor(ref_time * fps + 0.5))
+  local tf = obj.totalframe
+  if tf ~= nil and tf >= 1 then ref = math.min(ref, tf - 1) end
+  local key = table.concat({ obj.scene_id or 0, obj.getinfo("origin_scene_id") or 0, obj.id or 0,
+                             obj.effect_id or 0, obj.index or 0 }, "/")
+  local sig = table.concat({ method, string.format("%.4f", cb), string.format("%.4f", cw), ref }, ",")
+  local st = G.states[key]
+  if obj.frame == ref then
+    lv, why = collect()
+    if lv ~= nil then
+      if st == nil then
+        G.count = G.count + 1
+        if G.count > 512 then G.states, G.count = {}, 1 end
+      end
+      G.states[key] = { sig = sig, lv = lv }
+    end
+  elseif st ~= nil and st.sig == sig then
+    lv = st.lv
+  else
+    warn_once("noref:" .. key .. ":" .. sig, "基準のフレーム（" .. ref .. "）をまだ描いていないので、このフレームの画像で補正しました。"
+              .. "基準のフレームを一度表示すると固定されます")
+    lv, why = collect()
+  end
+end
+if lv == nil then
+  if why == "read" then warn_once("read", "縮めた画像を読み戻せなかったので効果を適用しません") end
+  return
+end
+
+obj.pixelshader("ps_al_apply", "object", {"object"}, {
+  lv[1], lv[2], lv[3], strength / 100,
+  lv[4], lv[5], lv[6],
+}, "copy", "dot")
+
+@美肌
+--information:美肌@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--track@smooth:なめらかさ,0,100,50,0.1
+--track@radius:半径,1,50,6,0.01
+--track@edge_keep:縁の保持,0,100,60,0.1
+--track@skin_hue:肌の色相,0,360,25,0.1
+--track@hue_range:範囲,0,90,25,0.1
+--track@sat_min:彩度の下限,0,100,10,0.1
+--track@sat_max:彩度の上限,0,100,80,0.1
+--check@show_mask:マスクを表示,0
+--[[pixelshader@ps_sk_bilat:
+Texture2D src : register(t0);
+Texture2D guide : register(t1);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 size;
+    float2 dir;
+    float sigma;
+    float inv2sr2;
+    float step_px;
+    float taps;
+};
+// 1 方向のバイラテラル（縁を残すぼかし）。色の近さは元の画像（guide）で測る（2 回目も元の画像で測る＝ジョイント）。
+// 乗算済みのまま重みを掛けて足すので、透明な画素は色に効かない
+float4 ps_sk_bilat(float4 pos : SV_Position) : SV_Target {
+    float4 g0 = guide.Load(int3(int(pos.x), int(pos.y), 0));
+    float3 c0 = (g0.a > 0.001) ? g0.rgb / g0.a : float3(0.0, 0.0, 0.0);
+    float inv2s2 = 1.0 / max(2.0 * sigma * sigma, 0.0001);
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    float wsum = 0.0;
+    int n = int(taps);
+    [loop] for (int k = -n; k <= n; k++) {
+        float off = float(k) * step_px;
+        float2 uvq = (pos.xy + dir * off) / size;
+        float4 sv = src.SampleLevel(smp, uvq, 0);
+        float4 gv = guide.SampleLevel(smp, uvq, 0);
+        float3 cg = (gv.a > 0.001) ? gv.rgb / gv.a : c0;
+        float3 dc = cg - c0;
+        float wt = exp(-off * off * inv2s2 - dot(dc, dc) * inv2sr2);
+        acc += sv * wt;
+        wsum += wt;
+    }
+    return acc / max(wsum, 0.000001);
+}
+]]
+--[[pixelshader@ps_sk_final:
+Texture2D src : register(t0);
+Texture2D smoothed : register(t1);
+cbuffer constant0 : register(b0) {
+    float skin_hue;
+    float hue_range;
+    float hue_feather;
+    float sat_min;
+    float sat_max;
+    float smooth_amt;
+    float show_mask;
+};
+// 正本: @バイブランス の rgb2hsv_vb（同じ式）
+float3 rgb2hsv_sk(float3 c) {
+    float4 K = float4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+    float4 p = c.g < c.b ? float4(c.bg, K.wz) : float4(c.gb, K.xy);
+    float4 q = c.r < p.x ? float4(p.xyw, c.r) : float4(c.r, p.yzx);
+    float d = q.x - min(q.w, q.y);
+    return float3(abs(q.z + (q.w - q.y) / (6.0 * max(d, 1e-10))), d / max(q.x, 1e-10), q.x);
+}
+// 肌のマスク（色相が 肌の色相 ± 範囲、彩度が下限〜上限、暗すぎない）をぼかした色で作り、その範囲だけぼかした色へ寄せる
+float4 ps_sk_final(float4 pos : SV_Position) : SV_Target {
+    int3 ip = int3(int(pos.x), int(pos.y), 0);
+    float4 c = src.Load(ip);
+    if (c.a <= 0.001) return c;
+    float4 v = smoothed.Load(ip);
+    float3 s = c.rgb / c.a;
+    float3 sm = (v.a > 0.001) ? v.rgb / v.a : s;
+    float3 hsv = rgb2hsv_sk(saturate(sm));
+    float hd = abs(hsv.x * 360.0 - skin_hue);
+    hd = min(hd, 360.0 - hd);
+    float m_h = 1.0 - smoothstep(hue_range, hue_range + hue_feather, hd);
+    float m_s = smoothstep(sat_min - 0.05, sat_min + 0.05, hsv.y) * (1.0 - smoothstep(sat_max - 0.05, sat_max + 0.05, hsv.y));
+    float m_v = smoothstep(0.08, 0.2, hsv.z);
+    float mask = m_h * m_s * m_v;
+    if (show_mask > 0.5) return float4(mask * c.a, mask * c.a, mask * c.a, c.a);
+    float3 o = lerp(s, sm, smooth_amt * mask);
+    return float4(o * c.a, c.a);
+}
+]]
+
+local obj, math = obj, math
+
+-- 美肌（Magic Bullet Cosmo / Sapphire Beauty）。肌の色の範囲（色相・彩度）だけ、縁を残すぼかし（バイラテラル）でなめらかにする。
+-- バイラテラルは横・縦に分けた近似（2 回とも元の画像で色の近さを測る）。半径が大きいときは間引いて読む（片側 16 点まで）。
+-- 仕様: AI/specifications/20261012_Filters_H_AE候補_spec.md。検証器: AI/scripts/Filters_H/verify_ae_sections.py
+-- 大きさは変えない（出入りとも obj.w x obj.h）のでフィルタオブジェクトにも置ける
+
+local show = (show_mask == 1)
+if smooth <= 0 and not show then return end
+local w, h = obj.w, obj.h
+if w < 1 or h < 1 then return end
+
+-- 位置の重みは σ = 半径 の正規分布を 2.5σ まで。色の重みの σ は 縁の保持 0 で 0.3、100 で 0.03（sRGB の 3 チャンネルの距離）
+local sigma = math.max(radius, 0.5)
+local step = math.max(1, sigma * 2.5 / 16)
+local taps = math.max(1, math.ceil(sigma * 2.5 / step))
+local sr = 0.3 + (0.03 - 0.3) * edge_keep / 100
+local inv2sr2 = 1 / (2 * sr * sr)
+
+obj.copybuffer("cache:sk/src", "object")
+obj.clearbuffer("cache:sk/h", w, h)
+obj.pixelshader("ps_sk_bilat", "cache:sk/h", {"cache:sk/src", "cache:sk/src"},
+                { w, h, 1, 0, sigma, inv2sr2, step, taps }, "copy", "clamp")
+obj.clearbuffer("cache:sk/v", w, h)
+obj.pixelshader("ps_sk_bilat", "cache:sk/v", {"cache:sk/h", "cache:sk/src"},
+                { w, h, 0, 1, sigma, inv2sr2, step, taps }, "copy", "clamp")
+-- 色相の境界のぼかし幅は 範囲 の半分（5 度以上）
+obj.pixelshader("ps_sk_final", "object", {"cache:sk/src", "cache:sk/v"}, {
+  skin_hue, hue_range, math.max(hue_range * 0.5, 5), sat_min / 100, sat_max / 100, smooth / 100, show and 1 or 0,
+}, "copy", "dot")
+
+@タイムディスプレイスメント
+--information:タイムディスプレイスメント@Filters_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--select@source:素材=0,今の絵の履歴=0,動画ファイル=1
+--file@file:動画ファイル
+--hide@file:source==0
+--track@start:開始位置,0,100000,0,0.001
+--hide@start:source==0
+--track@max_shift:最大変位時間[F],-120,120,15,0.1
+--select@method:補間=1,フレームの繰り返し=0,フレームの混合=1
+--select@map:マップ=0,横=0,縦=1,円=2,レイヤー=3
+--track@map_layer:マップのレイヤー,1,1000,1,1
+--hide@map_layer:map<3
+--check@stretch:マップをストレッチ,1
+--hide@stretch:map<3
+--track@angle:角度,-3600,3600,0,0.01
+--hide@angle:map>1
+--track@center_x:中心X,-10000,10000,0,0.1
+--hide@center_x:map==3
+--track@center_y:中心Y,-10000,10000,0,0.1
+--hide@center_y:map==3
+--track@size:大きさ,0,10000,0,0.1,自動
+--hide@size:map==3
+--check@invert:反転,0
+
+local obj, math = obj, math
+
+-- タイムディスプレイスメント（After Effects の Time Displacement）。画面の場所ごとに、何フレーム前の絵を出すかを変える。
+--   ずれ（フレーム）= マップの値（0〜1）x 最大変位時間。正なら過去、負なら未来（未来は 動画ファイル のときだけ）
+--   今の絵の履歴: このオブジェクトの今の絵を毎フレーム time_displace.mod2 に覚えさせ、今のフレーム − ずれ の絵を出す。
+--     頭から再生しないと過去の絵が無いので、足りない所は持っている中で一番近い絵（シークの直後なら今の絵）になる。
+--     前へ戻る・大きさが変わると履歴を捨てて始め直す（色付き残像(画像履歴) と同じ）
+--   動画ファイル: 開始位置 + オブジェクトの時間 − ずれ / シーンのフレームレート の時刻の動画のフレームを obj.load("movie.frame") で読む。
+--     読んだフレームはモジュールの中に (ファイル, フレーム番号) で覚え、次のフレームでは足りない分だけ読む（再生中は 1 枚）
+--   マップ: 横・縦・円（組み込み）か、別のレイヤーの明るさ（obj.load("layer", n, true)。Rec.709 の明るさ x α）
+--   フレームの繰り返し はずれを最も近い整数に丸める（段が見える）。フレームの混合 は前後の 2 枚を割合で混ぜる（乗算済みで混ぜる）
+-- 画素は getpixeldata の RGBA8（ストレート）で受け渡す。16bit の色・1 を超える明るさ（HDR）はここで 8bit に丸まる。
+-- 読み込む順番: マップのレイヤー → 動画のフレーム → 最後に元の画像と変数を戻してから getpixeldata → 合成 → putpixeldata。
+--   obj.load は今の画像と変数を置き換えるので、何か読むときだけ cache:tdp/src と変数を退避して戻す（大きさは変わらない）。
+-- 仕様: AI/specifications/20261012_Filters_H_タイムディスプレイスメント_spec.md
+-- 検証器: AI/scripts/Filters_H/verify_time_displacement.py。モジュールの拠点: AI/plugins/TimeDisplace_H/
+
+local W, H = obj.w, obj.h
+if W < 1 or H < 1 then return end
+
+local G = _TIME_DISPLACEMENT_FILTERS_H or { warned = {} }
+_TIME_DISPLACEMENT_FILTERS_H = G
+local function warn_once(key, msg)
+  if not G.warned[key] then
+    G.warned[key] = true
+    print("@warn", "[タイムディスプレイスメント@Filters_H] " .. msg)
+  end
+end
+
+local ok_mod, mod = pcall(obj.module, "time_displace")
+if not ok_mod or type(mod) ~= "table" then
+  warn_once("module", "time_displace.mod2 が見つかりません（Script/TimeDisplace_H/）")
+  return
+end
+
+-- 状態の鍵（色付き残像・自動レベル補正と同じ。シーン・描画の起点・オブジェクト・効果・個別オブジェクトの番号）
+local id = table.concat({ obj.scene_id or 0, obj.getinfo("origin_scene_id") or 0, obj.id or 0,
+                          obj.effect_id or 0, obj.index or 0 }, "/")
+local use_movie = (source == 1)
+local shift = max_shift
+local blend = (method == 1) and 1 or 0
+local kind = math.floor(map + 0.5)
+local inv = (invert == 1) and 1 or 0
+
+-- 退避と復元（obj.load で置き換わる画像と変数）
+local SRC = "cache:tdp/src"
+local saved = nil
+local function save()
+  if saved ~= nil then return true end
+  if not obj.copybuffer(SRC, "object") then return false end
+  saved = { obj.ox, obj.oy, obj.oz, obj.rx, obj.ry, obj.rz,
+            obj.cx, obj.cy, obj.cz, obj.sx, obj.sy, obj.sz, obj.alpha }
+  return true
+end
+local function restore()
+  if saved == nil then return end
+  obj.copybuffer("object", SRC)
+  obj.ox, obj.oy, obj.oz, obj.rx, obj.ry, obj.rz,
+  obj.cx, obj.cy, obj.cz, obj.sx, obj.sy, obj.sz, obj.alpha = unpack(saved)
+end
+
+-- 1. マップのレイヤー
+if kind == 3 then
+  local n = math.floor(map_layer + 0.5)
+  local got = false
+  if n == obj.layer then
+    warn_once("self:" .. id, "マップのレイヤーに自分のレイヤー（" .. n .. "）は使えません。ずれなしで描きます")
+  elseif save() then
+    local ok, loaded = pcall(obj.load, "layer", n, true)
+    if ok and loaded and obj.w > 0 and obj.h > 0 then
+      local data, mw, mh = obj.getpixeldata("object", "rgba")
+      if data ~= nil and mw ~= nil and mw > 0 and mh > 0 then
+        got = (mod.map_layer(id, data, mw, mh, W, H, (stretch == 1) and 1 or 0, inv) == 1)
+      end
+    end
+    if not got then
+      warn_once("layer:" .. id .. ":" .. n, "レイヤー " .. n .. " を読めないので、ずれなしで描きます")
+    end
+  end
+  if not got then kind = -1 end
+end
+
+-- 2. 素材
+if not use_movie then
+  restore()
+  local data, dw, dh = obj.getpixeldata("object", "rgba")
+  if data == nil or dw ~= W or dh ~= H then return end
+  if shift < 0 then
+    warn_once("future:" .. id, "今の絵の履歴では未来のフレームを出せません（動画ファイル なら出せます）")
+  end
+  local wrote = mod.process(id, data, W, H, obj.frame, shift, blend, kind, angle, center_x, center_y, size, inv)
+  if wrote == 1 then obj.putpixeldata("object", data, W, H, "rgba") end
+  return
+end
+
+if file == nil or file == "" then
+  restore()
+  return
+end
+local ok_info, nframes, rate, scale = pcall(obj.load, "movie.info", file)
+nframes, rate, scale = tonumber(nframes) or 0, tonumber(rate) or 0, tonumber(scale) or 0
+if not ok_info or nframes <= 0 or rate <= 0 or scale <= 0 then
+  restore()
+  warn_once("info:" .. file, "動画ファイルを読めません: " .. file)
+  return
+end
+local sfps = obj.framerate
+if sfps == nil or sfps <= 0 then sfps = 30 end
+local t0 = start + obj.time
+local missing = mod.prepare(id, file, W, H, t0, sfps, rate / scale, nframes, shift, blend,
+                            kind, angle, center_x, center_y, size, inv)
+if missing > 0 and save() then
+  for i = 0, missing - 1 do
+    local f = mod.pending(id, i)
+    if f < 0 then break end
+    local ok, total = pcall(obj.load, "movie.frame", file, f)
+    local put = false
+    if ok and (tonumber(total) or 0) > 0 and obj.w > 0 and obj.h > 0 then
+      local data, fw, fh = obj.getpixeldata("object", "rgba")
+      if data ~= nil and fw ~= nil and fw > 0 and fh > 0 then
+        put = (mod.put(id, f, data, fw, fh) == 1)
+      end
+    end
+    if not put then
+      warn_once("frame:" .. file, "動画のフレームを読めませんでした（" .. f .. "）。近いフレームで埋めます")
+    end
+  end
+end
+restore()
+local data, dw, dh = obj.getpixeldata("object", "rgba")
+if data == nil or dw ~= W or dh ~= H then return end
+if mod.render(id, data, W, H) == 1 then obj.putpixeldata("object", data, W, H, "rgba") end

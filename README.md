@@ -19,10 +19,12 @@ AviUtl ExEdit2 向けに作ったスクリプト集です。設定ダイアロ�
 
 | スクリプト                        | 一緒に置くもの                                              |
 | ---------------------------- | ---------------------------------------------------- |
-| `@Filters_H.anm2`            | `EffectUtils_Noise.lua` `EffectUtils_ColorGrade.lua` |
+| `@Filters_H.anm2`            | `EffectUtils_Noise.lua` `EffectUtils_ColorGrade.lua`。タイムディスプレイスメントを使うなら `TimeDisplace_H` のフォルダごと |
 | `プロシージャル模様_H.obj2`           | `EffectUtils_ColorGrade.lua`                         |
 | `@ローポリ化.anm2` `@ローポリ背景.obj2` | `EffectUtils_Lowpoly.lua`                            |
 | `@拡張パーティクル_H.anm2`           | `Particle_H.lua`                                     |
+| `@キーイング_H.anm2`             | 同型塗りつぶしを使うなら `SameShapeFill_H` のフォルダごと |
+| `@ShapeDistort_H.anm2`       | パペットを使うなら `Puppet_H` のフォルダごと |
 
 ## 収録スクリプト
 
@@ -30,9 +32,9 @@ AviUtl ExEdit2 向けに作ったスクリプト集です。設定ダイアロ�
 
 | 見本                                                                    | ファイル               | 内容                                                                                                                                                                                  | 説明書                              |
 | --------------------------------------------------------------------- | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
-| <img src="images/HexBrowns.Filters_H_thumbnail.png" width="160">      | `@Filters_H.anm2`  | フィルム調の加工 22 種（グリッチ、グレイン、ハレーション、ライトリーク、ビネット、アナモルフィックフレア、リキッドディストーション、シマー、フォグヘイズ、フィルムバーン、カラーグレード、リフト・ガンマ・ゲイン、バレル歪み、ノイズオーバーレイ、バイブランス、HSL選択補正、LUT適用、色調転写、局所トーン補正、ローカルラプラシアン、暗所視、ホログラム箔） | [docs](docs/Filtersフィルタ使用ガイド.md) |
-| <img src="images/HexBrowns.OpticalBokeh_thumbnail.png" width="160">   | `@光学系ボケ.anm2`      | レンズで撮ったようなボケ 4 種（玉ボケ、レンズぼかし、チルトシフト、球面収差ボケ）                                                                                                                                          | [docs](docs/光学系ボケ.md)            |
-| <img src="images/HexBrowns.Keying_H_thumbnail.png" width="160">       | `@キーイング_H.anm2`    | 背景を抜いた素材の仕上げ 4 種（マット調整、スピル除去、トラックマット、動体抽出＝前のフレームとの差で動いた所だけ残す）                                                                                                                       | [docs](docs/キーイング_H.md)          |
+| <img src="images/HexBrowns.Filters_H_thumbnail.png" width="160">      | `@Filters_H.anm2`  | フィルム調の加工 28 種（グリッチ、グレイン、ハレーション、ライトリーク、ビネット、アナモルフィックフレア、リキッドディストーション、シマー、フォグヘイズ、フィルムバーン、カラーグレード、リフト・ガンマ・ゲイン、バレル歪み、ノイズオーバーレイ、バイブランス、HSL選択補正、LUT適用、色調転写、局所トーン補正、ローカルラプラシアン、暗所視、ホログラム箔、多面体ガラス、レンズの汚れ、古いフィルム、自動レベル補正、美肌、タイムディスプレイスメント＝場所ごとに何フレーム前の絵を出すかを変える） | [docs](docs/Filtersフィルタ使用ガイド.md) |
+| <img src="images/HexBrowns.OpticalBokeh_thumbnail.png" width="160">   | `@光学系ボケ.anm2`      | レンズで撮ったようなボケ 5 種（玉ボケ、レンズぼかし、チルトシフト、球面収差ボケ、マップぼかし＝深度マップなどの明るさで場所ごとにぼかしの量を変える）                                                                                                                                          | [docs](docs/光学系ボケ.md)            |
+| <img src="images/HexBrowns.Keying_H_thumbnail.png" width="160">       | `@キーイング_H.anm2`    | 背景を抜いた素材の仕上げ 6 種（マット調整、スピル除去、トラックマット、動体抽出＝前のフレームとの差で動いた所だけ残す / 同型塗りつぶし＝同じ形の領域を全部見つけて塗る / 光の回り込み＝背景の光を縁へにじませてなじませる）                                                                                                                       | [docs](docs/キーイング_H.md)          |
 | <img src="images/HexBrowns.Lighting2D_H_thumbnail.gif" width="160">   | `@2Dライティング_H.anm2` | 平たい素材に立体の光と陰を足す 3 種（大域照明＝明るい所を光源にして、物で遮りながら光を広げ影を落とす / 環境遮蔽＝くぼみ・溝・接触部に陰を落とす / 光の帯＝表面をなめる光沢の帯）                                                                                                        | [docs](docs/2Dライティング_H.md)       |
 | <img src="images/HexBrowns.RangeWarning_H_thumbnail.png" width="160"> | `レンジ警告_H.anm2`     | 白飛び・黒潰れ・色域外の画素をゼブラで示す検査用の効果                                                                                                                                                         | [docs](docs/レンジ警告_H.md)          |
 
@@ -40,7 +42,7 @@ AviUtl ExEdit2 向けに作ったスクリプト集です。設定ダイアロ�
 
 | 見本                                                                    | ファイル                         | 内容                                    | 説明書                            |
 | --------------------------------------------------------------------- | ---------------------------- | ------------------------------------- | ------------------------------ |
-| <img src="images/HexBrowns.ShapeDistort_H_thumbnail.png" width="160"> | `@ShapeDistort_H.anm2`       | 画像をゆがませる 4 種（回転、放射、方向、ジグザグ）           | [docs](docs/ShapeDistort_H.md) |
+| <img src="images/HexBrowns.ShapeDistort_H_thumbnail.png" width="160"> | `@ShapeDistort_H.anm2`       | 画像をゆがませる 6 種（回転、放射、方向、ジグザグ、無限ズーム＝入れ子の自分へ終わりなく寄り続ける / パペット＝ピンを動かして絵を曲げる）           | [docs](docs/ShapeDistort_H.md) |
 | <img src="images/HexBrowns.Lowpoly_thumbnail.png" width="160">        | `@ローポリ化.anm2` `@ローポリ背景.obj2` | オブジェクトのローポリ化と、ローポリの背景                 | [docs](docs/ローポリ.md)           |
 | <img src="images/HexBrowns.VerticalText_thumbnail.png" width="160">   | `テキスト縦書き化.anm2`              | 横書きのテキストを、文字ごとのオブジェクトのまま縦書きに並べる       | [docs](docs/テキスト縦書き化.md)       |
 | <img src="images/HexBrowns.AutoFitText_H_thumbnail.png" width="160">  | `枠内自動フィット_H.obj2`            | 指定した枠に収まる最大のフォントサイズで文字を出す。自動改行・禁則処理つき | [docs](docs/枠内自動フィット_H.md)     |
