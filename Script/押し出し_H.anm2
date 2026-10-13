@@ -1,4 +1,4 @@
---information:押し出し_H v1.00 by HexBrowns
+--information:押し出し_H v1.01 by HexBrowns
 --label:HexScript
 
 --group:押し出し
@@ -43,17 +43,22 @@ After Effects の 3D テキストの「押し出し」と「ベベル」に当�
 - 以降のフィルタ効果は掛からない（lua.txt の obj.drawpoly）
 
 机上検証: AI/scripts/押し出し_H/verify_extrude.py
+
+v1.01: 4K・横長の巨大素材で cache と tempbuffer の枠（1600 万ドット）を超えないように、元の画像の退避 1 枚と
+一番近い外側の 2 枚が枠に収まらなければ、一番近い外側を縮めた解像度で求める（位置は元の解像度の px で持つ）。
+元の画像の退避だけで収まらなければ効果を掛けない。AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md
 ]]
 
 --[[pixelshader@ps_ext_seed:
 cbuffer P : register(b0) {
-    float2 size;      // 0-1 大きさ
+    float2 size;      // 0-1 大きさ（元の解像度）
+    float scale;      // 2   この面の解像度 / 元の解像度（v1.01）
 };
 Texture2D src : register(t0);
 
-// 外側の画素は自分、内側の画素は一番近い画像の外（縁の 0.5px 外）を最初の候補にする
+// 外側の画素は自分、内側の画素は一番近い画像の外（縁の 0.5px 外）を最初の候補にする。位置は元の解像度の px
 float4 ps_ext_seed(float4 pos : SV_Position) : SV_Target {
-    float2 p = pos.xy;
+    float2 p = pos.xy / scale;
     if (src.Load(int3(int2(p), 0)).a < 0.5) return float4(p, 0.0, 1.0);
     float2 s = float2(-0.5, p.y);
     float best = p.x + 0.5;
@@ -66,15 +71,16 @@ float4 ps_ext_seed(float4 pos : SV_Position) : SV_Target {
 
 --[[pixelshader@ps_ext_jfa:
 cbuffer P : register(b0) {
-    float2 size;      // 0-1 大きさ
-    float stepk;      // 2   飛ぶ幅（px）
+    float2 size;      // 0-1 大きさ（この面の解像度）
+    float stepk;      // 2   飛ぶ幅（この面の px）
+    float scale;      // 3   この面の解像度 / 元の解像度（v1.01。候補の位置と距離は元の解像度の px）
 };
 Texture2D seed : register(t0);
 
 // ジャンプフラッディング: 8 方向と自分の、stepk 先の画素が持つ候補のうち一番近いものを取る
 float4 ps_ext_jfa(float4 pos : SV_Position) : SV_Target {
-    float2 p = pos.xy;
-    int2 ip = int2(p);
+    float2 p = pos.xy / scale;
+    int2 ip = int2(pos.xy);
     int2 hi = int2(size) - 1;
     float2 best = seed.Load(int3(ip, 0)).rg;
     float bd = dot(best - p, best - p);
@@ -103,6 +109,7 @@ cbuffer P : register(b0) {
     float nr;          // 12   ベベルの面の向きの、縁の外向きの成分
     float nz;          // 13   同・Z の成分（手前が負）
     float shade_face;  // 14   1 で表面にも陰影
+    float scale;       // 15   一番近い外側の面の解像度 / 元の解像度（v1.01）
 };
 Texture2D src : register(t0);
 Texture2D seed : register(t1);
@@ -110,7 +117,7 @@ Texture2D seed : register(t1);
 float4 ps_ext_slice(float4 pos : SV_Position) : SV_Target {
     float2 p = pos.xy;
     float4 s = src.Load(int3(int2(p), 0));
-    float2 sd = seed.Load(int3(int2(p), 0)).rg - p;
+    float2 sd = seed.Load(int3(int2(p * scale), 0)).rg - p;
     float d = length(sd);
     // 覆う割合: 削らないときは元のアルファ、削るときは縁からの距離
     float cov = s.a;
@@ -153,24 +160,33 @@ if BW <= 0 or BD <= 0 then BEVEL, BW, BD = 0, 0, 0 end
 if D <= 0 then return end
 
 local SRC, SA, SB = "cache:ext/src", "cache:ext/sa", "cache:ext/sb"
+-- 一番近い外側を求める解像度の倍率 SC（v1.01。元の画像の退避と 2 枚が枠に収まるように）
+local budget = require("EffectUtils_Budget")
+local SC = budget.scale(W * H, 2 * W * H)
+if not SC then
+  budget.refuse("押し出し_H", W, H)
+  return
+end
+local JW, JH = math.max(1, math.ceil(W * SC)), math.max(1, math.ceil(H * SC))
 obj.copybuffer(SRC, "object")
 
 -- 一番近い外側（ジャンプフラッディング）
-obj.clearbuffer(SA, W, H)
-obj.pixelshader("ps_ext_seed", SA, {SRC}, {W, H})
-obj.clearbuffer(SB, W, H)
+obj.clearbuffer(SA, JW, JH)
+obj.pixelshader("ps_ext_seed", SA, {SRC}, {W, H, SC})
+obj.clearbuffer(SB, JW, JH)
 local cur, other = SA, SB
 local k = 1
-while k * 2 < math.max(W, H) do k = k * 2 end
+while k * 2 < math.max(JW, JH) do k = k * 2 end
 while k >= 1 do
-  obj.pixelshader("ps_ext_jfa", other, {cur}, {W, H, k})
+  obj.pixelshader("ps_ext_jfa", other, {cur}, {JW, JH, k, SC})
   cur, other = other, cur
   k = math.floor(k / 2)
 end
 -- 仕上げに 1 回足すと取りこぼしが減る（JFA+1）
-obj.pixelshader("ps_ext_jfa", other, {cur}, {W, H, 1})
+obj.pixelshader("ps_ext_jfa", other, {cur}, {JW, JH, 1, SC})
 cur, other = other, cur
 local SEED = cur
+obj.clearbuffer(other, 1, 1)   -- もう読まない（枠を空ける）
 
 local az, el = math.rad(num(light_dir, 135)), math.rad(clamp(num(light_elev, 45), 0, 90))
 local lx, ly, lz = math.cos(el) * math.cos(az), -math.cos(el) * math.sin(az), -math.sin(el)
@@ -186,7 +202,7 @@ local function slice(erode, kind, use_src, nr, nz)
     W, H, erode, kind,
     lx, ly, lz, AMB,
     cr, cg, cb, use_src,
-    nr, nz, SHADE_FACE,
+    nr, nz, SHADE_FACE, SC,
   })
 end
 

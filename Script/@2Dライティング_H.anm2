@@ -1,5 +1,5 @@
 --[[
-2Dライティング_H v1.10 by HexBrowns
+2Dライティング_H v1.11 by HexBrowns
 MIT No Attribution (MIT-0) / Copyright (c) 2026 HexBrowns
 
   環境遮蔽 : 明るさ（またはアルファ）を高さとみなし、くぼみ・接触部に陰を落とす 2D のアンビエントオクルージョン
@@ -9,10 +9,11 @@ MIT No Attribution (MIT-0) / Copyright (c) 2026 HexBrowns
 仕様: AI/specifications/20261009_環境遮蔽_H_spec.md / 20261009_大域照明_H_spec.md / 20261012_2Dライティング_H_光の帯_spec.md
 
 v1.10: 光の帯を足した（既存の 2 つは変えていない）
+v1.11: 環境遮蔽 v1.01・大域照明 v1.01。4K・横長の巨大素材でも cache と tempbuffer の枠に収める（元の画像を退避しない・作業解像度を下げる）
 ]]
 
 @環境遮蔽
---information:環境遮蔽@2Dライティング_H v1.00 by HexBrowns
+--information:環境遮蔽@2Dライティング_H v1.01 by HexBrowns
 --label:HexScript
 --filter
 --track@strength:強さ,0,200,100,0.1
@@ -183,12 +184,25 @@ local margin = grow and math.ceil(radius) or 0
 
 -- 作業解像度。半径と高さを同じ倍率で縮めるので、陰の形は解像度で変わらない（仰角は比）
 local div = (res == 2) and 2 or 1
+-- v1.01: cache と tempbuffer の枠（1600 万ドット）に収める。元の画像は object に置いたまま読み（外へ広げるときだけ広げた画像を cache に置く）、
+-- 作業用の 4 枚（h・t・hb・o）が収まらなければ作業解像度を下げる。広げた画像だけで収まらなければ効果を掛けない
+-- （AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）
+local budget = require("EffectUtils_Budget")
+do
+  local fw, fh = w + margin * 2, h + margin * 2
+  local s = budget.scale(grow and fw * fh or 0, 4 * fw * fh / (div * div))
+  if not s then
+    budget.refuse("環境遮蔽@2Dライティング_H", fw, fh)
+    return
+  end
+  div = div / s
+end
 if grow then
-  obj.copybuffer("cache:ao/src0", "object")
   w, h = w + margin * 2, h + margin * 2
   obj.clearbuffer("cache:ao/src", w, h)
-  obj.pixelshader("ps_ao_pad", "cache:ao/src", {"cache:ao/src0"}, { w - margin * 2, h - margin * 2, margin }, "copy", "dot")
+  obj.pixelshader("ps_ao_pad", "cache:ao/src", {"object"}, { w - margin * 2, h - margin * 2, margin }, "copy", "dot")
 end
+local src = grow and "cache:ao/src" or "object"
 local lw, lh = math.ceil(w / div), math.ceil(h / div)
 local rad = math.max(radius / div, 1)
 local hs = height / div
@@ -196,9 +210,8 @@ local nd = math.max(2, math.min(16, math.floor(dirs + 0.5)))
 local ns = math.max(2, math.min(32, math.floor(steps + 0.5)))
 local sr, sg, sb = RGB(tonumber(shadow_color) or 0)
 
-if not grow then obj.copybuffer("cache:ao/src", "object") end
 obj.clearbuffer("cache:ao/h", lw, lh)
-obj.pixelshader("ps_ao_height", "cache:ao/h", {"cache:ao/src"}, { height_src, (invert == 1) and 1 or 0, hs }, "copy", "clamp")
+obj.pixelshader("ps_ao_height", "cache:ao/h", {src},{ height_src, (invert == 1) and 1 or 0, hs }, "copy", "clamp")
 
 local function blur(name, from, depth, sigma)
   local r = math.max(1, math.min(64, math.ceil(3 * sigma)))
@@ -221,13 +234,13 @@ obj.pixelshader("ps_ao_main", "cache:ao/o", {"cache:ao/h"}, { lw, lh, rad, nd, n
 blur("cache:ao/o", "cache:ao/o", math.max(hs * 0.05, 0.5), 2)
 
 if grow then obj.clearbuffer("object", w, h) end
-obj.pixelshader("ps_ao_comp", "object", {"cache:ao/src", "cache:ao/o"}, {
+obj.pixelshader("ps_ao_comp", "object", {src, "cache:ao/o"}, {
   sr / 255, sg / 255, sb / 255, (ao_only == 1) and 1 or 0,
   blend, grow and 1 or 0,
 }, "copy", "clamp")
 
 @大域照明
---information:大域照明@2Dライティング_H v1.00 by HexBrowns
+--information:大域照明@2Dライティング_H v1.01 by HexBrowns
 --label:HexScript
 --filter
 --track@threshold:しきい値,0,100,70,0.1
@@ -492,12 +505,42 @@ local grow = (spread == 1) and not obj.getinfo("filter")
 local margin = grow and math.min(math.ceil(reach), 500) or 0
 
 local div = (res == 4) and 4 or 2
+-- 段の数: 最上段の間隔の終わり 2·(4^N − 1)/3 が到達距離（作業解像度の画素）を覆う
+local function cascades(d)
+  local r = math.max(reach / d, 1)
+  return r, math.max(1, math.min(7, math.ceil(math.log(1.5 * r + 1) / math.log(4))))
+end
+
+-- v1.01: cache と tempbuffer の枠（1600 万ドット）に収める。外へ広げないときは元の画像を object に置いたまま読み、
+-- 作業用のバッファ（シーン・縮めたシーン・段 2 枚・光の量）が収まらなければ作業解像度を 2 倍ずつ粗くする。
+-- それでも収まらなければ効果を掛けない（AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）
+local budget = require("EffectUtils_Budget")
+do
+  local W, H = w + margin * 2, h + margin * 2
+  local function need(d)
+    local lw, lh = math.ceil(W / d), math.ceil(H / d)
+    local _, n = cascades(d)
+    local total, pw, ph = lw * lh, lw, lh
+    for _ = 1, math.max(0, math.min(n - 2, 5)) do
+      pw, ph = math.ceil(pw / 2), math.ceil(ph / 2)
+      total = total + pw * ph
+    end
+    local cmax = 0
+    for i = 0, n - 1 do
+      local sp = 2 ^ (i + 1)
+      cmax = math.max(cmax, math.ceil(lw / sp) * sp * math.ceil(lh / sp) * sp)
+    end
+    return total + 2 * cmax + 2 * math.ceil(lw / 2) * math.ceil(lh / 2) + 1
+  end
+  local fixed = grow and w * h or 0
+  while fixed + need(div) > budget.BUDGET and div < 64 do div = div * 2 end
+  if not budget.check("大域照明@2Dライティング_H", W, H, fixed + need(div)) then return end
+end
+
 local lw, lh = math.ceil(w / div), math.ceil(h / div)
 -- 吸収: 元の画像の 1 画素を、密度 1 の物が横切る光の 1 − e^−2（86%）を止める。作業解像度の 1 画素は div 画素ぶん
 local K = 2 * div
--- 段の数: 最上段の間隔の終わり 2·(4^N − 1)/3 が到達距離（作業解像度の画素）を覆う
-local rw = math.max(reach / div, 1)
-local N = math.max(1, math.min(7, math.ceil(math.log(1.5 * rw + 1) / math.log(4))))
+local rw, N = cascades(div)
 local use_src, er, eg, eb = 1, 0, 0, 0
 if emit_color ~= nil then
   use_src = 0
@@ -509,15 +552,18 @@ if emit_color ~= nil then
   er, eg, eb = lin(r), lin(g), lin(b)
 end
 
--- 外へ広げるときも、元の画像はそのまま退避し、シーンと合成で余白の分ずらして読む（広げた画像を cache に作らない。枠を食わない）
+-- 外へ広げるときは、元の画像をそのまま退避し、シーンと合成で余白の分ずらして読む（広げた画像を cache に作らない。枠を食わない）。
+-- 広げないときは退避せず object を読む（v1.01）
 local sw, sh = w, h
-obj.copybuffer("cache:gi/src", "object")
+local src = "object"
 if grow then
+  src = "cache:gi/src"
+  obj.copybuffer(src, "object")
   w, h = w + margin * 2, h + margin * 2
   lw, lh = math.ceil(w / div), math.ceil(h / div)
 end
 obj.clearbuffer("cache:gi/s0", lw, lh)
-obj.pixelshader("ps_gi_scene", "cache:gi/s0", {"cache:gi/src"}, {
+obj.pixelshader("ps_gi_scene", "cache:gi/s0", {src}, {
   er, eg, eb, use_src, sw, sh, threshold / 100, emit / 100, occlusion / 100, occ_src, K, div, margin,
 }, "copy", "clamp")
 
@@ -566,7 +612,7 @@ if sig >= 0.3 then
 end
 
 if grow then obj.clearbuffer("object", w, h) end
-obj.pixelshader("ps_gi_comp", "object", {"cache:gi/src", "cache:gi/f"}, {
+obj.pixelshader("ps_gi_comp", "object", {src, "cache:gi/f"}, {
   div * 2 * g0w, div * 2 * g0h, sw, sh, ambient / 100, surface / 100, air / 100, (light_only == 1) and 1 or 0, threshold / 100, margin,
   rim,
 }, "copy", "clamp")

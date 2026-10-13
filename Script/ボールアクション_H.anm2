@@ -1,4 +1,4 @@
---information:ボールアクション_H v1.00 by HexBrowns
+--information:ボールアクション_H v1.01 by HexBrowns
 --label:HexScript
 
 --group:ボール
@@ -137,10 +137,12 @@ local lx, ly, lz = math.cos(el) * math.cos(az), -math.cos(el) * math.sin(az), -m
 local gx0 = W / 2 - (NC - 1) / 2 * SP
 local gy0 = H / 2 - (NR - 1) / 2 * SP
 
-local SRC, ATLAS = "cache:bah/src", "cache:bah/atlas"
-obj.copybuffer(SRC, "object")
+-- v1.01: 元の画像は cache に退避せず object のまま読む（横長の巨大素材で cache と tempbuffer の枠を超えて消えていた。
+-- AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）。アトラスが枠に収まらなければ効果を掛けない
+local ATLAS = "cache:bah/atlas"
+if not require("EffectUtils_Budget").check("ボールアクション_H", W, H, AW * AH) then return end
 obj.clearbuffer(ATLAS, AW, AH)
-obj.pixelshader("ps_ball_atlas_h", ATLAS, {SRC}, {
+obj.pixelshader("ps_ball_atlas_h", ATLAS, {"object"}, {
   W, H, gx0, gy0,
   lx, ly, lz, SP,
   T, math.floor(num(pick, 0) + 0.5), clamp(num(ambient, 25) / 100, 0, 1), clamp(num(spec, 60) / 100, 0, 1),

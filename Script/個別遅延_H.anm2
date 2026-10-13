@@ -1,4 +1,4 @@
---information:個別遅延_H v1.10 by HexBrowns
+--information:個別遅延_H v1.11 by HexBrowns
 --label:HexScript
 --filter
 --track@delay:遅延,-1000,1000,100,0.01
@@ -25,9 +25,10 @@
 --group
 
 --[[
-個別遅延_H v1.10
+個別遅延_H v1.11
 
 原作: Script/@DelayMove.anm2 の「Delay個別」（AviUtl2 移植版。作者・ライセンスの表記なし）。
+v1.11: 親レイヤーが空きの番号のとき・フィルタオブジェクトに掛けたとき、例外にせず動かさない（警告を 1 回出す）。
 v1.10: 配り方（等間隔 / ベジェ）を足した。順番の位置をベジェで写して、遅れに緩急を付ける（After Effects の Lazy に当たる）。
 個別オブジェクトを中間点などで動かしたとき、個別オブジェクトごとに動きを遅らせる。
 
@@ -93,7 +94,33 @@ local function Delay_id(delaytime,adjin,adjout,index,magp,magr,layer,rotation,mo
 
 if mode=="track" then
    return gv(0,id),gv(1,id),gv(2,id),gv(3,id)
-else
+end
+
+ -- v1.11: 読む先の値が無いときは動かさない（原作はここで nil の計算の例外になる）。
+ -- 親レイヤーにオブジェクトが無い（空きの番号）・フィルタオブジェクト（標準描画の値を持たない）のとき。強化デバッグ edg_1
+ -- （表に nil を入れると詰まって見落とすので 1 つずつ見る。値を 0 個返すこともあるので、変数に受けてから型を見る）
+ local readable = true
+ for _, k in ipairs({ "x", "y", "z", "rx", "ry", "rz", "zoom", "alpha", "aspect" }) do
+   local v = gv(L..k, id)
+   if type(v) ~= "number" then readable = false break end
+ end
+ if readable and mode=="counter" then
+   for _, k in ipairs({ "rx", "ry", "rz", L.."zoom", L.."alpha" }) do
+     local v = gv(k)
+     if type(v) ~= "number" then readable = false break end
+   end
+ end
+ if not readable then
+   delayed_time = nil
+   local wk = "IndividualDelay_H:missing:" .. L
+   if global[wk] == nil then
+     global[wk] = "1"
+     print("@warn", "[個別遅延_H] " .. L:sub(1, -2) .. " の値を読めないので動かしません（親レイヤーが空き・フィルタオブジェクトなど）")
+   end
+   return
+ end
+
+do
  local rx,ry,rz = obj.rx,obj.ry,obj.rz
  local alpha = obj.alpha
  local zoom=obj.zoom

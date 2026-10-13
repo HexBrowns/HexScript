@@ -13,6 +13,13 @@ EffectUtils_Lowpoly.lua
 
 drawpoly は使わない（後続フィルタを維持するため）。
 全面 CPU ラスタも obj.getpixeldata も使わない（VRAM 読み戻しは HLSL より遅い）。
+
+色空間（2026-10-13、ローポリ背景 v3.20 / ローポリ化 v3.20）:
+  色1→色2 の補間は mix_prepare / mix_at（EffectUtils_ColorSpace の mix_values）。
+  sRGB（0）のときは mix_prepare が nil を返し、今までと同じ lerp を通る。
+  ばらつき（apply_hsv_jitter）は space に 7 を渡すと Oklch の h・C・L を揺らす。
+  省略・3 のときは今までと同じ HSV。color_at の引数は末尾に足しただけで、今までの呼び方はそのまま通る。
+  検証器: AI/scripts/ローポリ/verify_colorspace_ext.py
 ]]
 
 local EffectUtils_Lowpoly = {}
@@ -42,6 +49,29 @@ local MAX_POINTS = 2200
 local BATCH_SIZE = 256
 
 local MESH_CACHE_MAX = 4
+
+-- Oklch のばらつきで「彩度変化 ±100%」に当てる C の幅。sRGB で最も鮮やかな色の C（マゼンタ約 0.32）に合わせ、
+-- HSV の S（0〜1）を ±100% 動かすのと同じくらいの振れ幅にする。HLSL 側の LP_OKLCH_C_REF と同じ値
+local OKLCH_C_REF = 0.32
+
+-- EffectUtils_ColorSpace は sRGB 以外を選んだときだけ読む（既定の計算は読まずに済む）
+local colorspace_mod = nil
+local colorspace_warned = false
+local function colorspace()
+  if colorspace_mod == nil then
+    local ok, m = pcall(require, "EffectUtils_ColorSpace")
+    if ok and type(m) == "table" then
+      colorspace_mod = m
+    else
+      colorspace_mod = false
+      if not colorspace_warned then
+        colorspace_warned = true
+        print("@warn", "[EffectUtils_Lowpoly] EffectUtils_ColorSpace.lua を読めないので sRGB / HSV で計算します")
+      end
+    end
+  end
+  return colorspace_mod or nil
+end
 
 function EffectUtils_Lowpoly.as_bool(value, default)
   if type(value) == "boolean" then
@@ -388,7 +418,10 @@ function EffectUtils_Lowpoly.hsv_offsets(tri_idx, seed, hue_var, sat_var, val_va
   return hue_off, sat_off, val_off
 end
 
-function EffectUtils_Lowpoly.apply_hsv_jitter(r, g, b, tri_idx, seed, hue_var, sat_var, val_var, hue_phase, val_phase)
+--- 三角形ごとのばらつき。space: 3 か省略で HSV（今までの計算）、7 で Oklch。
+--- Oklch では 色相 → h、彩度 → C（±100% が OKLCH_C_REF）、明度 → Oklab の L を同じオフセットで動かす。
+--- sRGB に無い色は EffectUtils_ColorSpace が明るさと色相を保ったまま C を下げて収める。
+function EffectUtils_Lowpoly.apply_hsv_jitter(r, g, b, tri_idx, seed, hue_var, sat_var, val_var, hue_phase, val_phase, space)
   hue_var = hue_var or 0
   sat_var = sat_var or 0
   val_var = val_var or 0
@@ -398,6 +431,13 @@ function EffectUtils_Lowpoly.apply_hsv_jitter(r, g, b, tri_idx, seed, hue_var, s
   end
   local hue_off, sat_off, val_off =
     EffectUtils_Lowpoly.hsv_offsets(tri_idx, seed, hue_var, sat_var, val_var, hue_phase, val_phase)
+  if (space or 3) > 6.5 then
+    local cs = colorspace()
+    if cs then
+      local hh, cc, ll = cs.to_space(r, g, b, 7)
+      return cs.from_space((hh + hue_off) % 1, math_max(cc + sat_off * OKLCH_C_REF, 0), clamp(ll + val_off, 0, 1), 7)
+    end
+  end
   local h, s, v = EffectUtils_Lowpoly.rgb_to_hsv(r, g, b)
   h = (h + hue_off) % 1
   if h < 0 then h = h + 1 end
@@ -477,11 +517,45 @@ function EffectUtils_Lowpoly.tri_vertex_hash(tri, salt, seed)
   return hash21(math_floor(u * 1000003), salt, seed + 2)
 end
 
+--- 色1→色2 の補間の準備。space は色空間の番号（EffectUtils_ColorSpace と同じ）、hue_long は 1 で長経路。
+--- sRGB（0）なら nil を返す（color_at は今までと同じ lerp を通る）。
+--- 戻り値の x1..z2 は色空間の値で、@高速 はこれをそのまま cbuffer へ渡す。
+function EffectUtils_Lowpoly.mix_prepare(r1, g1, b1, r2, g2, b2, space, hue_long)
+  space = math_floor(tonumber(space) or 0)
+  if space <= 0 then
+    return nil
+  end
+  local cs = colorspace()
+  if not cs then
+    return nil
+  end
+  local x1, y1, z1 = cs.to_space(r1, g1, b1, space)
+  local x2, y2, z2 = cs.to_space(r2, g2, b2, space)
+  return {
+    space = space, hue_long = (tonumber(hue_long) or 0) > 0.5, cs = cs,
+    x1 = x1, y1 = y1, z1 = z1, x2 = x2, y2 = y2, z2 = z2,
+  }
+end
+
+--- mix_prepare した 2 色の t（0..1）の色を sRGB で返す。
+function EffectUtils_Lowpoly.mix_at(mix, t)
+  local cs = mix.cs
+  local x, y, z = cs.mix_values(mix.x1, mix.y1, mix.z1, 1, mix.x2, mix.y2, mix.z2, 1, t, mix.space, mix.hue_long)
+  return cs.from_space(x, y, z, mix.space)
+end
+
 --- 係数 t で色1→色2を混ぜ、三角形ごとの HSV ばらつきを掛ける。
-function EffectUtils_Lowpoly.color_at(t, r1, g1, b1, r2, g2, b2, tri_idx, seed, hue_var, val_var, hue_phase, val_phase)
+--- mix は mix_prepare の戻り値（nil なら sRGB の lerp）、var_space は apply_hsv_jitter の space。
+--- どちらも省略できる（省略すると今までと同じ計算）。
+function EffectUtils_Lowpoly.color_at(t, r1, g1, b1, r2, g2, b2, tri_idx, seed, hue_var, val_var, hue_phase, val_phase, mix, var_space)
+  if mix then
+    local r, g, b = EffectUtils_Lowpoly.mix_at(mix, t)
+    return EffectUtils_Lowpoly.apply_hsv_jitter(
+      r, g, b, tri_idx, seed, hue_var, 0, val_var, hue_phase, val_phase, var_space)
+  end
   return EffectUtils_Lowpoly.apply_hsv_jitter(
     r1 + (r2 - r1) * t, g1 + (g2 - g1) * t, b1 + (b2 - b1) * t,
-    tri_idx, seed, hue_var, 0, val_var, hue_phase, val_phase)
+    tri_idx, seed, hue_var, 0, val_var, hue_phase, val_phase, var_space)
 end
 
 function EffectUtils_Lowpoly.color_gradient(cx, cy, w, h, r1, g1, b1, r2, g2, b2, gradient_dir, tri_idx, seed, hue_var, val_var, hue_phase, val_phase)
@@ -614,6 +688,7 @@ end
 
 EffectUtils_Lowpoly.MAX_POINTS = MAX_POINTS
 EffectUtils_Lowpoly.BATCH_SIZE = BATCH_SIZE
+EffectUtils_Lowpoly.OKLCH_C_REF = OKLCH_C_REF
 EffectUtils_Lowpoly.SRC_CACHE = "cache:lowpoly/src"
 
 return EffectUtils_Lowpoly

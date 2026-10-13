@@ -1,4 +1,4 @@
---information:ベクトルブラー_H v1.00 by HexBrowns
+--information:ベクトルブラー_H v1.01 by HexBrowns
 --label:HexScript
 --filter
 
@@ -30,7 +30,10 @@ After Effects の「ベクトルブラー」に近い効果。ベクトルマッ
    画素から両側へ、その向きの場をたどって（流線に沿って）長さの分だけ標本を取り、平均・最大値・最小値をとる
 
 オブジェクトの大きさと変数は変えない（フィルタオブジェクトでもそのまま使える）。
-中間のバッファは cache:vbh/ の 3〜4 枚（オブジェクトと同じ大きさ）。
+中間のバッファは cache:vbh/ の 2 枚（オブジェクトと同じ大きさ。マップがレイヤーなら読む間だけ元の画像の退避 1 枚）。
+v1.01: 4K・横長の巨大素材で cache と tempbuffer の枠（1600 万ドット）を超えないように、元の画像を退避しない（マップがレイヤーのときだけ読む間だけ退避）。
+2 枚が枠に収まらなければマップの解像度を下げる（値に倍率を掛けて、1px あたりの勾配を元の解像度と同じにする）。
+AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md
 
 机上検証: AI/scripts/ベクトルブラー_H/verify_vector_blur.py
 ]]
@@ -39,6 +42,7 @@ After Effects の「ベクトルブラー」に近い効果。ベクトルマッ
 cbuffer P : register(b0) {
     float2 size;    // 0-1 出力の大きさ（px）
     float prop;     // 2   0 輝度 / 1 赤 / 2 緑 / 3 青 / 4 アルファ
+    float gain;     // 3   値に掛ける倍率（作業の解像度の倍率。v1.01）
 };
 Texture2D map_tex : register(t0);
 SamplerState smp : register(s0);
@@ -51,6 +55,7 @@ float4 ps_vbh_value(float4 pos : SV_Position) : SV_Target {
     else if (prop > 2.5) v = m.b;
     else if (prop > 1.5) v = m.g;
     else if (prop > 0.5) v = m.r;
+    v *= gain;
     return float4(v, v, v, 1.0);
 }
 ]]
@@ -194,41 +199,59 @@ local W, H = obj.w, obj.h
 local L = math.max(num(blur_len, 20), 0)
 if W <= 0 or H <= 0 or L <= 0 then return end
 
-local SRC, MAP, A, B = "cache:vbh/src", "cache:vbh/map", "cache:vbh/a", "cache:vbh/b"
-obj.copybuffer(SRC, "object")
-
--- マップ。別のレイヤーは読み込んだ後に自分の画像と変数を戻す（読み込みで上書きされる）
-local map = SRC
+local SRC, A, B = "cache:vbh/src", "cache:vbh/a", "cache:vbh/b"
 local layer = math.floor(num(map_layer, 1) + 0.5)
-if math.floor(num(map_mode, 0) + 0.5) == 1 and layer ~= obj.layer then
+local layer_mode = math.floor(num(map_mode, 0) + 0.5) == 1 and layer ~= obj.layer
+local prop = math.floor(num(map_prop, 0) + 0.5)
+
+-- 作業の解像度の倍率 s。A・B の 2 枚と、マップがレイヤーなら読む間の元の画像の退避（1 枚）と A が枠に収まるように決める
+local budget = require("EffectUtils_Budget")
+local s = budget.scale(0, 2 * W * H)
+if s and layer_mode then
+  local s2 = budget.scale(W * H, W * H)
+  s = s2 and math.min(s, s2) or nil
+end
+if not s then
+  budget.refuse("ベクトルブラー_H", W, H)
+  return
+end
+local aw, ah = math.max(1, math.ceil(W * s)), math.max(1, math.ceil(H * s))
+
+-- マップの値を A へ。別のレイヤーは読み込んだまま値にし、自分の画像と変数を戻す（読み込みで上書きされる）
+local made = false
+if layer_mode then
+  obj.copybuffer(SRC, "object")
   local saved = {
     obj.ox, obj.oy, obj.oz, obj.rx, obj.ry, obj.rz,
     obj.cx, obj.cy, obj.cz, obj.sx, obj.sy, obj.sz, obj.alpha, obj.zoom, obj.aspect,
   }
   if obj.load("layer", layer, true) and obj.w > 0 and obj.h > 0 then
-    obj.copybuffer(MAP, "object")
-    map = MAP
+    obj.clearbuffer(A, aw, ah)
+    obj.pixelshader("ps_vbh_value", A, {"object"}, {aw, ah, prop, s}, "copy", "clamp")
+    made = true
   end
   obj.copybuffer("object", SRC)
+  obj.clearbuffer(SRC, 1, 1)   -- 戻したら要らない（枠を空ける）
   obj.ox, obj.oy, obj.oz, obj.rx, obj.ry, obj.rz,
   obj.cx, obj.cy, obj.cz, obj.sx, obj.sy, obj.sz, obj.alpha, obj.zoom, obj.aspect = unpack(saved)
 end
-
-obj.copybuffer(A, "object")
-obj.copybuffer(B, "object")
-obj.pixelshader("ps_vbh_value", A, {map}, {W, H, math.floor(num(map_prop, 0) + 0.5)}, "copy", "clamp")
-local soft = math.max(num(map_soft, 2), 0)
+if not made then
+  obj.clearbuffer(A, aw, ah)
+  obj.pixelshader("ps_vbh_value", A, {"object"}, {aw, ah, prop, s}, "copy", "clamp")
+end
+obj.clearbuffer(B, aw, ah)
+local soft = math.max(num(map_soft, 2), 0) * s
 if soft > 0 then
-  obj.pixelshader("ps_vbh_gauss", B, {A}, {W, H, 1, 0, soft}, "copy", "clamp")
-  obj.pixelshader("ps_vbh_gauss", A, {B}, {W, H, 0, 1, soft}, "copy", "clamp")
+  obj.pixelshader("ps_vbh_gauss", B, {A}, {aw, ah, 1, 0, soft}, "copy", "clamp")
+  obj.pixelshader("ps_vbh_gauss", A, {B}, {aw, ah, 0, 1, soft}, "copy", "clamp")
 end
-obj.pixelshader("ps_vbh_tensor", B, {A}, {W, H}, "copy")
-local ridge_s = math.max(num(ridge, 4), 0)
+obj.pixelshader("ps_vbh_tensor", B, {A}, {aw, ah}, "copy")
+local ridge_s = math.max(num(ridge, 4), 0) * s
 if ridge_s > 0 then
-  obj.pixelshader("ps_vbh_gauss", A, {B}, {W, H, 1, 0, ridge_s}, "copy", "clamp")
-  obj.pixelshader("ps_vbh_gauss", B, {A}, {W, H, 0, 1, ridge_s}, "copy", "clamp")
+  obj.pixelshader("ps_vbh_gauss", A, {B}, {aw, ah, 1, 0, ridge_s}, "copy", "clamp")
+  obj.pixelshader("ps_vbh_gauss", B, {A}, {aw, ah, 0, 1, ridge_s}, "copy", "clamp")
 end
-obj.pixelshader("ps_vbh_blur", "object", {SRC, B}, {
+obj.pixelshader("ps_vbh_blur", "object", {"object", B}, {
   W, H, L, math.rad(num(blur_angle, 0)),
   math.floor(num(blur_mode, 0) + 0.5), math.floor(num(len_mode, 0) + 0.5),
 }, "copy", "clamp")

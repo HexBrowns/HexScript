@@ -1,4 +1,4 @@
---information:光束_H v1.13 by HexBrowns
+--information:光束_H v1.14 by HexBrowns
 --label:HexScript
 --group:形
 --select@ray_mode:光の出方=0,平行=0,放射=1,収束=2
@@ -61,6 +61,8 @@ v1.10: 弧の角度（光を曲げる）をなくした（ユーザーの判断�
 v1.11: 光を元の画像の上に描く（ユーザーの依頼）。
 v1.13: 1 フレームに持つ cache が枠（cache と tempbuffer で合わせて 1600 万ドット）を超えないよう、
 作業解像度を自動で下げる条件に cache の合計を足した（広げた画像が大きいと黒いフレームになっていた）。
+v1.14: 広げた画像を cache に退避せず object のまま読む（横長の巨大素材で枠を超えて消えていた）。目安は共有の
+EffectUtils_Budget（1400 万ドット）にし、1/4 でも収まらなければ効果を掛けない（AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）。
 ]]
 
 --[[pixelshader@ps_lb_pool:
@@ -309,7 +311,7 @@ if ray_mode > 0 then
 end
 
 local GAMMA = 2.2
--- 1 フレームに使う VRAM の目安。広げた画像は 2 枚（オブジェクトと cache:lb/src）、光のバッファは作業解像度で
+-- 1 フレームに使う VRAM の目安。広げた画像は object の 1 枚（v1.13 までは cache:lb/src にも退避していた）、光のバッファは作業解像度で
 -- 6〜7 枚。v1.00 は 16777216 画素まで広げ、等倍なら 1GB を超えて "invalid buffer type" が出た
 -- （AI/scripts/光束_H/issues/20260923_invalid_buffer_large_expansion.md）
 local MAX_PIXELS = 8388608    -- 広げた後の画素数の上限
@@ -317,7 +319,8 @@ local WORK_MAX = 2097152      -- 光のバッファ 1 枚の画素数の目安�
 local MAX_STEPS = 65536       -- 1 本の鎖の歩数の上限
 local EXTENT_GRID = 65536     -- 形の広がりを測る升目の数の目安
 local POOL_MAX = 16           -- ps_lb_pool のループの上限（縮小率）
-local CACHE_BUDGET = 15000000 -- 1 フレームに持つ cache の上限の目安。枠 16,000,000 に余裕を残す（v1.13）
+local budget = require("EffectUtils_Budget")
+local CACHE_BUDGET = budget.BUDGET -- 1 フレームに持つ cache の上限の目安。枠 16,000,000 に余裕を残す（v1.14 から共有の目安）
 local pool_pixels = 0         -- 升目（cache:lb/pool）の画素数。shape_extent が作ったときだけ入る
 
 local L = math.max(0, length)
@@ -482,18 +485,24 @@ end
 -- 見た目の差は小さい）。粗くすると余白も変わるので広げる量を求め直す。
 -- v1.13: cache と tempbuffer は合わせて 1600 万ドットの枠を共有し、超えると古いもの（cache:lb/src）から
 -- 黙って捨てられて黒いフレームになる（LSH-29 / 31、AI/scripts/issues/20260925_lightshaft_cache_budget_over_16m.md）。
--- 1 フレームに持つ cache（広げた画像 1 枚 + 光のバッファ 体積光 7 枚・ベタ 6 枚 + 升目）が CACHE_BUDGET を
--- 超えるときも粗くする。1/4 なら MAX_PIXELS まで広げても 1210 万で収まる
+-- 1 フレームに持つ cache（光のバッファ 体積光 7 枚・ベタ 6 枚 + 升目）が CACHE_BUDGET を
+-- 超えるときも粗くする。v1.14 から広げた画像は退避しない（object のまま読む）
 local LIGHT_BUFS = fill_mode == 0 and 7 or 6
 local function cache_pixels(sv, l, r, t, b)
   local ww, hh = w0 + l + r, h0 + t + b
-  return ww * hh + LIGHT_BUFS * math.ceil(ww / sv) * math.ceil(hh / sv) + pool_pixels
+  return LIGHT_BUFS * math.ceil(ww / sv) * math.ceil(hh / sv) + pool_pixels
 end
 local left, right, top, bottom = plan_pad(s)
 while s < 4 and ((w0 + left + right) * (h0 + top + bottom) > WORK_MAX * s * s
                  or cache_pixels(s, left, right, top, bottom) > CACHE_BUDGET) do
   s = s * 2
   left, right, top, bottom = plan_pad(s)
+end
+-- 1/4 でも収まらない（横長の巨大素材など）なら、広げる前に素通しにする
+if cache_pixels(s, left, right, top, bottom) > CACHE_BUDGET then
+  budget.refuse("光束_H", w0 + left + right, h0 + top + bottom)
+  if light_only == 1 then obj.clearbuffer("object") end
+  return
 end
 obj.effect("領域拡張", "上", top, "下", bottom, "左", left, "右", right, "塗りつぶし", 0)
 -- 広げ方が左右・上下で違うので、元の画像が同じ位置に残るよう中心をずらす（ロングシャドー_H と同じ）
@@ -538,11 +547,9 @@ if light_color then
   lr, lg, lb = lin_rgb(light_color)
 end
 
-obj.copybuffer("cache:lb/src", "object")
-
 local function emit(target, emit_kind, scale)
   obj.clearbuffer(target, Ww, Hw)
-  obj.pixelshader("ps_lb_emit", target, "cache:lb/src", {
+  obj.pixelshader("ps_lb_emit", target, "object", {
     W, H, s, emit_kind,
     lr, lg, lb, use_source,
     scale, threshold / 100,
@@ -631,7 +638,7 @@ local wx = wind_speed * obj.time * math.cos(wr) / fog_scale
 local wy = wind_speed * obj.time * math.sin(wr) / fog_scale
 local wxi, wyi = math.floor(wx), math.floor(wy)
 
-obj.pixelshader("ps_lb_final", "object", { "cache:lb/src", "cache:lb/S", "cache:lb/R" }, {
+obj.pixelshader("ps_lb_final", "object", { "object", "cache:lb/S", "cache:lb/R" }, {
   W, H, Ww, Hw,
   lcx, lcy, dx, dy,
   ox, oy, wxi, wyi,

@@ -1,4 +1,4 @@
---information:ビーム化_H v1.12 by HexBrowns
+--information:ビーム化_H v1.13 by HexBrowns
 --label:HexScript
 --group:光
 --color@glow_color:光の色,nil
@@ -26,7 +26,12 @@
 --group
 
 --[[
-ビーム化_H v1.12
+ビーム化_H v1.13
+
+v1.13: 元の画像を cache に退避しない。芯・道のり・放射・光は広げる前の object から作り、広げた後の合成は
+広げた object をそのまま読む。4K・横長の巨大素材で cache と tempbuffer の枠（1600 万ドット）に収まらなければ、
+光を縮める率の下限を 2・4・… と上げ、それでも収まらなければ効果を掛けない
+（AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）。
 
 v1.12: 元の画像の退避（cache:beamh/src）を広げる前の大きさにした。cache と tempbuffer の枠（1600 万ドット）を
 外側の広がりによらず超えないようにするため（AI/scripts/issues/20260925_beam_cache_budget_over_16m.md）。
@@ -431,11 +436,10 @@ float beamh_erfinv(float x) {
 }
 float4 ps_beamh_final(float4 pos : SV_Position) : SV_Target {
     int3 ip = int3(pos.xy, 0);
-    // src は広げる前の元の画像（v1.12）。path_origin / path_size が広げた画像の中での元の画像の位置と大きさ
-    int2 sp = ip.xy - int2(path_origin);
+    // src は広げた画像（v1.13。v1.12 は広げる前の元の画像を退避して path_origin の位置で読んでいた）。広げた所は透明
     float core_a = 0.0;
-    if (sp.x >= 0 && sp.y >= 0 && sp.x < (int)path_size.x && sp.y < (int)path_size.y) {
-        core_a = src.Load(int3(sp, 0)).a;
+    if (ip.x < (int)size.x && ip.y < (int)size.y) {
+        core_a = src.Load(ip).a;
     }
     if (core_mode > 0.5) {
         // ぼかしたアルファ b = Φ(d / σ) から輪郭までの距離 d を戻す（直線の縁で正確）。
@@ -478,17 +482,15 @@ end
 -- 光のぼかしの段取り。σ = 広がり / 2 を、縮小後の σ が 6 以下になるまで縮めてから掛ける。
 -- タップは 4σ まで取る。3σ で打ち切ると、ガンマで持ち上がった裾（黒地で 10/255 ほど）が
 -- 四角い縁として見える。reach は 1 画素の光が届く距離（縮小のテント + ぼかし + 双線形の読み出し）
-local function glow_plan(radius, gain)
+-- fmin は縮小率の下限（v1.13。cache の枠に収めるときだけ 1 より大きくする）
+local function glow_plan(radius, gain, fmin)
   if gain <= 0 then return nil end
   local sigma = math.max(radius, 0) / 2
-  local f = math.min(DOWN_MAX, math.max(1, math.ceil(sigma / 6)))
+  local f = math.min(DOWN_MAX, math.max(fmin or 1, math.ceil(sigma / 6)))
   local s = sigma / f
   local taps = math.min(BLUR_MAX_TAPS, math.ceil(4 * s))
   return { factor = f, sigma = s, taps = taps, reach = (taps + 2) * f }
 end
-
-local inner = glow_plan(inner_radius, inner_gain)
-local outer = glow_plan(outer_radius, outer_gain)
 
 -- 芯。太さもぼかしも 0 なら元のアルファをそのまま使う
 local core_mode = core_offset ~= 0 or core_soft > 0
@@ -496,28 +498,58 @@ local core_sigma = math.min(CORE_SIGMA_MAX, math.max(0.5, (math.abs(core_offset)
 local core_taps = math.min(BLUR_MAX_TAPS, math.ceil(3 * core_sigma))
 local core_width = math.max(core_soft, 1)
 
--- 広げる量。光が 0 まで落ちきる所より外まで広げる
-local pad = 0
-if core_mode then pad = math.max(core_offset, 0) + core_width / 2 + 1 end
-if inner then pad = math.max(pad, inner.reach) end
-if outer then pad = math.max(pad, outer.reach) end
-pad = math.ceil(pad) + 2
-
 local max_w, max_h = obj.getinfo("image_max")
 max_w = math.min(16384, max_w or 16384)
 max_h = math.min(16384, max_h or 16384)
-local pad_x = math.max(0, math.min(pad, math.floor((max_w - w0) / 2)))
-local pad_y = math.max(0, math.min(pad, math.floor((max_h - h0) / 2)))
--- 元の画像は広げる前の大きさで退避する（v1.12）。cache と tempbuffer は合わせて 1600 万ドットの枠を共有し、
--- 超えると古いものから黙って捨てられる。v1.11 は広げた画像を退避していたので、外側の広がり 300 前後
--- （FHD）で枠を超え、最後の合成で invalid buffer type になった（BEM-21 / 23。
--- AI/scripts/issues/20260925_beam_cache_budget_over_16m.md）。読む側（pool・芯・放射・合成）は
--- 元の画像の座標で読み、外は透明として扱う
-obj.copybuffer("cache:beamh/src", "object")
-if pad_x > 0 or pad_y > 0 then
-  obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+
+-- 光の段取りと広げる量。広げる量は光が 0 まで落ちきる所より外まで
+local inner, outer, pad_x, pad_y
+local function plan_all(fmin)
+  inner = glow_plan(inner_radius, inner_gain, fmin)
+  outer = glow_plan(outer_radius, outer_gain, fmin)
+  local pad = 0
+  if core_mode then pad = math.max(core_offset, 0) + core_width / 2 + 1 end
+  if inner then pad = math.max(pad, inner.reach) end
+  if outer then pad = math.max(pad, outer.reach) end
+  pad = math.ceil(pad) + 2
+  pad_x = math.max(0, math.min(pad, math.floor((max_w - w0) / 2)))
+  pad_y = math.max(0, math.min(pad, math.floor((max_h - h0) / 2)))
 end
-local W, H = obj.w, obj.h
+
+-- v1.13: cache と tempbuffer の枠（1600 万ドット）に収める。元の画像は退避しない（広げる前の object から芯・道のり・
+-- 放射・光を作り、広げた後の合成は広げた object を読む）。残るのは道のりの地図・放射・芯（元の画像の大きさ）と光で、
+-- 収まらなければ光を縮める率の下限を上げる。放射・芯・道のりだけで収まらなければ効果を掛けない
+-- （AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）
+local budget = require("EffectUtils_Budget")
+local function need()
+  local function reg(reach)
+    return w0 + 2 * math.min(reach, pad_x), h0 + 2 * math.min(reach, pad_y)
+  end
+  local keep, peak = 0, 0
+  if along == 1 and (fade_root > 0 or fade_tip > 0 or noise_amount > 0) then keep = keep + w0 * h0 end
+  if inner or outer then keep = keep + w0 * h0 end
+  if core_mode then
+    local cw, ch = reg(math.ceil(math.max(core_offset, 0) + core_width / 2) + 2)
+    keep, peak = keep + cw * ch, cw * ch
+  end
+  for _, p in ipairs({ inner or false, outer or false }) do
+    if p then
+      local rw, rh = reg(p.reach)
+      local lw, lh = math.ceil(rw / p.factor), math.ceil(rh / p.factor)
+      keep = keep + lw * lh
+      peak = math.max(peak, (p.factor == 1) and rw * rh or (lw * rh + 2 * lw * lh))
+    end
+  end
+  return keep + peak
+end
+local fmin = 1
+plan_all(fmin)
+while not budget.fits(need()) and fmin < DOWN_MAX do
+  fmin = fmin * 2
+  plan_all(fmin)
+end
+if not budget.check("ビーム化_H", w0, h0, need()) then return end
+local W, H = w0 + 2 * pad_x, h0 + 2 * pad_y
 
 -- 長さ方向
 local rad = math.rad(direction)
@@ -627,7 +659,7 @@ local function build_path_map(band_px)
   local gw, gh = math.ceil(w0 / k), math.ceil(h0 / k)
   local n = gw * gh
   obj.clearbuffer("cache:beamh/pool", gw, gh)
-  obj.pixelshader("ps_beamh_pool", "cache:beamh/pool", "cache:beamh/src", { 0, 0, w0, h0, k }, "copy")
+  obj.pixelshader("ps_beamh_pool", "cache:beamh/pool", "object", { 0, 0, w0, h0, k }, "copy")
   local px = ffi.cast("uint8_t*", obj.getpixeldata("cache:beamh/pool"))
   local mask = ffi.new("uint8_t[?]", n)
   local ncell = 0
@@ -785,7 +817,8 @@ local function build_path_map(band_px)
   return "cache:beamh/pmap", 0, total * k
 end
 
-local path_buf, path_s0, path_s1, along_on = "cache:beamh/src", 0, 1, 0
+-- 使わないときの resource は object（読まない）
+local path_buf, path_s0, path_s1, along_on = "object", 0, 1, 0
 -- フェードも揺らぎも無ければ長さ方向は使わないので、地図も作らない
 if along == 1 and (fr > 0 or ft > 0 or na > 0) then
   local band = math.max(core_offset, 0) + core_width + 4
@@ -805,12 +838,12 @@ local function region(reach)
   return pad_x - rx, pad_y - ry, w0 + 2 * rx, h0 + 2 * ry
 end
 
-local core_buf = "cache:beamh/src"
+local core_buf = "object"
 local core_ox, core_oy, core_w, core_h = 0, 0, 1, 1
 if core_mode then
   core_ox, core_oy, core_w, core_h = region(math.ceil(math.max(core_offset, 0) + core_width / 2) + 2)
   obj.clearbuffer("cache:beamh/tmp", core_w, core_h)
-  obj.pixelshader("ps_beamh_blur", "cache:beamh/tmp", "cache:beamh/src",
+  obj.pixelshader("ps_beamh_blur", "cache:beamh/tmp", "object",
     { 1, 0, w0, h0, core_ox - pad_x, core_oy - pad_y, core_sigma, core_taps }, "copy")
   obj.clearbuffer("cache:beamh/core", core_w, core_h)
   obj.pixelshader("ps_beamh_blur", "cache:beamh/core", "cache:beamh/tmp",
@@ -826,7 +859,7 @@ if inner or outer then
     gr, gg, gb = lin_rgb(glow_color)
   end
   obj.clearbuffer("cache:beamh/emit", w0, h0)
-  obj.pixelshader("ps_beamh_emit", "cache:beamh/emit", { "cache:beamh/src", path_buf }, {
+  obj.pixelshader("ps_beamh_emit", "cache:beamh/emit", { "object", path_buf }, {
     W, H, dx, dy,
     gr, gg, gb, use_source,
     half_len, fr, ft, na,
@@ -876,12 +909,17 @@ end
 local g1x, g1y, g1ox, g1oy = run_glow(inner, "g1")
 local g2x, g2y, g2ox, g2oy = run_glow(outer, "g2")
 
+-- ここまでは広げる前の object を読んだ。ここで広げる（合成は広げた object の上に描く）
+if pad_x > 0 or pad_y > 0 then
+  obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
+end
+
 -- 光のバッファの外は透明として読む（sampler "clip"）
 local cr, cg, cb = lin_rgb(core_color)
 local ig = inner and inner_gain / 100 or 0
 local og = outer and outer_gain / 100 or 0
 obj.pixelshader("ps_beamh_final", "object",
-  { "cache:beamh/src", core_buf, "cache:beamh/g1", "cache:beamh/g2", path_buf }, {
+  { "object", core_buf, "cache:beamh/g1", "cache:beamh/g2", path_buf }, {
     W, H, dx, dy,
     g1x, g1y, g2x, g2y,
     cr, cg, cb, core_gain / 100,

@@ -357,7 +357,7 @@ obj.pixelshader("ps_spill", "object", { "object" }, {
 })
 
 @トラックマット
---information:トラックマット@キーイング_H v1.03 by HexBrowns
+--information:トラックマット@キーイング_H v1.04 by HexBrowns
 --label:HexScript
 --track@layer_rel:参照レイヤー,-10,10,-1,1
 --select@matte_src:マット元=0,輝度=0,アルファ=1
@@ -421,6 +421,17 @@ if matte_strength <= 0 then return end
 
 local target_layer = math.floor(obj.layer + layer_rel + 0.5)
 if target_layer < 1 then return end
+-- v1.04: 参照レイヤーが自分（参照レイヤー 0）なら読まない。読むと自分の描画の中でまた自分を読み、本体の Lua の入れ子の
+-- 上限で script exception になる（色調転写@Filters_H v1.01 と同じ扱い。警告を 1 回出して効果を適用しない。
+-- AI/scripts/issues/20261013_layer_reference_self_recursion.md）
+if target_layer == obj.layer then
+  local k = "KeyingH:TM:self:" .. target_layer
+  if global[k] == nil then
+    global[k] = "1"
+    print("@warn", "[トラックマット@キーイング_H] 参照レイヤーに自分のレイヤー（" .. target_layer .. "）は使えません。効果を適用しません")
+  end
+  return
+end
 
 -- obj.load("layer", ...) はオブジェクトの内容とサイズに加えて obj.* も読んだレイヤーの値で
 -- 置き換える（ルール au2-lua-pitfalls「別レイヤーの大きさを測るのに使える」）。
@@ -488,7 +499,7 @@ obj.pixelshader("ps_trackmatte", "tempbuffer", { "tempbuffer", "object" }, {
 obj.copybuffer("object", "tempbuffer")
 
 @動体抽出
---information:動体抽出@キーイング_H v1.00 by HexBrowns
+--information:動体抽出@キーイング_H v1.01 by HexBrowns
 --label:HexScript
 --filter
 --group:比較
@@ -797,8 +808,23 @@ end
 local w, h = obj.w, obj.h
 if w < 2 or h < 2 then return end
 local div = (res == 4) and 4 or ((res == 1) and 1 or 2)
-local lw, lh = math.ceil(w / div), math.ceil(h / div)
 local color = (use_color == 1) and 1 or 0
+-- v1.01: 元の画像は、object を読み替えるとき（動画ファイル・グリッド画像）だけ cache に退避する。作業用のバッファが
+-- cache と tempbuffer の枠（1600 万ドット）に収まらなければ作業解像度を 2 倍ずつ粗くし、それでも収まらなければ効果を掛けない
+-- （AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）
+local keep_src = (src_mode == 1) or (grid == 1 and grid_file ~= nil and grid_file ~= "")
+do
+  local budget = require("EffectUtils_Budget")
+  local function need(d)
+    local qw, qh = math.ceil(w / d), math.ceil(h / d)
+    local qp = (color == 1) and qw or math.ceil(qw / 3)
+    -- a・b・m と動画なら c、詰めた 2 枚。セルの格子などの小さいものに 1/8 を見込む
+    return (keep_src and w * h or 0) + qw * qh * ((src_mode == 1) and 4 or 3) + 2 * qp * qh + math.ceil(qw * qh / 8)
+  end
+  while not budget.fits(need(div)) and div < 16 do div = div * 2 end
+  if not budget.check("動体抽出@キーイング_H", w, h, need(div)) then return end
+end
+local lw, lh = math.ceil(w / div), math.ceil(h / div)
 local pw = (color == 1) and lw or math.ceil(lw / 3)
 local K = math.max(1, math.floor(interval + 0.5))
 local grad = (gradient == 1) and 1 or 0
@@ -821,7 +847,11 @@ local function prepare(a, packed)
   obj.pixelshader("ps_md_pack", packed, {a}, { lw, lh, color }, "copy")
 end
 
-obj.copybuffer("cache:md/src", "object")
+local src = "object"
+if keep_src then
+  src = "cache:md/src"
+  obj.copybuffer(src, "object")
+end
 local have_prev = false
 
 if src_mode == 1 then
@@ -843,7 +873,7 @@ if src_mode == 1 then
     prepare("cache:md/c", "cache:md/pp")
     have_prev = true
   end
-  obj.copybuffer("object", "cache:md/src")
+  obj.copybuffer("object", src)
 else
   -- 履歴: 今のフレームを詰めて読み戻し、リングの f の枠へ。f − 間隔 の枠が同じ番号・同じ設定のときだけ比較元にする
   prepare("cache:md/a", "cache:md/pk")
@@ -1034,7 +1064,7 @@ if grid == 1 and grid_file ~= nil and grid_file ~= "" then
   else
     warn_once("grid:" .. tostring(grid_file), "配置する画像を読めない: " .. tostring(grid_file))
   end
-  obj.copybuffer("object", "cache:md/src")
+  obj.copybuffer("object", src)
 end
 
 local tr, tg, tb = RGB(tint)
@@ -1048,10 +1078,10 @@ local rest = {
   out_mode, (invert == 1) and 1 or 0, use_keep, 4, (show_frame == 1) and 1 or 0, frame_shape, nbox, grid_on, grid_pitch,
 }
 for i = 1, #rest do c[128 + i] = rest[i] end
-obj.pixelshader("ps_md_apply", "object", {"cache:md/src", "cache:md/m", keep_tex, grid_tex}, c, "copy", "clamp")
+obj.pixelshader("ps_md_apply", "object", {src, "cache:md/m", keep_tex, grid_tex}, c, "copy", "clamp")
 
 @同型塗りつぶし
---information:同型塗りつぶし@キーイング_H v1.01 by HexBrowns
+--information:同型塗りつぶし@キーイング_H v1.02 by HexBrowns
 --label:HexScript
 --filter
 --track@seed_x:X,-4000,4000,0,0.1
@@ -1269,13 +1299,28 @@ if mod.find_bits == nil then
 end
 
 local div = (res == 2) and 2 or 1
-obj.copybuffer("cache:sf/src", "object")
+-- v1.02: 元の画像は cache に退避せず object のまま読む（照合に渡す画素は同じ）。マスク・詰めたビット・ぼかしの作業が
+-- cache と tempbuffer の枠（1600 万ドット）に収まらなければ、効果を掛けずに 1 回知らせる（解像度は勝手に下げない。照合の結果が変わるため）
+-- （AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）
+do
+  local budget = require("EffectUtils_Budget")
+  local function need(d)
+    local qw, qh = math.ceil(w / d), math.ceil(h / d)
+    return qw * qh * ((feather > 0) and 2 or 1) + math.ceil(qw / 24) * qh
+  end
+  if not budget.fits(need(div)) then
+    local hint = (div == 1 and budget.fits(need(2))) and "。解像度を 1/2 にすると掛かります" or ""
+    budget.warn_once("同型塗りつぶし@キーイング_H", w .. "x" .. h .. "/" .. div,
+      "画像（" .. w .. "x" .. h .. "）が大きく、作業用のバッファが枠（cache と tempbuffer の合計 1600 万ドット）に収まらないので、効果を掛けません" .. hint)
+    return
+  end
+end
 local mw, mh = w, h
-local fg_src = "cache:sf/src"
+local fg_src = "object"
 if div == 2 then
   mw, mh = math.ceil(w / 2), math.ceil(h / 2)
   obj.clearbuffer("cache:sf/mask", mw, mh)
-  obj.pixelshader("ps_sf_down", "cache:sf/mask", {"cache:sf/src"}, { w, h, mw, mh }, "copy")
+  obj.pixelshader("ps_sf_down", "cache:sf/mask", {"object"}, { w, h, mw, mh }, "copy")
   fg_src = "cache:sf/mask"
 end
 local sx, sy = math.floor((seed_x + w / 2) / div), math.floor((seed_y + h / 2) / div)
@@ -1311,7 +1356,7 @@ if feather > 0 then
 end
 
 local fr, fg, fb = RGB(fill_color)
-obj.pixelshader("ps_sf_final", "object", {"cache:sf/src", "cache:sf/mask"}, {
+obj.pixelshader("ps_sf_final", "object", {"object", "cache:sf/mask"}, {
   fr / 255, fg / 255, fb / 255, opacity / 100,
   w, h, mw * div, mh * div,
   blend, (invert == 1) and 1 or 0, (keep_luma == 1) and 1 or 0, out_mode,

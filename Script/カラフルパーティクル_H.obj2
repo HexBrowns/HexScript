@@ -1,4 +1,4 @@
---information:カラフルパーティクル_H v1.00 by HexBrowns
+--information:カラフルパーティクル_H v1.10 by HexBrowns
 --label:HexScript
 --object
 
@@ -20,6 +20,14 @@
 --check@colorful:カラフル,1
 --color@col:色,0xffffff
 --hide@col:colorful==1
+--select@color_space:色空間=0,今まで=0,HSV=3,Oklch=7
+--hide@color_space:colorful==0
+--track@ok_l:明度(L),0,100,75,0.1
+--hide@ok_l:colorful==0
+--hide@ok_l:color_space~=7
+--track@ok_c:彩度(C),0,0.4,0.15,0.001
+--hide@ok_c:colorful==0
+--hide@ok_c:color_space~=7
 --group
 
 --group:変化
@@ -44,7 +52,19 @@
   ・旧形式の --dialog を --track@ / --figure@ / --check@ に置き換えた
   ・原作で常に 0 だった未使用の乱数（XY 角度・Z など）を呼ばない
 
+カラフルの色空間（v1.10）
+  今まで : 原作の式。乱数 c（-0.5〜0.5）で G = cos、負なら B・正なら R = sin。青〜緑〜赤だけで紫・マゼンタは出ない
+  HSV    : 同じ乱数で色相を一周から選ぶ。彩度・明度は 100%
+  Oklch  : 同じ乱数で色相を一周から選び、明度(L)・彩度(C) は項目の値。sRGB に無い色は L と色相を保って C を下げる
+  どれも乱数は 1 粒に obj.rand(0, 100, i, 100) を 1 回だけ引く（位置・回転・大きさの乱数は色空間で変わらない）
+
+版の履歴
+  v1.00 初版
+  v1.10（2026-10-13）カラフルの色空間（今まで / HSV / Oklch。既定は今まで）を足した。
+        仕様: AI/specifications/20261013_色空間拡張_spec.md
+
 検証器: AI/scripts/カラフルパーティクル_H/verify_colorful_particle.py
+        AI/scripts/カラフルパーティクル_H/verify_colorspace_ext.py（色空間）
 ]]
 
 local obj, math = obj, math
@@ -62,8 +82,27 @@ local n = obj.totaltime / b
 local i_lo = math.max(0, math.floor((time - v) / b) - 1)
 local i_hi = math.min(math.ceil(n) - 1, math.ceil(time / b) + 1)
 
+-- Oklch は共有部品で計算する。読めなければ今までの式で描く
+local cs
+if colorful == 1 and color_space == 7 then
+  local okc, m = pcall(require, "EffectUtils_ColorSpace")
+  if okc and m then
+    cs = m
+  elseif not _COLORFUL_PARTICLE_H_WARNED then
+    _COLORFUL_PARTICLE_H_WARNED = true
+    print("@warn", "[カラフルパーティクル_H] Oklch に EffectUtils_ColorSpace.lua が要ります（Script/ に置いてください）。今までの式で描きます")
+  end
+end
+
+-- 粒 i の色。乱数は色空間によらず obj.rand(0, 100, i, 100) を 1 回だけ引く（0〜100 の 101 通り）
 local function colorful_color(i)
-  local c = (obj.rand(0, 100, i, 100) - 50) / 100
+  local r = obj.rand(0, 100, i, 100)
+  if color_space == 3 then
+    return HSV(r / 101 * 360, 100, 100)
+  elseif cs then
+    return cs.pack(cs.from_space(r / 101, ok_c, ok_l / 100, 7))
+  end
+  local c = (r - 50) / 100
   if c < 0 then
     return math.floor(math.cos(math.pi * c) * 255) * 256 + math.floor(math.sin(math.pi * -c) * 255)
   end

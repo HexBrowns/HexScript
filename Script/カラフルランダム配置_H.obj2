@@ -1,4 +1,4 @@
---information:カラフルランダム配置_H v1.00 by HexBrowns
+--information:カラフルランダム配置_H v1.10 by HexBrowns
 --label:HexScript
 --object
 
@@ -16,6 +16,14 @@
 --check@colorful:カラフル,1
 --color@col:色,0xffffff
 --hide@col:colorful==1
+--select@color_space:色空間=0,今まで=0,HSV=3,Oklch=7
+--hide@color_space:colorful==0
+--track@ok_l:明度(L),0,100,75,0.1
+--hide@ok_l:colorful==0
+--hide@ok_l:color_space~=7
+--track@ok_c:彩度(C),0,0.4,0.15,0.001
+--hide@ok_c:colorful==0
+--hide@ok_c:color_space~=7
 --track@rzv_ran:ランダムZ回転,0,3600,0,0.1
 --track@s_ran:ランダム拡大[-%],0,100,0,0.1
 --group
@@ -30,7 +38,19 @@
     （i = 0 〜 個数-1 の粒は原作と同じ位置・色・大きさ。原作の最後の 1 個だけが無くなる）
   ・旧形式の --dialog を --track@ / --figure@ / --check@ に置き換えた
 
+カラフルの色空間（v1.10）
+  今まで : 原作の式。乱数 c（-0.5〜0.5）で G = cos、負なら B・正なら R = sin。青〜緑〜赤だけで紫・マゼンタは出ない
+  HSV    : 同じ乱数で色相を一周から選ぶ。彩度・明度は 100%
+  Oklch  : 同じ乱数で色相を一周から選び、明度(L)・彩度(C) は項目の値。sRGB に無い色は L と色相を保って C を下げる
+  どれも乱数は 1 粒に obj.rand(0, 100, i, 100) を 1 回だけ引く（位置・回転・大きさの乱数は色空間で変わらない）
+
+版の履歴
+  v1.00 初版
+  v1.10（2026-10-13）カラフルの色空間（今まで / HSV / Oklch。既定は今まで）を足した。
+        仕様: AI/specifications/20261013_色空間拡張_spec.md
+
 検証器: AI/scripts/カラフルランダム配置_H/verify_colorful_random.py
+        AI/scripts/カラフルランダム配置_H/verify_colorspace_ext.py（色空間）
 ]]
 
 local obj, math = obj, math
@@ -49,15 +69,36 @@ if colorful ~= 1 then
   obj.effect()
 end
 
+-- Oklch は共有部品で計算する。読めなければ今までの式で描く
+local cs
+if colorful == 1 and color_space == 7 then
+  local okc, m = pcall(require, "EffectUtils_ColorSpace")
+  if okc and m then
+    cs = m
+  elseif not _COLORFUL_RANDOM_H_WARNED then
+    _COLORFUL_RANDOM_H_WARNED = true
+    print("@warn", "[カラフルランダム配置_H] Oklch に EffectUtils_ColorSpace.lua が要ります（Script/ に置いてください）。今までの式で描きます")
+  end
+end
+
+-- 粒 i の色。乱数は色空間によらず obj.rand(0, 100, i, 100) を 1 回だけ引く（0〜100 の 101 通り）
+local function colorful_color(i)
+  local r = obj.rand(0, 100, i, 100)
+  if color_space == 3 then
+    return HSV(r / 101 * 360, 100, 100)
+  elseif cs then
+    return cs.pack(cs.from_space(r / 101, ok_c, ok_l / 100, 7))
+  end
+  local c = (r - 50) / 100
+  if c < 0 then
+    return math.floor(math.cos(math.pi * c) * 255) * 256 + math.floor(math.sin(math.pi * -c) * 255)
+  end
+  return math.floor(math.cos(math.pi * c) * 255) * 256 + math.floor(math.sin(math.pi * c) * 255) * 65536
+end
+
 for i = 0, n - 1 do
   if colorful == 1 then
-    local c = (obj.rand(0, 100, i, 100) - 50) / 100
-    if c < 0 then
-      c = math.floor(math.cos(math.pi * c) * 255) * 256 + math.floor(math.sin(math.pi * -c) * 255)
-    else
-      c = math.floor(math.cos(math.pi * c) * 255) * 256 + math.floor(math.sin(math.pi * c) * 255) * 65536
-    end
-    obj.load("figure", name, c, f_size, f_line)
+    obj.load("figure", name, colorful_color(i), f_size, f_line)
     obj.effect()
   end
   local x = obj.rand(-sw, sw, i, 0) / 2 * track1 / 100

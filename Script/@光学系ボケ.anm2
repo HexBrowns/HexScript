@@ -1,5 +1,5 @@
 @玉ボケ
---information:玉ボケ@光学系ボケ v1.02 by HexBrowns
+--information:玉ボケ@光学系ボケ v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:ボケ半径,0,200,30,0.1
@@ -9,129 +9,155 @@
 --select@shape:形状,円=0,六角形=1,八角形=2
 --check@add_blend:加算合成,true
 
--- [1] ハイライト抽出
---[[pixelshader@highlight_extract:
+-- v1.10（強化デバッグ 7.5）: 速くし、4K・横長の素材でも cache の枠に収める。
+--   v1.02 までは元の大きさのまま、半径の内側の画素を 1 画素ずつ集めていた（1 画素あたり (2 x 半径 + 1)^2 回。
+--   FHD の既定で 58ms、半径 200 で 3.3 秒。実機 2026-10-13）。v1.10 は
+--     [1] 縮小しながらハイライトを抜き出す（object → tempbuffer）
+--     [2] 縮小した画像でぼかす（tempbuffer → cache:tama_blur）
+--     [3] 広げた大きさへバイリニアで戻しながら合成する（object と cache:tama_blur → object）
+--   縮小率は「縮小した画像での半径」が RADIUS_CAP 画素を超えない分だけ（半径 30 なら 1.875。半径 16 以下は縮小しない）。
+--   玉の縁は縮小率の画素ほど柔らかくなる（半径に対しておよそ 1 / RADIUS_CAP）。
+--   元の画像は cache に退避しない（広げた画像は object のまま。cache と tempbuffer は縮小した 2 枚だけ）
+--   机上検証: AI/scripts/光学系ボケ/verify_speed.py（v1.02 との見た目の差・枠の見積もり）
+
+-- [1] 縮小しながらハイライトを抜き出す（v1.02 の highlight_extract を画素ごとに掛けてから平均する）
+--     出力の 1 画素は、広げた画像の [floor(pos) x cb_step, + cb_step) を覆う（端数は覆う割合で数える）。
+--     元の画像は広げた画像の (cb_off) だけ内側にあり、その外は透明として数える
+--     正本。@レンズぼかし / @チルトシフト / @球面収差ボケ の *_down はこれからハイライトの抜き出しを除いたもの
+--[[pixelshader@tama_down:
 Texture2D src : register(t0);
 cbuffer constant0 : register(b0) {
-    float cb_threshold;
-    float cb_smooth_w;
-    float2 cb_pad0;
+    float2 cb_step;
+    float2 cb_off;
+    float2 cb_src;
+    float  cb_taps;
+    float  cb_threshold;
+    float  cb_smooth_w;
 };
 
-float4 highlight_extract(float4 pos : SV_Position) : SV_Target
+float4 tama_down(float4 pos : SV_Position) : SV_Target
 {
-    const int2   xy  = int2(floor(pos.xy));
-    const float4 col = src.Load(int3(xy, 0));
-    if (col.a < 0.0001) return float4(0, 0, 0, 0);
-    const float3 linear_rgb = col.rgb / col.a;
-    const float  lum  = dot(linear_rgb, float3(0.299, 0.587, 0.114));
-    const float  mask = smoothstep(cb_threshold - cb_smooth_w, cb_threshold, lum);
-    return col * mask;
+    const float2 a    = floor(pos.xy) * cb_step;
+    const float2 b    = a + cb_step;
+    const int2   p0   = int2(floor(a));
+    const int    m    = int(cb_taps + 0.5);
+    const int2   off  = int2(cb_off);
+    const int2   smax = int2(cb_src) - int2(1, 1);
+    float4 acc = float4(0, 0, 0, 0);
+    [loop]
+    for (int ky = 0; ky < m; ky++)
+    {
+        const int   py = p0.y + ky;
+        const float wy = saturate(min(b.y, float(py) + 1.0) - max(a.y, float(py)));
+        [loop]
+        for (int kx = 0; kx < m; kx++)
+        {
+            const int   px = p0.x + kx;
+            const float wx = saturate(min(b.x, float(px) + 1.0) - max(a.x, float(px)));
+            const int2  q  = int2(px, py) - off;
+            [branch]
+            if (q.x < 0 || q.y < 0 || q.x > smax.x || q.y > smax.y) continue;
+            const float4 col = src.Load(int3(q, 0));
+            [branch]
+            if (col.a < 0.0001) continue;
+            const float3 lin  = col.rgb / col.a;
+            const float  lum  = dot(lin, float3(0.299, 0.587, 0.114));
+            const float  mask = smoothstep(cb_threshold - cb_smooth_w, cb_threshold, lum);
+            acc += col * (mask * wx * wy);
+        }
+    }
+    return acc / (cb_step.x * cb_step.y);
 }
 ]]
 
--- [2] ディスクカーネルブラー（非正規化 / パディング対応）
---     acc をそのまま返すことで輝点が丸い玉として広がる
---     登録名はファイル全体で共有されるので、セクションごとに固有の名前にする（v1.01。
---     v1.00 は 3 セクションが別の中身のまま同じ diskblur を定義していた）
---     出力は元の画像を (cb_offset_x, cb_offset_y) だけ内側に置いた大きさ。重みで割らないので、
---     画像の外のタップは足さないだけでよい（透明として数えるのと同じ）
---[[pixelshader@tama_diskblur:
+-- [2] 縮小した画像でのディスクブラー（非正規化）。acc をそのまま返すことで輝点が丸い玉として広がる
+--     タップは広げた画像で cb_step おきに並ぶ。形の距離は広げた画像の画素で測り、縁は cb_aa の幅で覆う割合にする
+--     （半径を動かしても縁が段にならない）。六角形は v1.02 と同じく上下を半径で切る（v1.02 はループの範囲で切れていた）。
+--     縮小した 1 画素は元の cb_gain（= 縮小率の 2 乗）画素ぶんなので、和に掛けて v1.02 の明るさに合わせる。
+--     各行の dx の範囲は dy だけで決まる（画素によらない）ので、GPU の中で回数がばらつかない
+--     正本。@レンズぼかし の lens_blur はこれを平均にしたもの
+--[[pixelshader@tama_blur:
 Texture2D src : register(t0);
 cbuffer constant0 : register(b0) {
-    float cb_radius;
-    float cb_edge_str;
-    float cb_shape;
-    float cb_pad_x;
-    float cb_src_w;
-    float cb_src_h;
-    float cb_offset_x;
-    float cb_offset_y;
+    float2 cb_step;
+    float2 cb_low;
+    float  cb_radius;
+    float  cb_edge_str;
+    float  cb_shape;
+    float  cb_aa;
+    float  cb_gain;
 };
 
-bool dskb_hex(float dx, float dy, float r)
+float4 tama_blur(float4 pos : SV_Position) : SV_Target
 {
-    const float ax = abs(dx), ay = abs(dy);
-    return (ax <= r) && (ax * 0.5 + ay * 0.866025 <= r);
-}
-bool dskb_oct(float dx, float dy, float r)
-{
-    const float ax = abs(dx), ay = abs(dy);
-    return (ax <= r) && (ay <= r) && ((ax + ay) * 0.707107 <= r);
-}
-
-float4 tama_diskblur(float4 pos : SV_Position) : SV_Target
-{
-    const int2 off    = int2(int(cb_offset_x), int(cb_offset_y));
-    const int  wmax   = int(cb_src_w) - 1;
-    const int  hmax   = int(cb_src_h) - 1;
-    const int  r_int  = int(ceil(cb_radius));
-    const int  ishape = int(cb_shape + 0.5);
-    const int2 xy     = int2(floor(pos.xy)) - off;
+    const int2  xy     = int2(floor(pos.xy));
+    const int2  lmax   = int2(cb_low) - int2(1, 1);
+    const int   ishape = int(cb_shape + 0.5);
+    const float rr     = cb_radius + 0.5 * cb_aa;
+    const float inv_r  = 1.0 / max(cb_radius, 0.0001);
+    const int   ny     = int(floor(rr / cb_step.y));
 
     float4 acc = float4(0, 0, 0, 0);
-
     [loop]
-    for (int dy = -r_int; dy <= r_int; dy++)
+    for (int dy = -ny; dy <= ny; dy++)
     {
+        const float oy = float(dy) * cb_step.y;
+        const float ay = abs(oy);
+        float ex = sqrt(max(rr * rr - oy * oy, 0.0));
+        [branch]
+        if      (ishape == 1) ex = min(rr, 2.0 * (rr - 0.866025 * ay));
+        else if (ishape == 2) ex = min(rr, rr * 1.414214 - ay);
+        const int nx = int(floor(max(ex, 0.0) / cb_step.x));
         [loop]
-        for (int dx = -r_int; dx <= r_int; dx++)
+        for (int dx = -nx; dx <= nx; dx++)
         {
-            const float fdx = float(dx), fdy = float(dy);
-            const float dist = length(float2(fdx, fdy));
-
-            bool inside;
+            const int2 q = xy + int2(dx, dy);
             [branch]
-            if      (ishape == 2) inside = dskb_oct(fdx, fdy, cb_radius);
-            else if (ishape == 1) inside = dskb_hex(fdx, fdy, cb_radius);
-            else                  inside = (dist <= cb_radius);
-
+            if (q.x < 0 || q.y < 0 || q.x > lmax.x || q.y > lmax.y) continue;
+            const float ox   = float(dx) * cb_step.x;
+            const float ax   = abs(ox);
+            const float dist = sqrt(ox * ox + oy * oy);
+            float d = dist;
             [branch]
-            if (!inside) continue;
-
-            const int sx = xy.x + dx;
-            const int sy = xy.y + dy;
-            [branch]
-            if (sx < 0 || sy < 0 || sx > wmax || sy > hmax) continue;
-
-            const float n = (cb_radius > 0.0001) ? dist / cb_radius : 0.0;
-            const float w = 1.0 + cb_edge_str * smoothstep(0.7, 1.0, n);
-            acc += src.Load(int3(sx, sy, 0)) * w;
+            if      (ishape == 1) d = max(max(ax, ay), ax * 0.5 + ay * 0.866025);
+            else if (ishape == 2) d = max(max(ax, ay), (ax + ay) * 0.707107);
+            const float cov = saturate((cb_radius - d) / cb_aa + 0.5);
+            const float w   = (1.0 + cb_edge_str * smoothstep(0.7, 1.0, dist * inv_r)) * cov;
+            acc += src.Load(int3(q, 0)) * w;
         }
     }
-    return acc;
+    return acc * cb_gain;
 }
 ]]
 
 -- [3] 加算 / 通常合成
---     v1.02: 出力（object）は玉と同じ大きさに広げてある。元の画像は (cb_offset_x, cb_offset_y) だけ
---     内側にあり、その外は透明として読む
---[[pixelshader@blend_add:
+--     出力（object）は玉と同じ大きさに広げてある（[1] の後で 領域拡張）。元の画像は (cb_off) だけ内側にあり、
+--     その外は透明として読む。玉は縮小した画像（cb_big を覆う）をバイリニアで読む（sampler は "clamp"）
+--[[pixelshader@tama_blend:
 Texture2D base_tex  : register(t0);
 Texture2D bokeh_tex : register(t1);
+SamplerState smp : register(s0);
 cbuffer constant0 : register(b0) {
-    float cb_strength;
-    float cb_add_blend;
-    float cb_offset_x;
-    float cb_offset_y;
-    float cb_src_w;
-    float cb_src_h;
-    float2 cb_pad0;
+    float2 cb_big;
+    float2 cb_off;
+    float2 cb_src;
+    float  cb_strength;
+    float  cb_add_blend;
 };
 
 // v1.01: 乗算済みのまま α が 1 を超えないようにする。
 //   玉の α は「強さ × 覆った割合 × 縁の重み」なので 1 を超える（既定値でも不透明な部分で約 2）。
 //   v1.00 は加算で base.a + bokeh.a をそのまま返し、通常では base * (1 - bokeh.a) が負になっていた。
 //   α が 1 を超えた画像を重ねると、下の画像に (1 - α) < 0 が掛かって色が引かれる。
-float4 blend_add(float4 pos : SV_Position) : SV_Target
+float4 tama_blend(float4 pos : SV_Position) : SV_Target
 {
-    const int2   xy    = int2(floor(pos.xy));
-    const int2   sxy   = xy - int2(int(cb_offset_x), int(cb_offset_y));
+    const int2 xy  = int2(floor(pos.xy));
+    const int2 sxy = xy - int2(cb_off);
     float4 base = float4(0, 0, 0, 0);
     [branch]
-    if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < int(cb_src_w) && sxy.y < int(cb_src_h))
-        base = base_tex.Load(int3(sxy, 0));
-    float4 bokeh = bokeh_tex.Load(int3(xy, 0)) * cb_strength;
+    if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < int(cb_src.x) && sxy.y < int(cb_src.y))
+        base = base_tex.Load(int3(xy, 0));
+    float4 bokeh = bokeh_tex.SampleLevel(smp, pos.xy / cb_big, 0) * cb_strength;
     float4 result = base + bokeh;
     [branch]
     if (cb_add_blend > 0.5)
@@ -155,140 +181,180 @@ local obj, math = obj, math
 if radius    <= 0   then return end
 if threshold >= 100 then return end
 if strength  <= 0   then return end
+local W, H = obj.w, obj.h
+if W < 1 or H < 1 then return end
 
--- v1.02: ぼけがオブジェクトの外枠で切れないよう、各辺を広げる量を決める
---   正本。@レンズぼかし / @チルトシフト / @球面収差ボケ の plan_pad は同じ複製（変更時は 4 つとも直す）
---   - フィルタオブジェクトは大きさを変えられないので広げない（ルール au2-filter-object）
---   - 上下・左右を同じだけ広げるので、元の画像は同じ位置に残る（中心はずれない）
---   - 広げた画像は image_max に収める。cache と tempbuffer は合わせて 1600 万ドットの枠を共有し、
---     超えると最も長く使っていないものから黙って捨てられるので、広げた tempbuffer と
---     元の大きさの cache（keep 枚）の合計が CACHE_BUDGET を超えない所まで縮める
---     （縮めても玉の半径は変えない。切れる位置が内側へ寄るだけ）
-local CACHE_BUDGET = 15000000
+-- 作業の大きさ（v1.10）
+--   正本。@レンズぼかし / @チルトシフト / @球面収差ボケ の plan_work は同じ複製（変更時は 4 つとも直す）
+--   - 広げる量: ぼけがオブジェクトの外枠で切れないよう、各辺を ceil(want) だけ広げる（v1.02 と同じ）。
+--     フィルタオブジェクトは大きさを変えられないので広げない（ルール au2-filter-object）。広げた画像は image_max に収める。
+--     上下・左右を同じだけ広げるので、元の画像は同じ位置に残る（中心はずれない）
+--   - 縮小率: 縮小した画像での半径が cap 画素を超えない（want / cap）。さらに縮小した画像 2 枚（tempbuffer と cache）が
+--     CACHE_BUDGET に収まるまで縮める（4K・横長の素材。cache と tempbuffer は合わせて 1600 万ドットの枠を共有し、
+--     超えると最も長く使っていないものから黙って捨てられる。ほかのオブジェクトの分を残して 1400 万で見る）
+--   - 縮小した画像の 1 画素は、広げた画像の (wb / lw) x (hb / lh) 画素をちょうど覆う（端が半端にならない）
+local CACHE_BUDGET = 14000000
 local is_filter = obj.getinfo("filter")
 is_filter = (is_filter == true or is_filter == 1)
-local function plan_pad(want, w, h, keep)
-  if is_filter then return 0, 0 end
-  local max_w, max_h = obj.getinfo("image_max")
-  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
-  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
-  for p = want, 1, -1 do
-    local px, py = math.min(p, cap_x), math.min(p, cap_y)
-    if keep * w * h + (w + 2 * px) * (h + 2 * py) <= CACHE_BUDGET then return px, py end
+local function plan_work(want, cap, w, h)
+  local px, py = 0, 0
+  if not is_filter then
+    local max_w, max_h = obj.getinfo("image_max")
+    px = math.min(math.ceil(want), math.max(0, math.floor(((max_w or w) - w) / 2)))
+    py = math.min(math.ceil(want), math.max(0, math.floor(((max_h or h) - h) / 2)))
   end
-  return 0, 0
+  local wb, hb = w + 2 * px, h + 2 * py
+  local s = math.max(1, want / cap, math.sqrt(2 * wb * hb / CACHE_BUDGET))
+  local lw, lh = math.ceil(wb / s), math.ceil(hb / s)
+  for _ = 1, 64 do
+    if 2 * lw * lh <= CACHE_BUDGET then break end
+    s = s * 1.01
+    lw, lh = math.ceil(wb / s), math.ceil(hb / s)
+  end
+  return px, py, wb, hb, math.max(1, lw), math.max(1, lh)
 end
+
+-- 縮小した画像での半径の上限（画素）。大きいほど玉の縁が鋭く、重い（半径がこの値のときがいちばん重い）
+local RADIUS_CAP = 16
 
 local thresh   = threshold / 100
 local smooth_w = 0.05
 local edge     = edge_str / 100
 local shape_v  = shape * 1.0
 local add_f    = add_blend and 1.0 or 0.0
-local W        = obj.w
-local H        = obj.h
-local pad_x, pad_y = plan_pad(math.ceil(radius), W, H, 2)
-local Wbig     = W + 2 * pad_x
-local Hbig     = H + 2 * pad_y
+local pad_x, pad_y, Wbig, Hbig, LW, LH = plan_work(radius, RADIUS_CAP, W, H)
+if 2 * LW * LH > CACHE_BUDGET then
+  -- 縮めても枠に収まらない（起きないはずの安全弁）。進むとバッファが黙って捨てられて絵が壊れるので、何もしない
+  if not OBK_TAMA_BUDGET_WARNED then
+    print("@warn", string.format("[玉ボケ@光学系ボケ] 画像が大きすぎるため効果を掛けません（%dx%d）", W, H))
+    OBK_TAMA_BUDGET_WARNED = true
+  end
+  return
+end
+local sx, sy   = Wbig / LW, Hbig / LH
+local taps     = (sx == 1 and sy == 1) and 1 or (math.ceil(math.max(sx, sy)) + 1)
+local aa       = 0.5 * (sx + sy)
 local disk_area = math.max(math.pi * radius * radius, 1.0)
 local str = (strength / 100) / disk_area
 
-obj.copybuffer("cache:tama_orig", "object")
-obj.copybuffer("tempbuffer",      "object")
-obj.pixelshader("highlight_extract", "tempbuffer", "object",
-    { thresh, smooth_w, 0.0, 0.0 })
-obj.copybuffer("cache:tama_hi", "tempbuffer")
+obj.clearbuffer("tempbuffer", LW, LH)
+obj.pixelshader("tama_down", "tempbuffer", "object",
+    { sx, sy, pad_x, pad_y, W, H, taps, thresh, smooth_w })
 if pad_x > 0 or pad_y > 0 then
-  -- 中身は blend_add で全部描き直すので、広げた部分の塗りは何でもよい
+  -- 塗りつぶしなし（透明）で広げる。合成は元の画像の外を透明として読む
   obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
 end
-obj.clearbuffer("tempbuffer", Wbig, Hbig)
-obj.pixelshader("tama_diskblur", "tempbuffer", "cache:tama_hi",
-    { radius, edge, shape_v, 0.0, W * 1.0, H * 1.0, pad_x * 1.0, pad_y * 1.0 })
-obj.pixelshader("blend_add", "object", { "cache:tama_orig", "tempbuffer" },
-    { str, add_f, pad_x * 1.0, pad_y * 1.0, W * 1.0, H * 1.0, 0.0, 0.0 })
+obj.clearbuffer("cache:tama_blur", LW, LH)
+obj.pixelshader("tama_blur", "cache:tama_blur", "tempbuffer",
+    { sx, sy, LW, LH, radius, edge, shape_v, aa, sx * sy })
+obj.pixelshader("tama_blend", "object", { "object", "cache:tama_blur" },
+    { Wbig, Hbig, pad_x, pad_y, W, H, str, add_f }, "copy", "clamp")
 
 
 @レンズぼかし
---information:レンズぼかし@光学系ボケ v1.02 by HexBrowns
+--information:レンズぼかし@光学系ボケ v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:ボケ半径,0,200,30,0.1
 --track@strength:強さ,0,100,100,0.01
 --select@shape:形状,円=0,六角形=1,八角形=2
 
--- [1] ディスクカーネルブラー（正規化 / パディング対応）
---     acc / weight_sum で実カメラのボケに近い畳み込み平均
---     正本。@チルトシフト の tilt_diskblur は名前以外同じ複製（変更時は両方を直す）
---     出力は元の画像を (cb_offset_x, cb_offset_y) だけ内側に置いた大きさ
---[[pixelshader@lens_diskblur:
+-- v1.10: 縮小した画像でぼかしてから戻す（@玉ボケ の冒頭の説明と同じ。縮小した画像での半径の上限は 12 画素）
+
+-- [1] 縮小（平均）
+--     正本: @玉ボケ の tama_down からハイライトの抜き出しを除いたもの。@チルトシフト の tilt_down・
+--     @球面収差ボケ の sa_down は名前以外同じ複製（変更時は 3 つとも直す）
+--[[pixelshader@lens_down:
 Texture2D src : register(t0);
 cbuffer constant0 : register(b0) {
-    float cb_radius;
-    float cb_edge_str;
-    float cb_shape;
-    float cb_count_out;
-    float cb_src_w;
-    float cb_src_h;
-    float cb_offset_x;
-    float cb_offset_y;
+    float2 cb_step;
+    float2 cb_off;
+    float2 cb_src;
+    float  cb_taps;
 };
 
-bool dskb_hex(float dx, float dy, float r)
+float4 lens_down(float4 pos : SV_Position) : SV_Target
 {
-    const float ax = abs(dx), ay = abs(dy);
-    return (ax <= r) && (ax * 0.5 + ay * 0.866025 <= r);
+    const float2 a    = floor(pos.xy) * cb_step;
+    const float2 b    = a + cb_step;
+    const int2   p0   = int2(floor(a));
+    const int    m    = int(cb_taps + 0.5);
+    const int2   off  = int2(cb_off);
+    const int2   smax = int2(cb_src) - int2(1, 1);
+    float4 acc = float4(0, 0, 0, 0);
+    [loop]
+    for (int ky = 0; ky < m; ky++)
+    {
+        const int   py = p0.y + ky;
+        const float wy = saturate(min(b.y, float(py) + 1.0) - max(a.y, float(py)));
+        [loop]
+        for (int kx = 0; kx < m; kx++)
+        {
+            const int   px = p0.x + kx;
+            const float wx = saturate(min(b.x, float(px) + 1.0) - max(a.x, float(px)));
+            const int2  q  = int2(px, py) - off;
+            [branch]
+            if (q.x < 0 || q.y < 0 || q.x > smax.x || q.y > smax.y) continue;
+            acc += src.Load(int3(q, 0)) * (wx * wy);
+        }
+    }
+    return acc / (cb_step.x * cb_step.y);
 }
-bool dskb_oct(float dx, float dy, float r)
-{
-    const float ax = abs(dx), ay = abs(dy);
-    return (ax <= r) && (ay <= r) && ((ax + ay) * 0.707107 <= r);
-}
+]]
 
-float4 lens_diskblur(float4 pos : SV_Position) : SV_Target
+-- [2] 縮小した画像でのディスクブラー（正規化）。acc / 重みの和 で実カメラのボケに近い平均
+--     正本: @玉ボケ の tama_blur を平均にしたもの。@チルトシフト の tilt_blur は名前以外同じ複製（変更時は両方を直す）
+--     通常のオブジェクト（cb_count_out）では、縮小した画像の外のタップも透明として重みに数える（v1.02 と同じ。
+--     数えないと外枠の外側が内側だけの平均になり、フェードせず不透明のまま膨らむ）。
+--     フィルタオブジェクトでは数えない（画面の縁を透明に寄せない）
+--[[pixelshader@lens_blur:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 cb_step;
+    float2 cb_low;
+    float  cb_radius;
+    float  cb_shape;
+    float  cb_count_out;
+    float  cb_aa;
+};
+
+float4 lens_blur(float4 pos : SV_Position) : SV_Target
 {
-    const int2 off    = int2(int(cb_offset_x), int(cb_offset_y));
-    const int  wmax   = int(cb_src_w) - 1;
-    const int  hmax   = int(cb_src_h) - 1;
-    const int  r_int  = int(ceil(cb_radius));
-    const int  ishape = int(cb_shape + 0.5);
-    const bool count_out = (cb_count_out > 0.5);
-    const int2 xy     = int2(floor(pos.xy)) - off;
+    const int2  xy     = int2(floor(pos.xy));
+    const int2  lmax   = int2(cb_low) - int2(1, 1);
+    const int   ishape = int(cb_shape + 0.5);
+    const bool  count_out = (cb_count_out > 0.5);
+    const float rr     = cb_radius + 0.5 * cb_aa;
+    const int   ny     = int(floor(rr / cb_step.y));
 
     float4 acc = float4(0, 0, 0, 0);
     float  ws  = 0.0;
-
     [loop]
-    for (int dy = -r_int; dy <= r_int; dy++)
+    for (int dy = -ny; dy <= ny; dy++)
     {
+        const float oy = float(dy) * cb_step.y;
+        const float ay = abs(oy);
+        float ex = sqrt(max(rr * rr - oy * oy, 0.0));
+        [branch]
+        if      (ishape == 1) ex = min(rr, 2.0 * (rr - 0.866025 * ay));
+        else if (ishape == 2) ex = min(rr, rr * 1.414214 - ay);
+        const int nx = int(floor(max(ex, 0.0) / cb_step.x));
         [loop]
-        for (int dx = -r_int; dx <= r_int; dx++)
+        for (int dx = -nx; dx <= nx; dx++)
         {
-            const float fdx = float(dx), fdy = float(dy);
-            const float dist = length(float2(fdx, fdy));
-
-            bool inside;
+            const float ox = float(dx) * cb_step.x;
+            const float ax = abs(ox);
+            float d = sqrt(ox * ox + oy * oy);
             [branch]
-            if      (ishape == 2) inside = dskb_oct(fdx, fdy, cb_radius);
-            else if (ishape == 1) inside = dskb_hex(fdx, fdy, cb_radius);
-            else                  inside = (dist <= cb_radius);
-
+            if      (ishape == 1) d = max(max(ax, ay), ax * 0.5 + ay * 0.866025);
+            else if (ishape == 2) d = max(max(ax, ay), (ax + ay) * 0.707107);
+            const float w  = saturate((cb_radius - d) / cb_aa + 0.5);
+            const int2  q  = xy + int2(dx, dy);
+            const bool  in_low = (q.x >= 0 && q.y >= 0 && q.x <= lmax.x && q.y <= lmax.y);
             [branch]
-            if (!inside) continue;
-
-            const int  sx     = xy.x + dx;
-            const int  sy     = xy.y + dy;
-            const bool in_src = (sx >= 0 && sy >= 0 && sx <= wmax && sy <= hmax);
-            // v1.02: 通常のオブジェクト（count_out）では、画像の外のタップも透明として重みに数える。
-            //   数えないと外枠の外側が内側だけの平均になり、フェードせず不透明のまま膨らむ。
-            //   フィルタオブジェクトでは数えない（v1.01 と同じ。画面の縁を透明に寄せない）
+            if (in_low) acc += src.Load(int3(q, 0)) * w;
             [branch]
-            if (!in_src && !count_out) continue;
-
-            const float n = (cb_radius > 0.0001) ? dist / cb_radius : 0.0;
-            const float w = 1.0 + cb_edge_str * smoothstep(0.7, 1.0, n);
-            [branch]
-            if (in_src) acc += src.Load(int3(sx, sy, 0)) * w;
-            ws  += w;
+            if (in_low || count_out) ws += w;
         }
     }
     if (ws < 0.0001) return float4(0, 0, 0, 0);
@@ -296,31 +362,30 @@ float4 lens_diskblur(float4 pos : SV_Position) : SV_Target
 }
 ]]
 
--- [2] lerp 合成
---     正本。@球面収差ボケ の sa_blend_lerp は名前以外同じ複製（変更時は両方を直す）
---     v1.02: 出力（object）はぼけと同じ大きさに広げてある。元の画像は (cb_offset_x, cb_offset_y) だけ
---     内側にあり、その外は透明として読む
---[[pixelshader@lens_blend_lerp:
+-- [3] lerp 合成
+--     正本。@球面収差ボケ の sa_blend は名前以外同じ複製（変更時は両方を直す）
+--     出力（object）はぼけと同じ大きさに広げてある。元の画像は (cb_off) だけ内側にあり、その外は透明として読む。
+--     ぼけは縮小した画像をバイリニアで読む（sampler は "clamp"）
+--[[pixelshader@lens_blend:
 Texture2D base_tex : register(t0);
 Texture2D blur_tex : register(t1);
+SamplerState smp : register(s0);
 cbuffer constant0 : register(b0) {
-    float cb_strength;
-    float cb_offset_x;
-    float cb_offset_y;
-    float cb_src_w;
-    float cb_src_h;
-    float3 cb_pad0;
+    float2 cb_big;
+    float2 cb_off;
+    float2 cb_src;
+    float  cb_strength;
 };
 
-float4 lens_blend_lerp(float4 pos : SV_Position) : SV_Target
+float4 lens_blend(float4 pos : SV_Position) : SV_Target
 {
-    const int2   xy   = int2(floor(pos.xy));
-    const int2   sxy  = xy - int2(int(cb_offset_x), int(cb_offset_y));
+    const int2 xy  = int2(floor(pos.xy));
+    const int2 sxy = xy - int2(cb_off);
     float4 base = float4(0, 0, 0, 0);
     [branch]
-    if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < int(cb_src_w) && sxy.y < int(cb_src_h))
-        base = base_tex.Load(int3(sxy, 0));
-    const float4 blur = blur_tex.Load(int3(xy, 0));
+    if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < int(cb_src.x) && sxy.y < int(cb_src.y))
+        base = base_tex.Load(int3(xy, 0));
+    const float4 blur = blur_tex.SampleLevel(smp, pos.xy / cb_big, 0);
     return lerp(base, blur, saturate(cb_strength));
 }
 ]]
@@ -330,46 +395,64 @@ local obj, math = obj, math
 
 if radius   <= 0 then return end
 if strength <= 0 then return end
+local W, H = obj.w, obj.h
+if W < 1 or H < 1 then return end
 
--- 正本: @玉ボケ の plan_pad（同じ複製。変更時は 4 つとも直す）
-local CACHE_BUDGET = 15000000
+-- 正本: @玉ボケ の plan_work（同じ複製。変更時は 4 つとも直す）
+local CACHE_BUDGET = 14000000
 local is_filter = obj.getinfo("filter")
 is_filter = (is_filter == true or is_filter == 1)
-local function plan_pad(want, w, h, keep)
-  if is_filter then return 0, 0 end
-  local max_w, max_h = obj.getinfo("image_max")
-  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
-  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
-  for p = want, 1, -1 do
-    local px, py = math.min(p, cap_x), math.min(p, cap_y)
-    if keep * w * h + (w + 2 * px) * (h + 2 * py) <= CACHE_BUDGET then return px, py end
+local function plan_work(want, cap, w, h)
+  local px, py = 0, 0
+  if not is_filter then
+    local max_w, max_h = obj.getinfo("image_max")
+    px = math.min(math.ceil(want), math.max(0, math.floor(((max_w or w) - w) / 2)))
+    py = math.min(math.ceil(want), math.max(0, math.floor(((max_h or h) - h) / 2)))
   end
-  return 0, 0
+  local wb, hb = w + 2 * px, h + 2 * py
+  local s = math.max(1, want / cap, math.sqrt(2 * wb * hb / CACHE_BUDGET))
+  local lw, lh = math.ceil(wb / s), math.ceil(hb / s)
+  for _ = 1, 64 do
+    if 2 * lw * lh <= CACHE_BUDGET then break end
+    s = s * 1.01
+    lw, lh = math.ceil(wb / s), math.ceil(hb / s)
+  end
+  return px, py, wb, hb, math.max(1, lw), math.max(1, lh)
 end
+
+-- 縮小した画像での半径の上限（画素。@玉ボケ の説明）
+local RADIUS_CAP = 12
 
 local str     = strength / 100
 local shape_v = shape * 1.0
-local W       = obj.w
-local H       = obj.h
-local pad_x, pad_y = plan_pad(math.ceil(radius), W, H, 1)
-local Wbig    = W + 2 * pad_x
-local Hbig    = H + 2 * pad_y
 local count_out = is_filter and 0.0 or 1.0
+local pad_x, pad_y, Wbig, Hbig, LW, LH = plan_work(radius, RADIUS_CAP, W, H)
+if 2 * LW * LH > CACHE_BUDGET then
+  if not OBK_LENS_BUDGET_WARNED then
+    print("@warn", string.format("[レンズぼかし@光学系ボケ] 画像が大きすぎるため効果を掛けません（%dx%d）", W, H))
+    OBK_LENS_BUDGET_WARNED = true
+  end
+  return
+end
+local sx, sy  = Wbig / LW, Hbig / LH
+local taps    = (sx == 1 and sy == 1) and 1 or (math.ceil(math.max(sx, sy)) + 1)
+local aa      = 0.5 * (sx + sy)
 
-obj.copybuffer("cache:lens_orig", "object")
+obj.clearbuffer("tempbuffer", LW, LH)
+obj.pixelshader("lens_down", "tempbuffer", "object", { sx, sy, pad_x, pad_y, W, H, taps })
 if pad_x > 0 or pad_y > 0 then
-  -- 中身は lens_blend_lerp で全部描き直すので、広げた部分の塗りは何でもよい
+  -- 塗りつぶしなし（透明）で広げる。合成は元の画像の外を透明として読む
   obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
 end
-obj.clearbuffer("tempbuffer", Wbig, Hbig)
-obj.pixelshader("lens_diskblur", "tempbuffer", "cache:lens_orig",
-    { radius, 0.0, shape_v, count_out, W * 1.0, H * 1.0, pad_x * 1.0, pad_y * 1.0 })
-obj.pixelshader("lens_blend_lerp", "object", { "cache:lens_orig", "tempbuffer" },
-    { str, pad_x * 1.0, pad_y * 1.0, W * 1.0, H * 1.0, 0.0, 0.0, 0.0 })
+obj.clearbuffer("cache:lens_blur", LW, LH)
+obj.pixelshader("lens_blur", "cache:lens_blur", "tempbuffer",
+    { sx, sy, LW, LH, radius, shape_v, count_out, aa })
+obj.pixelshader("lens_blend", "object", { "object", "cache:lens_blur" },
+    { Wbig, Hbig, pad_x, pad_y, W, H, str }, "copy", "clamp")
 
 
 @チルトシフト
---information:チルトシフト@光学系ボケ v1.02 by HexBrowns
+--information:チルトシフト@光学系ボケ v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:ボケ半径,0,200,30,0.1
@@ -379,77 +462,98 @@ obj.pixelshader("lens_blend_lerp", "object", { "cache:lens_orig", "tempbuffer" }
 --track@strength:強さ,0,100,100,0.01
 --select@direction:方向,縦=0,横=1
 
--- [1] ディスクカーネルブラー（正規化 / パディング対応）
---     正本: @レンズぼかし の lens_diskblur（名前以外同じ。変更時は両方を直す）
---[[pixelshader@tilt_diskblur:
+-- v1.10: 縮小した画像でぼかしてから戻す（@玉ボケ の冒頭の説明と同じ。縮小した画像での半径の上限は 12 画素）
+
+-- [1] 縮小（平均）
+--     正本: @レンズぼかし の lens_down（名前以外同じ。変更時は 3 つとも直す）
+--[[pixelshader@tilt_down:
 Texture2D src : register(t0);
 cbuffer constant0 : register(b0) {
-    float cb_radius;
-    float cb_edge_str;
-    float cb_shape;
-    float cb_count_out;
-    float cb_src_w;
-    float cb_src_h;
-    float cb_offset_x;
-    float cb_offset_y;
+    float2 cb_step;
+    float2 cb_off;
+    float2 cb_src;
+    float  cb_taps;
 };
 
-bool dskb_hex(float dx, float dy, float r)
+float4 tilt_down(float4 pos : SV_Position) : SV_Target
 {
-    const float ax = abs(dx), ay = abs(dy);
-    return (ax <= r) && (ax * 0.5 + ay * 0.866025 <= r);
+    const float2 a    = floor(pos.xy) * cb_step;
+    const float2 b    = a + cb_step;
+    const int2   p0   = int2(floor(a));
+    const int    m    = int(cb_taps + 0.5);
+    const int2   off  = int2(cb_off);
+    const int2   smax = int2(cb_src) - int2(1, 1);
+    float4 acc = float4(0, 0, 0, 0);
+    [loop]
+    for (int ky = 0; ky < m; ky++)
+    {
+        const int   py = p0.y + ky;
+        const float wy = saturate(min(b.y, float(py) + 1.0) - max(a.y, float(py)));
+        [loop]
+        for (int kx = 0; kx < m; kx++)
+        {
+            const int   px = p0.x + kx;
+            const float wx = saturate(min(b.x, float(px) + 1.0) - max(a.x, float(px)));
+            const int2  q  = int2(px, py) - off;
+            [branch]
+            if (q.x < 0 || q.y < 0 || q.x > smax.x || q.y > smax.y) continue;
+            acc += src.Load(int3(q, 0)) * (wx * wy);
+        }
+    }
+    return acc / (cb_step.x * cb_step.y);
 }
-bool dskb_oct(float dx, float dy, float r)
-{
-    const float ax = abs(dx), ay = abs(dy);
-    return (ax <= r) && (ay <= r) && ((ax + ay) * 0.707107 <= r);
-}
+]]
 
-float4 tilt_diskblur(float4 pos : SV_Position) : SV_Target
+-- [2] 縮小した画像でのディスクブラー（正規化）
+--     正本: @レンズぼかし の lens_blur（名前以外同じ。変更時は両方を直す）
+--[[pixelshader@tilt_blur:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 cb_step;
+    float2 cb_low;
+    float  cb_radius;
+    float  cb_shape;
+    float  cb_count_out;
+    float  cb_aa;
+};
+
+float4 tilt_blur(float4 pos : SV_Position) : SV_Target
 {
-    const int2 off    = int2(int(cb_offset_x), int(cb_offset_y));
-    const int  wmax   = int(cb_src_w) - 1;
-    const int  hmax   = int(cb_src_h) - 1;
-    const int  r_int  = int(ceil(cb_radius));
-    const int  ishape = int(cb_shape + 0.5);
-    const bool count_out = (cb_count_out > 0.5);
-    const int2 xy     = int2(floor(pos.xy)) - off;
+    const int2  xy     = int2(floor(pos.xy));
+    const int2  lmax   = int2(cb_low) - int2(1, 1);
+    const int   ishape = int(cb_shape + 0.5);
+    const bool  count_out = (cb_count_out > 0.5);
+    const float rr     = cb_radius + 0.5 * cb_aa;
+    const int   ny     = int(floor(rr / cb_step.y));
 
     float4 acc = float4(0, 0, 0, 0);
     float  ws  = 0.0;
-
     [loop]
-    for (int dy = -r_int; dy <= r_int; dy++)
+    for (int dy = -ny; dy <= ny; dy++)
     {
+        const float oy = float(dy) * cb_step.y;
+        const float ay = abs(oy);
+        float ex = sqrt(max(rr * rr - oy * oy, 0.0));
+        [branch]
+        if      (ishape == 1) ex = min(rr, 2.0 * (rr - 0.866025 * ay));
+        else if (ishape == 2) ex = min(rr, rr * 1.414214 - ay);
+        const int nx = int(floor(max(ex, 0.0) / cb_step.x));
         [loop]
-        for (int dx = -r_int; dx <= r_int; dx++)
+        for (int dx = -nx; dx <= nx; dx++)
         {
-            const float fdx = float(dx), fdy = float(dy);
-            const float dist = length(float2(fdx, fdy));
-
-            bool inside;
+            const float ox = float(dx) * cb_step.x;
+            const float ax = abs(ox);
+            float d = sqrt(ox * ox + oy * oy);
             [branch]
-            if      (ishape == 2) inside = dskb_oct(fdx, fdy, cb_radius);
-            else if (ishape == 1) inside = dskb_hex(fdx, fdy, cb_radius);
-            else                  inside = (dist <= cb_radius);
-
+            if      (ishape == 1) d = max(max(ax, ay), ax * 0.5 + ay * 0.866025);
+            else if (ishape == 2) d = max(max(ax, ay), (ax + ay) * 0.707107);
+            const float w  = saturate((cb_radius - d) / cb_aa + 0.5);
+            const int2  q  = xy + int2(dx, dy);
+            const bool  in_low = (q.x >= 0 && q.y >= 0 && q.x <= lmax.x && q.y <= lmax.y);
             [branch]
-            if (!inside) continue;
-
-            const int  sx     = xy.x + dx;
-            const int  sy     = xy.y + dy;
-            const bool in_src = (sx >= 0 && sy >= 0 && sx <= wmax && sy <= hmax);
-            // v1.02: 通常のオブジェクト（count_out）では、画像の外のタップも透明として重みに数える。
-            //   数えないと外枠の外側が内側だけの平均になり、フェードせず不透明のまま膨らむ。
-            //   フィルタオブジェクトでは数えない（v1.01 と同じ。画面の縁を透明に寄せない）
+            if (in_low) acc += src.Load(int3(q, 0)) * w;
             [branch]
-            if (!in_src && !count_out) continue;
-
-            const float n = (cb_radius > 0.0001) ? dist / cb_radius : 0.0;
-            const float w = 1.0 + cb_edge_str * smoothstep(0.7, 1.0, n);
-            [branch]
-            if (in_src) acc += src.Load(int3(sx, sy, 0)) * w;
-            ws  += w;
+            if (in_low || count_out) ws += w;
         }
     }
     if (ws < 0.0001) return float4(0, 0, 0, 0);
@@ -457,36 +561,35 @@ float4 tilt_diskblur(float4 pos : SV_Position) : SV_Target
 }
 ]]
 
--- [2] 焦点マスクブレンド
---     v1.02: 出力（object）はぼけと同じ大きさに広げてある。元の画像は (cb_offset_x, cb_offset_y) だけ
---     内側にあり、その外は透明として読む。焦点の位置は元の画像の座標（sxy と cb_src_w / cb_src_h）で測る
+-- [3] 焦点マスクブレンド
+--     出力（object）はぼけと同じ大きさに広げてある。元の画像は (cb_off) だけ内側にあり、その外は透明として読む。
+--     焦点の位置は元の画像の座標（sxy と cb_src）で測る（v1.02 と同じ）。ぼけは縮小した画像をバイリニアで読む
 --[[pixelshader@tilt_blend:
 Texture2D base_tex : register(t0);
 Texture2D blur_tex : register(t1);
+SamplerState smp : register(s0);
 cbuffer constant0 : register(b0) {
-    float cb_focus_y;
-    float cb_focus_half;
-    float cb_focus_edge;
-    float cb_strength;
-    float cb_offset_x;
-    float cb_offset_y;
-    float cb_src_w;
-    float cb_src_h;
-    float cb_direction;
-    float3 cb_pad0;
+    float2 cb_big;
+    float2 cb_off;
+    float2 cb_src;
+    float  cb_focus_y;
+    float  cb_focus_half;
+    float  cb_focus_edge;
+    float  cb_strength;
+    float  cb_direction;
 };
 
 float4 tilt_blend(float4 pos : SV_Position) : SV_Target
 {
-    const int2   xy   = int2(floor(pos.xy));
-    const int2   sxy  = xy - int2(int(cb_offset_x), int(cb_offset_y));
+    const int2 xy  = int2(floor(pos.xy));
+    const int2 sxy = xy - int2(cb_off);
     float4 base = float4(0, 0, 0, 0);
     [branch]
-    if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < int(cb_src_w) && sxy.y < int(cb_src_h))
-        base = base_tex.Load(int3(sxy, 0));
-    const float4 blur = blur_tex.Load(int3(xy, 0));
+    if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < int(cb_src.x) && sxy.y < int(cb_src.y))
+        base = base_tex.Load(int3(xy, 0));
+    const float4 blur = blur_tex.SampleLevel(smp, pos.xy / cb_big, 0);
 
-    const float size   = (cb_direction < 0.5) ? cb_src_h : cb_src_w;
+    const float size   = (cb_direction < 0.5) ? cb_src.y : cb_src.x;
     const float axis   = (cb_direction < 0.5) ? float(sxy.y) : float(sxy.x);
     const float center = cb_focus_y * size;
     const float dist   = abs(axis - center);
@@ -502,50 +605,67 @@ local obj, math = obj, math
 
 if radius   <= 0 then return end
 if strength <= 0 then return end
+local W, H = obj.w, obj.h
+if W < 1 or H < 1 then return end
 
--- 正本: @玉ボケ の plan_pad（同じ複製。変更時は 4 つとも直す）
-local CACHE_BUDGET = 15000000
+-- 正本: @玉ボケ の plan_work（同じ複製。変更時は 4 つとも直す）
+local CACHE_BUDGET = 14000000
 local is_filter = obj.getinfo("filter")
 is_filter = (is_filter == true or is_filter == 1)
-local function plan_pad(want, w, h, keep)
-  if is_filter then return 0, 0 end
-  local max_w, max_h = obj.getinfo("image_max")
-  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
-  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
-  for p = want, 1, -1 do
-    local px, py = math.min(p, cap_x), math.min(p, cap_y)
-    if keep * w * h + (w + 2 * px) * (h + 2 * py) <= CACHE_BUDGET then return px, py end
+local function plan_work(want, cap, w, h)
+  local px, py = 0, 0
+  if not is_filter then
+    local max_w, max_h = obj.getinfo("image_max")
+    px = math.min(math.ceil(want), math.max(0, math.floor(((max_w or w) - w) / 2)))
+    py = math.min(math.ceil(want), math.max(0, math.floor(((max_h or h) - h) / 2)))
   end
-  return 0, 0
+  local wb, hb = w + 2 * px, h + 2 * py
+  local s = math.max(1, want / cap, math.sqrt(2 * wb * hb / CACHE_BUDGET))
+  local lw, lh = math.ceil(wb / s), math.ceil(hb / s)
+  for _ = 1, 64 do
+    if 2 * lw * lh <= CACHE_BUDGET then break end
+    s = s * 1.01
+    lw, lh = math.ceil(wb / s), math.ceil(hb / s)
+  end
+  return px, py, wb, hb, math.max(1, lw), math.max(1, lh)
 end
 
+-- 縮小した画像での半径の上限（画素。@玉ボケ の説明）
+local RADIUS_CAP = 12
+
 local str        = strength / 100
-local W          = obj.w
-local H          = obj.h
-local pad_x, pad_y = plan_pad(math.ceil(radius), W, H, 1)
-local Wbig       = W + 2 * pad_x
-local Hbig       = H + 2 * pad_y
 local count_out  = is_filter and 0.0 or 1.0
 local dir        = direction * 1.0
 local focus_y_r  = focus_y / 100
 local focus_half = focus_w / 2.0
 local focus_edg  = math.max(focus_edge * 1.0, 1.0)
+local pad_x, pad_y, Wbig, Hbig, LW, LH = plan_work(radius, RADIUS_CAP, W, H)
+if 2 * LW * LH > CACHE_BUDGET then
+  if not OBK_TILT_BUDGET_WARNED then
+    print("@warn", string.format("[チルトシフト@光学系ボケ] 画像が大きすぎるため効果を掛けません（%dx%d）", W, H))
+    OBK_TILT_BUDGET_WARNED = true
+  end
+  return
+end
+local sx, sy     = Wbig / LW, Hbig / LH
+local taps       = (sx == 1 and sy == 1) and 1 or (math.ceil(math.max(sx, sy)) + 1)
+local aa         = 0.5 * (sx + sy)
 
-obj.copybuffer("cache:tilt_orig", "object")
+obj.clearbuffer("tempbuffer", LW, LH)
+obj.pixelshader("tilt_down", "tempbuffer", "object", { sx, sy, pad_x, pad_y, W, H, taps })
 if pad_x > 0 or pad_y > 0 then
-  -- 中身は tilt_blend で全部描き直すので、広げた部分の塗りは何でもよい
+  -- 塗りつぶしなし（透明）で広げる。合成は元の画像の外を透明として読む
   obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
 end
-obj.clearbuffer("tempbuffer", Wbig, Hbig)
-obj.pixelshader("tilt_diskblur", "tempbuffer", "cache:tilt_orig",
-    { radius, 0.0, 0.0, count_out, W * 1.0, H * 1.0, pad_x * 1.0, pad_y * 1.0 })
-obj.pixelshader("tilt_blend", "object", { "cache:tilt_orig", "tempbuffer" },
-    { focus_y_r, focus_half, focus_edg, str, pad_x * 1.0, pad_y * 1.0, W * 1.0, H * 1.0,
-      dir, 0.0, 0.0, 0.0 })
+obj.clearbuffer("cache:tilt_blur", LW, LH)
+obj.pixelshader("tilt_blur", "cache:tilt_blur", "tempbuffer",
+    { sx, sy, LW, LH, radius, 0.0, count_out, aa })
+obj.pixelshader("tilt_blend", "object", { "object", "cache:tilt_blur" },
+    { Wbig, Hbig, pad_x, pad_y, W, H, focus_y_r, focus_half, focus_edg, str, dir }, "copy", "clamp")
 
 
 @球面収差ボケ
---information:球面収差ボケ@光学系ボケ v1.02 by HexBrowns
+--information:球面収差ボケ@光学系ボケ v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:ボケ半径,0,200,20,0.1
@@ -553,107 +673,140 @@ obj.pixelshader("tilt_blend", "object", { "cache:tilt_orig", "tempbuffer" },
 --track@aberration:色収差,0,100,20,0.01
 --track@strength:強さ,0,100,80,0.01
 
--- [1] RGB 別半径ディスクブラー（正規化 / パディング対応）
---     R: radius×(1+aberration)  G: radius  B: radius×(1-aberration×0.5)
---     ボケ縁部にカラーフリンジが生じ、球面収差特有の色にじみを再現する
---     出力は元の画像を (cb_offset_x, cb_offset_y) だけ内側に置いた大きさ
---[[pixelshader@sa_diskblur:
+-- v1.10: 縮小した画像でぼかしてから戻す（@玉ボケ の冒頭の説明と同じ。縮小した画像での R の半径の上限は 12 画素）
+
+-- [1] 縮小（平均）
+--     正本: @レンズぼかし の lens_down（名前以外同じ。変更時は 3 つとも直す）
+--[[pixelshader@sa_down:
 Texture2D src : register(t0);
 cbuffer constant0 : register(b0) {
-    float cb_radius;
-    float cb_ring_str;
-    float cb_aberration;
-    float cb_count_out;
-    float cb_src_w;
-    float cb_src_h;
-    float cb_offset_x;
-    float cb_offset_y;
+    float2 cb_step;
+    float2 cb_off;
+    float2 cb_src;
+    float  cb_taps;
 };
 
-float4 sa_diskblur(float4 pos : SV_Position) : SV_Target
+float4 sa_down(float4 pos : SV_Position) : SV_Target
 {
-    const int2 off  = int2(int(cb_offset_x), int(cb_offset_y));
-    const int  wmax = int(cb_src_w) - 1;
-    const int  hmax = int(cb_src_h) - 1;
-    const bool count_out = (cb_count_out > 0.5);
-    const int2 xy   = int2(floor(pos.xy)) - off;
-
-    const float r_G = cb_radius;
-    const float r_R = cb_radius * (1.0 + cb_aberration);
-    const float r_B = cb_radius * max(1.0 - cb_aberration * 0.5, 0.01);
-    const int   r_max = int(ceil(r_R));
-
-    float4 acc_r = float4(0,0,0,0); float ws_r = 0.0;
-    float4 acc_g = float4(0,0,0,0); float ws_g = 0.0;
-    float4 acc_b = float4(0,0,0,0); float ws_b = 0.0;
-
+    const float2 a    = floor(pos.xy) * cb_step;
+    const float2 b    = a + cb_step;
+    const int2   p0   = int2(floor(a));
+    const int    m    = int(cb_taps + 0.5);
+    const int2   off  = int2(cb_off);
+    const int2   smax = int2(cb_src) - int2(1, 1);
+    float4 acc = float4(0, 0, 0, 0);
     [loop]
-    for (int dy = -r_max; dy <= r_max; dy++)
+    for (int ky = 0; ky < m; ky++)
     {
+        const int   py = p0.y + ky;
+        const float wy = saturate(min(b.y, float(py) + 1.0) - max(a.y, float(py)));
         [loop]
-        for (int dx = -r_max; dx <= r_max; dx++)
+        for (int kx = 0; kx < m; kx++)
         {
-            const float dist = length(float2(float(dx), float(dy)));
-            const int  sx     = xy.x + dx;
-            const int  sy     = xy.y + dy;
-            const bool in_src = (sx >= 0 && sy >= 0 && sx <= wmax && sy <= hmax);
-            // v1.02: 通常のオブジェクト（count_out）では、画像の外のタップも透明として重みに数える
-            //   （@レンズぼかし の lens_diskblur と同じ理由）
+            const int   px = p0.x + kx;
+            const float wx = saturate(min(b.x, float(px) + 1.0) - max(a.x, float(px)));
+            const int2  q  = int2(px, py) - off;
             [branch]
-            if (!in_src && !count_out) continue;
-            float4 s = float4(0, 0, 0, 0);
+            if (q.x < 0 || q.y < 0 || q.x > smax.x || q.y > smax.y) continue;
+            acc += src.Load(int3(q, 0)) * (wx * wy);
+        }
+    }
+    return acc / (cb_step.x * cb_step.y);
+}
+]]
+
+-- [2] RGB 別半径ディスクブラー（正規化。縮小した画像で）
+--     R: radius×(1+aberration)  G: radius  B: radius×(1-aberration×0.5)
+--     ボケ縁部にカラーフリンジが生じ、球面収差特有の色にじみを再現する。
+--     タップの並べ方・縁の覆い・画像の外の数え方は @レンズぼかし の lens_blur と同じ（形は円だけ）
+--[[pixelshader@sa_blur:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 cb_step;
+    float2 cb_low;
+    float  cb_radius;
+    float  cb_ring_str;
+    float  cb_aberration;
+    float  cb_count_out;
+    float  cb_aa;
+};
+
+float4 sa_blur(float4 pos : SV_Position) : SV_Target
+{
+    const int2  xy   = int2(floor(pos.xy));
+    const int2  lmax = int2(cb_low) - int2(1, 1);
+    const bool  count_out = (cb_count_out > 0.5);
+    const float r_G  = cb_radius;
+    const float r_R  = cb_radius * (1.0 + cb_aberration);
+    const float r_B  = cb_radius * max(1.0 - cb_aberration * 0.5, 0.01);
+    const float rr   = r_R + 0.5 * cb_aa;
+    const int   ny   = int(floor(rr / cb_step.y));
+
+    float  acc_r = 0.0;                 float ws_r = 0.0;
+    float2 acc_g = float2(0.0, 0.0);    float ws_g = 0.0;    // g と a
+    float  acc_b = 0.0;                 float ws_b = 0.0;
+    [loop]
+    for (int dy = -ny; dy <= ny; dy++)
+    {
+        const float oy = float(dy) * cb_step.y;
+        const int   nx = int(floor(sqrt(max(rr * rr - oy * oy, 0.0)) / cb_step.x));
+        [loop]
+        for (int dx = -nx; dx <= nx; dx++)
+        {
+            const float ox   = float(dx) * cb_step.x;
+            const float dist = sqrt(ox * ox + oy * oy);
+            const float w_r  = (1.0 + cb_ring_str * smoothstep(0.7, 1.0, dist / r_R)) * saturate((r_R - dist) / cb_aa + 0.5);
+            const float w_g  = (1.0 + cb_ring_str * smoothstep(0.7, 1.0, dist / r_G)) * saturate((r_G - dist) / cb_aa + 0.5);
+            const float w_b  = (1.0 + cb_ring_str * smoothstep(0.7, 1.0, dist / r_B)) * saturate((r_B - dist) / cb_aa + 0.5);
+            const int2  q    = xy + int2(dx, dy);
+            const bool  in_low = (q.x >= 0 && q.y >= 0 && q.x <= lmax.x && q.y <= lmax.y);
             [branch]
-            if (in_src) s = src.Load(int3(sx, sy, 0));
-            [branch]
-            if (dist <= r_R) {
-                const float w = 1.0 + cb_ring_str * smoothstep(0.7, 1.0, dist / r_R);
-                acc_r += s * w; ws_r += w;
+            if (in_low)
+            {
+                const float4 col = src.Load(int3(q, 0));
+                acc_r += col.r * w_r;
+                acc_g += col.ga * w_g;
+                acc_b += col.b * w_b;
             }
             [branch]
-            if (dist <= r_G) {
-                const float w = 1.0 + cb_ring_str * smoothstep(0.7, 1.0, dist / r_G);
-                acc_g += s * w; ws_g += w;
-            }
-            [branch]
-            if (dist <= r_B) {
-                const float w = 1.0 + cb_ring_str * smoothstep(0.7, 1.0, dist / r_B);
-                acc_b += s * w; ws_b += w;
+            if (in_low || count_out)
+            {
+                ws_r += w_r;
+                ws_g += w_g;
+                ws_b += w_b;
             }
         }
     }
 
     if (ws_g < 0.0001) return float4(0, 0, 0, 0);
-    const float r = (ws_r > 0.0001) ? acc_r.r / ws_r : 0.0;
-    const float g = acc_g.g / ws_g;
-    const float b = (ws_b > 0.0001) ? acc_b.b / ws_b : 0.0;
-    const float a = acc_g.a / ws_g;
-    return float4(r, g, b, a);
+    const float r = (ws_r > 0.0001) ? acc_r / ws_r : 0.0;
+    const float b = (ws_b > 0.0001) ? acc_b / ws_b : 0.0;
+    return float4(r, acc_g.x / ws_g, b, acc_g.y / ws_g);
 }
 ]]
 
--- [2] lerp 合成
---     正本: @レンズぼかし の lens_blend_lerp（名前以外同じ。変更時は両方を直す）
---[[pixelshader@sa_blend_lerp:
+-- [3] lerp 合成
+--     正本: @レンズぼかし の lens_blend（名前以外同じ。変更時は両方を直す）
+--[[pixelshader@sa_blend:
 Texture2D base_tex : register(t0);
 Texture2D blur_tex : register(t1);
+SamplerState smp : register(s0);
 cbuffer constant0 : register(b0) {
-    float cb_strength;
-    float cb_offset_x;
-    float cb_offset_y;
-    float cb_src_w;
-    float cb_src_h;
-    float3 cb_pad0;
+    float2 cb_big;
+    float2 cb_off;
+    float2 cb_src;
+    float  cb_strength;
 };
 
-float4 sa_blend_lerp(float4 pos : SV_Position) : SV_Target
+float4 sa_blend(float4 pos : SV_Position) : SV_Target
 {
-    const int2   xy   = int2(floor(pos.xy));
-    const int2   sxy  = xy - int2(int(cb_offset_x), int(cb_offset_y));
+    const int2 xy  = int2(floor(pos.xy));
+    const int2 sxy = xy - int2(cb_off);
     float4 base = float4(0, 0, 0, 0);
     [branch]
-    if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < int(cb_src_w) && sxy.y < int(cb_src_h))
-        base = base_tex.Load(int3(sxy, 0));
-    const float4 blur = blur_tex.Load(int3(xy, 0));
+    if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < int(cb_src.x) && sxy.y < int(cb_src.y))
+        base = base_tex.Load(int3(xy, 0));
+    const float4 blur = blur_tex.SampleLevel(smp, pos.xy / cb_big, 0);
     return lerp(base, blur, saturate(cb_strength));
 }
 ]]
@@ -663,44 +816,62 @@ local obj, math = obj, math
 
 if radius   <= 0 then return end
 if strength <= 0 then return end
+local W, H = obj.w, obj.h
+if W < 1 or H < 1 then return end
 
--- 正本: @玉ボケ の plan_pad（同じ複製。変更時は 4 つとも直す）
-local CACHE_BUDGET = 15000000
+-- 正本: @玉ボケ の plan_work（同じ複製。変更時は 4 つとも直す）
+local CACHE_BUDGET = 14000000
 local is_filter = obj.getinfo("filter")
 is_filter = (is_filter == true or is_filter == 1)
-local function plan_pad(want, w, h, keep)
-  if is_filter then return 0, 0 end
-  local max_w, max_h = obj.getinfo("image_max")
-  local cap_x = math.max(0, math.floor(((max_w or w) - w) / 2))
-  local cap_y = math.max(0, math.floor(((max_h or h) - h) / 2))
-  for p = want, 1, -1 do
-    local px, py = math.min(p, cap_x), math.min(p, cap_y)
-    if keep * w * h + (w + 2 * px) * (h + 2 * py) <= CACHE_BUDGET then return px, py end
+local function plan_work(want, cap, w, h)
+  local px, py = 0, 0
+  if not is_filter then
+    local max_w, max_h = obj.getinfo("image_max")
+    px = math.min(math.ceil(want), math.max(0, math.floor(((max_w or w) - w) / 2)))
+    py = math.min(math.ceil(want), math.max(0, math.floor(((max_h or h) - h) / 2)))
   end
-  return 0, 0
+  local wb, hb = w + 2 * px, h + 2 * py
+  local s = math.max(1, want / cap, math.sqrt(2 * wb * hb / CACHE_BUDGET))
+  local lw, lh = math.ceil(wb / s), math.ceil(hb / s)
+  for _ = 1, 64 do
+    if 2 * lw * lh <= CACHE_BUDGET then break end
+    s = s * 1.01
+    lw, lh = math.ceil(wb / s), math.ceil(hb / s)
+  end
+  return px, py, wb, hb, math.max(1, lw), math.max(1, lh)
 end
+
+-- 縮小した画像での R の半径の上限（画素。@玉ボケ の説明。1 回で 3 つの半径を集めるので 12 にとどめる）
+local RADIUS_CAP = 12
 
 local str      = strength / 100
 local ring     = ring_str / 100
 local aber     = aberration / 100
-local W        = obj.w
-local H        = obj.h
 local radius_r = radius * (1.0 + aber)
-local pad_x, pad_y = plan_pad(math.ceil(radius_r), W, H, 1)
-local Wbig     = W + 2 * pad_x
-local Hbig     = H + 2 * pad_y
 local count_out = is_filter and 0.0 or 1.0
+local pad_x, pad_y, Wbig, Hbig, LW, LH = plan_work(radius_r, RADIUS_CAP, W, H)
+if 2 * LW * LH > CACHE_BUDGET then
+  if not OBK_SA_BUDGET_WARNED then
+    print("@warn", string.format("[球面収差ボケ@光学系ボケ] 画像が大きすぎるため効果を掛けません（%dx%d）", W, H))
+    OBK_SA_BUDGET_WARNED = true
+  end
+  return
+end
+local sx, sy   = Wbig / LW, Hbig / LH
+local taps     = (sx == 1 and sy == 1) and 1 or (math.ceil(math.max(sx, sy)) + 1)
+local aa       = 0.5 * (sx + sy)
 
-obj.copybuffer("cache:sa_orig", "object")
+obj.clearbuffer("tempbuffer", LW, LH)
+obj.pixelshader("sa_down", "tempbuffer", "object", { sx, sy, pad_x, pad_y, W, H, taps })
 if pad_x > 0 or pad_y > 0 then
-  -- 中身は sa_blend_lerp で全部描き直すので、広げた部分の塗りは何でもよい
+  -- 塗りつぶしなし（透明）で広げる。合成は元の画像の外を透明として読む
   obj.effect("領域拡張", "上", pad_y, "下", pad_y, "左", pad_x, "右", pad_x, "塗りつぶし", 0)
 end
-obj.clearbuffer("tempbuffer", Wbig, Hbig)
-obj.pixelshader("sa_diskblur", "tempbuffer", "cache:sa_orig",
-    { radius, ring, aber, count_out, W * 1.0, H * 1.0, pad_x * 1.0, pad_y * 1.0 })
-obj.pixelshader("sa_blend_lerp", "object", { "cache:sa_orig", "tempbuffer" },
-    { str, pad_x * 1.0, pad_y * 1.0, W * 1.0, H * 1.0, 0.0, 0.0, 0.0 })
+obj.clearbuffer("cache:sa_blur", LW, LH)
+obj.pixelshader("sa_blur", "cache:sa_blur", "tempbuffer",
+    { sx, sy, LW, LH, radius, ring, aber, count_out, aa })
+obj.pixelshader("sa_blend", "object", { "object", "cache:sa_blur" },
+    { Wbig, Hbig, pad_x, pad_y, W, H, str }, "copy", "clamp")
 
 @マップぼかし
 --information:マップぼかし@光学系ボケ v1.00 by HexBrowns

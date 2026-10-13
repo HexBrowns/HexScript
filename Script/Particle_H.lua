@@ -14,7 +14,7 @@ local abs, max, min, pi, huge = math.abs, math.max, math.min, math.pi, math.huge
 local RAD = pi / 180
 
 local M = {}
-M.VERSION = "0.17.0"
+M.VERSION = "0.18.0"      -- v0.18.0: 色の変化・軌跡（帯）の補間に色空間と色相経路、出た所の色の近い色選びに色差を足した（既定は今までの計算）
 M.MAX_PARTICLES = 10000   -- 生きている粒子の上限（実機 PRP-12 / 18 で決めた）
 M.INTER_MAX = 3000        -- 粒子どうし（v0.12.0）で一緒に進める粒子の上限（超えた分は力を受けず、今までどおり粒子ごとに進める）
 M.INTER_CP = 64           -- 粒子どうしのチェックポイントの数の上限（間隔はオブジェクトの長さ ÷ この数、1 秒より短くしない）
@@ -3108,6 +3108,8 @@ function M.simulate(cfg)
       QSRC.qpal[nl] = QPAL
     end
     out.cl = ffi.new("uint8_t[?]", cap)
+    -- 出た所の色そのもの（v0.18.0。-1 = 出た所が無い）。色差を選んだとき、描く側で近い色を選び直す（color_level）
+    out.csrc = ffi.new("int32_t[?]", cap)
     out.qpal = QPAL
   end
   if RS then
@@ -3203,6 +3205,9 @@ function M.simulate(cfg)
                 if emit.shape == 6 then c = QSRC.col[emit.last_cell or 0]
                 else c = CELLS.col[((emit.same_pos and ew or k) % CELLS.n) + 1] end
                 out.cl[n] = nearest_pal(QPAL, c)
+                out.csrc[n] = c
+              elseif out.csrc then
+                out.csrc[n] = -1
               end
               if J then
                 px = px + M.jitter(J, k, 1, sk) * J.x
@@ -3553,6 +3558,7 @@ function M.simulate(cfg)
                       out.cu[n], out.cv[n], out.cw[n], out.ch[n], out.ci[n] = out.cu[n0], out.cv[n0], out.cw[n0], out.ch[n0], out.ci[n0]
                     end
                     if out.cl then out.cl[n] = out.cl[n0] end
+                    if out.csrc then out.csrc[n] = out.csrc[n0] end
                     if TN > 0 then for jj = 0, TN - 1 do out.tok[n * TN + jj] = 0 end end
                     n = n + 1
                   end
@@ -3970,7 +3976,7 @@ local BAKE_MAGIC = "PRHBAKE1"
 -- 粒子ごとの欄（無い欄は書かない）。軌跡の欄は 粒子の数 × 軌跡の点の数
 local BAKE_F32 = { "x", "y", "z", "rx", "ry", "rz", "vx", "vy", "zoom", "alpha", "age", "b", "life",
                    "ex", "ey", "ez", "cu", "cv", "cw", "ch", "asx", "asy", "shr", "tb", "tbp", "td" }
-local BAKE_I32 = { "k", "e", "ci" }
+local BAKE_I32 = { "k", "e", "ci", "csrc" }
 local BAKE_U8 = { "cl", "rs" }
 local BAKE_TRAIL = { "tx", "ty", "tz" }
 local BAKE_SCALAR = { "overflow", "steps", "resets", "inter_n", "inter_over", "rsk", "tn" }
@@ -4718,16 +4724,112 @@ local function lerp_color(c0, c1, f)
   return r * 65536 + g * 256 + b
 end
 
+-- 色空間の共有部品（v0.18.0）。番号は Script/EffectUtils_ColorSpace.lua と同じ
+-- （補間: 0 sRGB / 1 リニア / 2 Oklab / 3 HSV / 4 HSL / 5 Lab / 6 LCh / 7 Oklch / 9 HWB、色差: 0 RGB / 1 YCbCr / 2 Oklab / 3 CIEDE2000）。
+-- 既定（どちらも 0）は今までの式のままで、共有部品も読まない。require は Script/ 直下を探す（このモジュールと同じ場所）
+local CS
+local function colorspace()
+  if not CS then CS = require("EffectUtils_ColorSpace") end
+  return CS
+end
+
 -- 色の段 l（0 始まり）の色
+-- 色空間（C.space、v0.18.0）が 0 以外なら、色の並びを色空間で補間する（色相のある色空間は C.hue == 1 で長い方を回る）。
+-- 段は 64 まで・色は 64 まで（パレット）なので、並びの変換と段ごとの色は 1 フレームに 1 回だけ求めて C.memo に置く
+-- （C は色の変化の節が毎フレーム作り直す。粒子ごとの呼び出しは表を引くだけ）
 function M.level_color(C, l)
   local cols, nc = C.cols, C.n
   if C.mode == 5 then return (C.qpal and C.qpal[l + 1]) or cols[1] end
   if C.mode == 1 or C.mode == 2 then return cols[l + 1] or cols[1] end
   if nc <= 1 or C.levels <= 1 then return cols[1] end
-  local f = l / (C.levels - 1) * (nc - 1)
-  local i = min(floor(f), nc - 2)
-  return lerp_color(cols[i + 1], cols[i + 2], f - i)
+  local space = C.space or 0
+  if space == 0 then
+    -- sRGB: 今までの式（8bit の値の直線補間）
+    local f = l / (C.levels - 1) * (nc - 1)
+    local i = min(floor(f), nc - 2)
+    return lerp_color(cols[i + 1], cols[i + 2], f - i)
+  end
+  local hue = C.hue or 0
+  local memo = C.memo
+  if not (memo and memo.cols == cols and memo.n == nc and memo.levels == C.levels and memo.space == space and memo.hue == hue) then
+    local cs = colorspace()
+    local used = {}
+    for i = 1, nc do used[i] = cols[i] end
+    memo = { cols = cols, n = nc, levels = C.levels, space = space, hue = hue, stops = cs.prepare(used, space), at = {} }
+    C.memo = memo
+  end
+  local c = memo.at[l]
+  if not c then
+    local cs = colorspace()
+    c = cs.pack(cs.sample(memo.stops, l / (C.levels - 1), hue == 1))
+    memo.at[l] = c
+  end
+  return c
 end
+
+-- 出た所の色を、色差（metric、v0.18.0）でパレット pal のいちばん近い色の番号（0 始まり）にする。
+-- パレットと色差ごとに、パレットの変換と「色 → 番号」の答えを覚えておく（覚えるパレットは 4 つまで。古いものから捨てる）。
+-- 1 フレームに粒子の数だけ呼ばれるが、同じ色は表を引くだけ（新しい色だけ パレットの色の数 回比べる）
+local NEAR_CACHE, NEAR_ORDER = {}, {}
+local function near_table(pal, metric)
+  local key = metric .. ":" .. table.concat(pal, ",")
+  local t = NEAR_CACHE[key]
+  if t then return t end
+  local cs = colorspace()
+  local P = {}
+  for i = 1, #pal do
+    local r, g, b = cs.unpack(pal[i])
+    if metric == 2 then
+      r, g, b = cs.linear_to_oklab(cs.to_linear(r, g, b))
+    elseif metric == 3 then
+      r, g, b = cs.xyz_to_lab(cs.linear_to_xyz(cs.to_linear(r, g, b)))
+    end
+    P[i] = { r, g, b }
+  end
+  t = { metric = metric, P = P, map = {}, count = 0 }
+  NEAR_CACHE[key] = t
+  NEAR_ORDER[#NEAR_ORDER + 1] = key
+  if #NEAR_ORDER > 4 then NEAR_CACHE[table.remove(NEAR_ORDER, 1)] = nil end
+  return t
+end
+
+local function nearest_metric(t, c)
+  local best = t.map[c]
+  if best then return best end
+  local cs = colorspace()
+  local r, g, b = cs.unpack(c)
+  local m, P = t.metric, t.P
+  local bd = huge
+  best = 0
+  if m == 3 then
+    local L, A, B = cs.xyz_to_lab(cs.linear_to_xyz(cs.to_linear(r, g, b)))
+    for i = 1, #P do
+      local q = P[i]
+      local d = cs.ciede2000(L, A, B, q[1], q[2], q[3])
+      if d < bd then best, bd = i - 1, d end
+    end
+  elseif m == 2 then
+    local L, A, B = cs.linear_to_oklab(cs.to_linear(r, g, b))
+    for i = 1, #P do
+      local q = P[i]
+      local d = (q[1] - L) ^ 2 + (q[2] - A) ^ 2 + (q[3] - B) ^ 2
+      if d < bd then best, bd = i - 1, d end
+    end
+  else
+    for i = 1, #P do
+      local q = P[i]
+      local d = cs.distance(r, g, b, q[1], q[2], q[3], m)
+      if d < bd then best, bd = i - 1, d end
+    end
+  end
+  -- 覚える色の数に上限を置く（画像の色が多くても表が膨らみ続けないように）
+  if t.count < 65536 then
+    t.map[c] = best
+    t.count = t.count + 1
+  end
+  return best
+end
+M.nearest_metric = function(pal, c, metric) return nearest_metric(near_table(pal, metric), c) end
 
 -- フィルターの段 l の値
 function M.level_value(F, l)
@@ -4852,7 +4954,15 @@ local function color_level(D, res, i, sk)
   local C = D.color
   local l
   if C.mode == 5 then
-    l = res.cl and res.cl[i] or 0
+    -- 色差（v0.18.0）: RGB（0）以外なら、出た所の色からパレットの近い色を選び直す（焼き付けに出た所の色が無ければ今までの段）
+    local m = C.metric or 0
+    local c = (m ~= 0 and res.csrc and C.qpal) and res.csrc[i] or -1
+    if c >= 0 then
+      if not (C.near and C.near_pal == C.qpal and C.near.metric == m) then C.near, C.near_pal = near_table(C.qpal, m), C.qpal end
+      l = nearest_metric(C.near, c)
+    else
+      l = res.cl and res.cl[i] or 0
+    end
   elseif C.mode == 0 or C.mode == 3 or C.mode == 4 or C.mode == 6 or C.mode == 7 then
     -- 寿命で変える / 速さで変える（基準の速さで最後の色）/ 奥行きで変える（奥行きの範囲）/ 跳ね返ってから / 跳ね返るまで
     local f
@@ -5219,6 +5329,14 @@ function M.ribbons(res, idx, T, list)
   local r2, g2, b2 = r, g, b
   if T.grad == 1 and T.col2 then r2, g2, b2 = color_rgb(T.col2) end
   local tn = res.tn
+  -- 色空間（T.space、v0.18.0）: 0（sRGB）は今までの式。ほかは尻尾の区切り（tn + 1 か所。32 まで）の色を 1 フレームに 1 回だけ求める
+  local GR, GG, GB
+  if T.grad == 1 and T.col2 and (T.space or 0) ~= 0 then
+    local cs = colorspace()
+    local stops = cs.prepare({ T.col, T.col2 }, T.space)
+    GR, GG, GB = {}, {}, {}
+    for j = 0, tn do GR[j], GG[j], GB[j] = cs.sample(stops, j / tn, T.hue == 1) end
+  end
   for _, i in ipairs(idx) do
     local px, py, pz = res.x[i], res.y[i], res.z[i]
     local a0 = res.alpha[i]
@@ -5229,10 +5347,15 @@ function M.ribbons(res, idx, T, list)
       local f1 = j / tn
       local a1 = res.alpha[i] * (1 - T.alpha_end / 100 * f1)
       local w1 = T.width * res.zoom[i] * (1 + (T.zoom_end / 100 - 1) * f1)
-      local f0, f1 = (j - 1) / tn, j / tn
-      line_quad(list, px, py, pz, res.tx[bi], res.ty[bi], res.tz[bi], (w0 + w1) / 2,
-                r + (r2 - r) * f0, g + (g2 - g) * f0, b + (b2 - b) * f0, a0, a1,
-                r + (r2 - r) * f1, g + (g2 - g) * f1, b + (b2 - b) * f1)
+      if GR then
+        line_quad(list, px, py, pz, res.tx[bi], res.ty[bi], res.tz[bi], (w0 + w1) / 2,
+                  GR[j - 1], GG[j - 1], GB[j - 1], a0, a1, GR[j], GG[j], GB[j])
+      else
+        local f0, f1 = (j - 1) / tn, j / tn
+        line_quad(list, px, py, pz, res.tx[bi], res.ty[bi], res.tz[bi], (w0 + w1) / 2,
+                  r + (r2 - r) * f0, g + (g2 - g) * f0, b + (b2 - b) * f0, a0, a1,
+                  r + (r2 - r) * f1, g + (g2 - g) * f1, b + (b2 - b) * f1)
+      end
       px, py, pz, a0, w0 = res.tx[bi], res.ty[bi], res.tz[bi], a1, w1
     end
   end

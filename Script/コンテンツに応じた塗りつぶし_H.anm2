@@ -1,4 +1,4 @@
---information:コンテンツに応じた塗りつぶし_H v1.00 by HexBrowns
+--information:コンテンツに応じた塗りつぶし_H v1.01 by HexBrowns
 --label:HexScript
 --filter
 
@@ -106,6 +106,31 @@ float4 ps_caf_grow(float4 pos : SV_Position) : SV_Target {
         v = max(v, m.Load(int3(q, 0)).r);
     }
     return float4(v, 0.0, 0.0, 1.0);
+}
+]]
+
+--[[pixelshader@ps_caf_shrink:
+cbuffer P : register(b0) {
+    float2 src_size;  // 0-1 元の大きさ
+    float2 dst_size;  // 2-3 出力の大きさ
+};
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+
+// 任意の倍率で縮める（v1.01。cache の枠に収めるときだけ使う）。
+// 1 画素は元の画像の対応する範囲を n x n 点の双線形で平均する（乗算済みのまま）
+float4 ps_caf_shrink(float4 pos : SV_Position) : SV_Target {
+    float2 ratio = src_size / max(dst_size, float2(1.0, 1.0));
+    int n = clamp(int(ceil(max(ratio.x, ratio.y) * 0.5)), 1, 8);
+    float2 o = floor(pos.xy) * ratio;
+    float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+    [loop] for (int j = 0; j < n; j++) {
+        [loop] for (int i = 0; i < n; i++) {
+            float2 q = o + (float2(float(i), float(j)) + 0.5) * ratio / float(n);
+            acc += src.SampleLevel(smp, q / src_size, 0);
+        }
+    }
+    return acc / float(n * n);
 }
 ]]
 
@@ -313,6 +338,7 @@ float4 ps_caf_vote(float4 pos : SV_Position) : SV_Target {
 cbuffer P : register(b0) {
     float2 size;      // 0-1 大きさ
     float show;       // 2   1 で範囲を赤く重ねる
+    float scaled;     // 3   1 なら範囲は縮めた解像度で作ってある（双線形で読んで 0.5 で切る。v1.01）
 };
 Texture2D src : register(t0);
 Texture2D fill : register(t1);
@@ -322,7 +348,7 @@ SamplerState smp : register(s0);
 float4 ps_caf_out(float4 pos : SV_Position) : SV_Target {
     float2 uv = pos.xy / size;
     float4 s = src.Load(int3(int2(pos.xy), 0));   // 範囲の外は補間せずにそのまま
-    float hole = m.Load(int3(int2(pos.xy), 0)).r;
+    float hole = (scaled > 0.5) ? m.SampleLevel(smp, uv, 0).r : m.Load(int3(int2(pos.xy), 0)).r;
     float4 o = (hole > 0.5) ? float4(fill.SampleLevel(smp, uv, 0).rgb, 1.0) : s;
     if (show > 0.5 && hole > 0.5) o = float4(lerp(o.rgb, float3(1.0, 0.0, 0.0), 0.5), 1.0);
     return o;
@@ -338,26 +364,34 @@ end
 local W, H = obj.w, obj.h
 if W <= 0 or H <= 0 then return end
 
-local SRC, LAY, M = "cache:caf/src", "cache:caf/lay", "cache:caf/m"
+local SRC, M = "cache:caf/src", "cache:caf/m"
 local FA, FB, NA, NB = "cache:caf/fa", "cache:caf/fb", "cache:caf/na", "cache:caf/nb"
-obj.copybuffer(SRC, "object")
-
 local AREA = math.floor(num(area, 2) + 0.5)
-local lay = SRC
-if AREA == 1 then
-  local l = math.floor(num(area_layer, 1) + 0.5)
-  if l ~= obj.layer then
-    local names = {"ox", "oy", "oz", "rx", "ry", "rz", "cx", "cy", "cz", "sx", "sy", "sz", "alpha", "zoom", "aspect"}
-    local saved = {}
-    for k, n in ipairs(names) do saved[k] = obj[n] end
-    if obj.load("layer", l, true) and obj.w > 0 and obj.h > 0 then
-      obj.copybuffer(LAY, "object")
-      lay = LAY
-    end
-    obj.copybuffer("object", SRC)
-    for k, n in ipairs(names) do obj[n] = saved[k] end
+local METHOD = math.floor(num(method, 1) + 0.5)
+local area_l = math.floor(num(area_layer, 1) + 0.5)
+local layer_mode = (AREA == 1) and area_l ~= obj.layer
+
+-- v1.01: 元の画像は cache に退避せず object のまま読む（範囲のレイヤーを読む間だけ退避する）。範囲・縮小階層・プル・
+-- パッチの作業が cache と tempbuffer の枠（1600 万ドット）に収まらなければ、全部を縮めた解像度 WS x HS で行い、
+-- 範囲と塗りを双線形で広げて合成する。それでも収まらなければ効果を掛けない
+-- （AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）
+local budget = require("EffectUtils_Budget")
+local SC
+do
+  -- 範囲 1 + 縮小階層 4/3 + 作業 FA 1 + プル・パッチの 3 枚（パッチを等倍で探すなら 1 段目、1/2 なら 2 段目の大きさ）
+  local fine = (METHOD == 1 and math.floor(num(pm_res, 1) + 0.5) ~= 0) and 0.25 or 1
+  SC = budget.scale(0, (1 + 4 / 3 + 1 + 3 * fine) * W * H)
+  if SC and layer_mode then
+    local s2 = budget.scale(W * H, W * H)
+    SC = s2 and math.min(SC, s2) or nil
+  end
+  if not SC then
+    budget.refuse("コンテンツに応じた塗りつぶし_H", W, H)
+    return
   end
 end
+local WS, HS = W, H
+if SC < 1 then WS, HS = math.max(1, math.ceil(W * SC)), math.max(1, math.ceil(H * SC)) end
 
 -- 中間のバッファは pixelshader が全面を書くので、同じ大きさのまま確保し直す clearbuffer は要らない。
 -- この実行の中で大きさが変わるときだけ確保する（FHD で 1 フレームの呼び出しが 60 回を超えるので、回数を減らす）
@@ -370,35 +404,60 @@ local function ensure(name, w, h)
   end
 end
 
--- 範囲（r = 1 が消す所）
-ensure(M, W, H)
-obj.pixelshader("ps_caf_mask", M, {SRC, lay}, {
-  W, H, W / 2 + num(area_x, 0), H / 2 + num(area_y, 0),
-  math.max(num(area_w, 200), 0) / 2, math.max(num(area_h, 200), 0) / 2,
-  AREA, math.floor(num(area_prop, 0) + 0.5), (area_inv == 1) and 1 or 0,
-}, "copy", "clamp")
+-- 範囲（r = 1 が消す所）。範囲のレイヤーは読み込んだまま範囲にし、自分の画像と変数を戻す（読み込みで上書きされる）。
+-- レイヤーを読めないとき・自分のレイヤーのときは、自分の画像を範囲の元にする（v1.00 と同じ）
+local function make_mask()
+  ensure(M, WS, HS)
+  obj.pixelshader("ps_caf_mask", M, {"object", "object"}, {
+    WS, HS, (W / 2 + num(area_x, 0)) * WS / W, (H / 2 + num(area_y, 0)) * HS / H,
+    math.max(num(area_w, 200), 0) / 2 * WS / W, math.max(num(area_h, 200), 0) / 2 * HS / H,
+    AREA, math.floor(num(area_prop, 0) + 0.5), (area_inv == 1) and 1 or 0,
+  }, "copy", "clamp")
+end
+local made = false
+if layer_mode then
+  obj.copybuffer(SRC, "object")
+  local names = {"ox", "oy", "oz", "rx", "ry", "rz", "cx", "cy", "cz", "sx", "sy", "sz", "alpha", "zoom", "aspect"}
+  local saved = {}
+  for k, n in ipairs(names) do saved[k] = obj[n] end
+  if obj.load("layer", area_l, true) and obj.w > 0 and obj.h > 0 then
+    make_mask()
+    made = true
+  end
+  obj.copybuffer("object", SRC)
+  obj.clearbuffer(SRC, 1, 1)   -- 戻したら要らない（枠を空ける）
+  for k, n in ipairs(names) do obj[n] = saved[k] end
+end
+if not made then make_mask() end
 local G = math.floor(math.max(num(grow, 2), 0) + 0.5)
+if G > 0 and SC < 1 then G = math.max(1, math.floor(G * SC + 0.5)) end
 if G > 0 then
-  ensure(FA, W, H)
-  obj.pixelshader("ps_caf_grow", FA, {M}, {W, H, 1, 0, G})
-  obj.pixelshader("ps_caf_grow", M, {FA}, {W, H, 0, 1, G})
+  ensure(FA, WS, HS)
+  obj.pixelshader("ps_caf_grow", FA, {M}, {WS, HS, 1, 0, G})
+  obj.pixelshader("ps_caf_grow", M, {FA}, {WS, HS, 0, 1, G})
 end
 
 -- 縮小階層（1x1 まで）
-local levels = {{W, H}}
+local levels = {{WS, HS}}
 while levels[#levels][1] > 1 or levels[#levels][2] > 1 do
   local w, h = levels[#levels][1], levels[#levels][2]
   levels[#levels + 1] = {math.max(1, math.ceil(w / 2)), math.max(1, math.ceil(h / 2))}
 end
 local function pname(k) return "cache:caf/p" .. k end
-ensure(pname(1), W, H)
-obj.pixelshader("ps_caf_init", pname(1), {SRC, M}, {W, H})
+-- 縮めるときは、元の画像を FA へ縮めてから 0 段目を作る
+local src_small = "object"
+if SC < 1 then
+  ensure(FA, WS, HS)
+  obj.pixelshader("ps_caf_shrink", FA, {"object"}, {W, H, WS, HS}, "copy", "clamp")
+  src_small = FA
+end
+ensure(pname(1), WS, HS)
+obj.pixelshader("ps_caf_init", pname(1), {src_small, M}, {WS, HS})
 for k = 2, #levels do
   ensure(pname(k), levels[k][1], levels[k][2])
   obj.pixelshader("ps_caf_down", pname(k), {pname(k - 1)}, {levels[k][1], levels[k][2], levels[k - 1][1], levels[k - 1][2]})
 end
 
-local METHOD = math.floor(num(method, 1) + 0.5)
 -- パッチ: 探す段の範囲。粗い方は短辺 32px 以上で最も粗い段、細かい方は 探す細かさ（等倍 = 1 段目、1/2 = 2 段目）
 local K_FINE, K_COARSE = 1, 1
 if METHOD == 1 then
@@ -449,4 +508,4 @@ if METHOD == 1 then
   end
 end
 
-obj.pixelshader("ps_caf_out", "object", {SRC, cur, M}, {W, H, (show_area == 1) and 1 or 0}, "copy", "clamp")
+obj.pixelshader("ps_caf_out", "object", {"object", cur, M}, {W, H, (show_area == 1) and 1 or 0, (SC < 1) and 1 or 0}, "copy", "clamp")
