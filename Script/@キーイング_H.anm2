@@ -1,5 +1,5 @@
 --[[
-キーイング_H.anm2（マット調整 v1.01 / スピル除去 v1.01 / トラックマット v1.03 / 動体抽出 v1.00 / 同型塗りつぶし v1.01 / 光の回り込み v1.00）
+キーイング_H.anm2（マット調整 v1.01 / スピル除去 v1.01 / トラックマット v1.04 / 動体抽出 v1.10 / 同型塗りつぶし v1.10 / 光の回り込み v1.00 / 色差領域塗りつぶし v1.00）
 
   マット調整   : アルファを 収縮／膨張 → エッジぼかし → レベル補正 の順で整える（マルチパス）
   スピル除去   : 背景色の回り込み（スピル）を中和する（1 パス）
@@ -7,6 +7,12 @@
   動体抽出     : 前のフレーム（または動画ファイルの別の時刻）との差が大きい所だけを残す。枠・ターゲット選択・グリッド画像つき
   同型塗りつぶし : 種の位置の色の領域と同じ形の領域を全部見つけて塗る（回転・大きさ違いも同じ形。照合は same_shape.mod2）
   光の回り込み   : 抜いた前景の縁に、背景（下のレイヤーか下の画面）のぼかした光をにじませて合成をなじませる（ライトラップ）
+  色差領域塗りつぶし : 種の位置の色に近い色の、つながった領域を塗る。σ軸の Region_S の 色領域塗りつぶし（MIT）のフォークで、
+                   色の比べ方（色差）を選べる。使うには Region_S（Region_S.lua と その anm2）が要る
+
+動体抽出（色の差）・同型塗りつぶし・色差領域塗りつぶし の 色差 は、今まで（既定）・RGB・YCbCr・Oklab・CIEDE2000。
+式は共有部品の cs_distance（AI/tools/assets/colorspace.hlsl の写し。sync_colorspace.py が書き写す）。
+仕様: AI/specifications/20261013_色空間拡張_spec.md の 3 章 ③ と MIT のフォーク
 
 適用順は マット調整 → スピル除去 を推奨（α を整えてから RGB の被りを取る）。
 
@@ -499,7 +505,7 @@ obj.pixelshader("ps_trackmatte", "tempbuffer", { "tempbuffer", "object" }, {
 obj.copybuffer("object", "tempbuffer")
 
 @動体抽出
---information:動体抽出@キーイング_H v1.01 by HexBrowns
+--information:動体抽出@キーイング_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 --group:比較
@@ -521,6 +527,8 @@ obj.copybuffer("object", "tempbuffer")
 --track@smooth:マスクの滑らかさ,0,100,4,0.1
 --check@gradient:強度グラデーション,0
 --check@use_color:色の差,0
+--select@color_metric:色差=4,今まで=4,RGB=0,YCbCr=1,Oklab=2,CIEDE2000=3
+--hide@color_metric:use_color==0
 --check@invert:反転,0
 --group:対象
 --track@noise:ノイズ除去,0,100000,0,1
@@ -645,11 +653,456 @@ cbuffer constant0 : register(b0) {
     float softness;
     float gradient;
     float color_mode;
+    float metric;
+    float metric_k;
 };
+// ==== colorspace.hlsl ここから（AI/tools/sync_colorspace.py が書き写す。直すのは正本） ====
+// colorspace.hlsl v1.01 — 色空間の変換・補間・色相回転・色差（HexBrowns）
+// 正本: AI/tools/assets/colorspace.hlsl。各スクリプトの印の間へは AI/tools/sync_colorspace.py が書き写す（写しを直さない）
+// Lua 側の同じ式: Script/EffectUtils_ColorSpace.lua。机上検証: AI/scripts/色空間拡張/verify_colorspace.py
+//
+// 色はすべてストレート（乗算済みでない）の sRGB（0〜1）で受け渡す。
+// 色空間の番号（全スクリプト共通。@図形グラデーション_H と同じ）
+//   0 sRGB / 1 リニア / 2 Oklab / 3 HSV / 4 HSL / 5 Lab / 6 LCh / 7 Oklch / 8 XYZ / 9 HWB
+// 色相のある色空間（3 / 4 / 6 / 7 / 9）は x に色相（0〜1 周）を置く。
+//   HSV (h, s, v) / HSL (h, s, l) / HWB (h, w, b) / LCh (h, C, L) / Oklch (h, C, L)
+// Lab は D65 の白（XYZ を経由。CSS の lab() は D50 なので値は少し違う）。
+// 色差の種類: 0 RGB / 1 YCbCr（色差だけ。明るさを見ない）/ 2 Oklab / 3 CIEDE2000。
+//   どれも黒と白の差がおよそ 1 になるように割ってある（YCbCr は明るさを見ないので黒と白は 0）
+
+#define CS_TAU 6.28318530717958647692
+
+float cs_lin1(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4);
+}
+
+float cs_srgb1(float c) {
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(abs(c), 1.0 / 2.4) - 0.055;
+}
+
+float3 cs_to_linear(float3 c) {
+    return float3(cs_lin1(c.r), cs_lin1(c.g), cs_lin1(c.b));
+}
+
+// リニア → sRGB。範囲外は切り詰める
+float3 cs_to_srgb(float3 c) {
+    float3 s = saturate(c);
+    return float3(cs_srgb1(s.r), cs_srgb1(s.g), cs_srgb1(s.b));
+}
+
+float cs_cbrt(float x) {
+    return sign(x) * pow(abs(x), 1.0 / 3.0);
+}
+
+// Oklab（Björn Ottosson, 2020）
+float3 cs_linear_to_oklab(float3 c) {
+    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    float l_ = cs_cbrt(l);
+    float m_ = cs_cbrt(m);
+    float s_ = cs_cbrt(s);
+    return float3(
+        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_);
+}
+
+float3 cs_oklab_to_linear(float3 c) {
+    float l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;
+    float m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;
+    float s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;
+    float l = l_ * l_ * l_;
+    float m = m_ * m_ * m_;
+    float s = s_ * s_ * s_;
+    return float3(
+         4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+}
+
+// sRGB（D65）のリニア ⇔ XYZ（IEC 61966-2-1）
+float3 cs_linear_to_xyz(float3 c) {
+    return float3(
+        0.4124564 * c.r + 0.3575761 * c.g + 0.1804375 * c.b,
+        0.2126729 * c.r + 0.7151522 * c.g + 0.0721750 * c.b,
+        0.0193339 * c.r + 0.1191920 * c.g + 0.9503041 * c.b);
+}
+
+float3 cs_xyz_to_linear(float3 c) {
+    return float3(
+         3.2404542 * c.x - 1.5371385 * c.y - 0.4985314 * c.z,
+        -0.9692660 * c.x + 1.8760108 * c.y + 0.0415560 * c.z,
+         0.0556434 * c.x - 0.2040259 * c.y + 1.0572252 * c.z);
+}
+
+// CIE 15: ε = 216/24389、κ = 24389/27
+float cs_lab_f(float t) {
+    return t > 0.008856452 ? cs_cbrt(t) : (903.2963 * t + 16.0) / 116.0;
+}
+
+float cs_lab_finv(float f) {
+    float f3 = f * f * f;
+    return f3 > 0.008856452 ? f3 : (116.0 * f - 16.0) / 903.2963;
+}
+
+float3 cs_xyz_to_lab(float3 c) {
+    float fx = cs_lab_f(c.x / 0.95047);
+    float fy = cs_lab_f(c.y);
+    float fz = cs_lab_f(c.z / 1.08883);
+    return float3(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz));
+}
+
+float3 cs_lab_to_xyz(float3 c) {
+    float fy = (c.x + 16.0) / 116.0;
+    float fx = fy + c.y / 500.0;
+    float fz = fy - c.z / 200.0;
+    return float3(cs_lab_finv(fx) * 0.95047, cs_lab_finv(fy), cs_lab_finv(fz) * 1.08883);
+}
+
+// (L, a, b) → (色相 0〜1 周, C, L)
+float3 cs_lab_to_polar(float3 v) {
+    return float3(frac(atan2(v.z, v.y) / CS_TAU + 1.0), length(float2(v.y, v.z)), v.x);
+}
+
+float3 cs_polar_to_lab(float3 p) {
+    return float3(p.z, p.y * cos(p.x * CS_TAU), p.y * sin(p.x * CS_TAU));
+}
+
+float cs_hue_of(float3 c, float mx, float mn) {
+    float d = mx - mn;
+    float h = 0.0;
+    if (d > 0.000001) {
+        if (mx == c.r) {
+            h = (c.g - c.b) / d;
+        } else if (mx == c.g) {
+            h = (c.b - c.r) / d + 2.0;
+        } else {
+            h = (c.r - c.g) / d + 4.0;
+        }
+    }
+    return frac(h / 6.0 + 1.0);
+}
+
+float3 cs_hue_rgb(float h) {
+    float3 p = abs(frac(float3(h, h, h) + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return saturate(p - 1.0);
+}
+
+float3 cs_rgb_to_hsv(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float s = mx > 0.000001 ? (mx - mn) / mx : 0.0;
+    return float3(cs_hue_of(c, mx, mn), s, mx);
+}
+
+float3 cs_hsv_to_rgb(float3 c) {
+    return c.z * lerp(float3(1.0, 1.0, 1.0), cs_hue_rgb(c.x), saturate(c.y));
+}
+
+float3 cs_rgb_to_hsl(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float l = (mx + mn) * 0.5;
+    float den = 1.0 - abs(2.0 * l - 1.0);
+    float s = den > 0.000001 ? (mx - mn) / den : 0.0;
+    return float3(cs_hue_of(c, mx, mn), s, l);
+}
+
+float3 cs_hsl_to_rgb(float3 c) {
+    float chroma = (1.0 - abs(2.0 * c.z - 1.0)) * saturate(c.y);
+    return (cs_hue_rgb(c.x) - 0.5) * chroma + c.z;
+}
+
+float3 cs_rgb_to_hwb(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    return float3(cs_hue_of(c, mx, mn), mn, 1.0 - mx);
+}
+
+float3 cs_hwb_to_rgb(float3 c) {
+    float w = max(c.y, 0.0);
+    float b = max(c.z, 0.0);
+    float sum = w + b;
+    if (sum > 1.0) {
+        w = w / sum;
+        b = b / sum;
+    }
+    return cs_hue_rgb(c.x) * (1.0 - w - b) + w;
+}
+
+// リニアが sRGB の範囲に入っているか。float32 の誤差の分だけ、値の大きさに比例して許す
+// （決まった幅で許すと、値の小さい暗い色で切り詰めたときに色相がずれる）
+bool cs_in_gamut(float3 lin) {
+    float e = max(abs(lin.r), max(abs(lin.g), abs(lin.b))) * 0.000002 + 0.000000001;
+    return all(lin >= -e) && all(lin <= 1.0 + e);
+}
+
+// Oklch (h, C, L) をリニアへ。sRGB に無い色は、明るさと色相を保ったまま C を下げて収める（二分探索 16 回）
+float3 cs_oklch_to_linear_fit(float3 p) {
+    float3 lab = cs_polar_to_lab(p);
+    float3 lin = cs_oklab_to_linear(lab);
+    if (!cs_in_gamut(lin)) {
+        float lo = 0.0;
+        float hi = max(p.y, 0.0);
+        [loop]
+        for (int i = 0; i < 16; i++) {
+            float mid = (lo + hi) * 0.5;
+            float3 t = cs_oklab_to_linear(cs_polar_to_lab(float3(p.x, mid, p.z)));
+            if (cs_in_gamut(t)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lin = cs_oklab_to_linear(cs_polar_to_lab(float3(p.x, lo, p.z)));
+    }
+    return lin;
+}
+
+// sRGB → 色空間の値
+float3 cs_to_space(float3 c, float space) {
+    float3 r = c;
+    if (space > 8.5) {
+        r = cs_rgb_to_hwb(c);
+    } else if (space > 7.5) {
+        r = cs_linear_to_xyz(cs_to_linear(c));
+    } else if (space > 6.5) {
+        r = cs_lab_to_polar(cs_linear_to_oklab(cs_to_linear(c)));
+    } else if (space > 5.5) {
+        r = cs_lab_to_polar(cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c))));
+    } else if (space > 4.5) {
+        r = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c)));
+    } else if (space > 3.5) {
+        r = cs_rgb_to_hsl(c);
+    } else if (space > 2.5) {
+        r = cs_rgb_to_hsv(c);
+    } else if (space > 1.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c));
+    } else if (space > 0.5) {
+        r = cs_to_linear(c);
+    }
+    return r;
+}
+
+// 色空間の値 → sRGB（0〜1）。Oklch だけは C を下げて sRGB に収め、ほかは切り詰める
+float3 cs_from_space(float3 v, float space) {
+    float3 r = saturate(v);
+    if (space > 8.5) {
+        r = saturate(cs_hwb_to_rgb(v));
+    } else if (space > 7.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(v));
+    } else if (space > 6.5) {
+        r = cs_to_srgb(cs_oklch_to_linear_fit(v));
+    } else if (space > 5.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(cs_lab_to_xyz(cs_polar_to_lab(v))));
+    } else if (space > 4.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(cs_lab_to_xyz(v)));
+    } else if (space > 3.5) {
+        r = saturate(cs_hsl_to_rgb(v));
+    } else if (space > 2.5) {
+        r = saturate(cs_hsv_to_rgb(v));
+    } else if (space > 1.5) {
+        r = cs_to_srgb(cs_oklab_to_linear(v));
+    } else if (space > 0.5) {
+        r = cs_to_srgb(v);
+    }
+    return r;
+}
+
+bool cs_is_polar(float space) {
+    return (space > 2.5 && space < 4.5) || (space > 5.5 && space < 7.5) || space > 8.5;
+}
+
+// 色相を持たない（無彩色の）値か
+bool cs_no_hue(float3 v, float space) {
+    bool r = v.y < 0.0001;
+    if (space > 8.5) {
+        r = v.y + v.z > 0.9999;
+    } else if (space > 6.5) {
+        r = v.y < 0.0002;
+    } else if (space > 5.5) {
+        r = v.y < 0.05;
+    }
+    return r;
+}
+
+// 色空間の値どうしの補間。a0 / a1 は不透明度で、乗算済みのまま混ぜる（透明へ向かっても黒ずまない。CSS と同じ）。
+// 色相のある色空間では色相だけは乗算せず、無彩色の側は相手の色相に合わせる。hue_long > 0.5 で長い方を回る。
+// 戻り値の xyz は色空間の値（cs_from_space で sRGB に戻す）、w は不透明度
+float4 cs_mix_values(float3 v0, float a0, float3 v1, float a1, float u, float space, float hue_long) {
+    float a = lerp(a0, a1, u);
+    float3 v = v0;
+    if (cs_is_polar(space)) {
+        float3 x0 = v0;
+        float3 x1 = v1;
+        if (cs_no_hue(x0, space)) {
+            x0.x = x1.x;
+        } else if (cs_no_hue(x1, space)) {
+            x1.x = x0.x;
+        }
+        float dh = x1.x - x0.x;
+        if (hue_long > 0.5) {
+            if (dh > 0.0 && dh < 0.5) {
+                dh = dh - 1.0;
+            } else if (dh <= 0.0 && dh > -0.5) {
+                dh = dh + 1.0;
+            }
+        } else {
+            if (dh > 0.5) {
+                dh = dh - 1.0;
+            } else if (dh < -0.5) {
+                dh = dh + 1.0;
+            }
+        }
+        float2 yz = lerp(float2(x0.y, x0.z) * a0, float2(x1.y, x1.z) * a1, u);
+        yz = a > 0.000001 ? yz / a : lerp(float2(x0.y, x0.z), float2(x1.y, x1.z), u);
+        v = float3(frac(x0.x + dh * u + 1.0), yz.x, yz.y);
+    } else {
+        float3 pc = lerp(v0 * a0, v1 * a1, u);
+        v = a > 0.000001 ? pc / a : lerp(v0, v1, u);
+    }
+    return float4(v, a);
+}
+
+// ストレートの sRGB 2 色を色空間で補間する。戻り値はストレートの sRGB と不透明度
+float4 cs_mix(float4 c0, float4 c1, float u, float space, float hue_long) {
+    float3 v0 = cs_to_space(c0.rgb, space);
+    float3 v1 = cs_to_space(c1.rgb, space);
+    float4 m = cs_mix_values(v0, c0.a, v1, c1.a, u, space, hue_long);
+    return float4(cs_from_space(m.xyz, space), m.w);
+}
+
+// 色相を turns 周だけ回す。space: 3 HSV / 4 HSL / 6 LCh / 7 Oklch / 9 HWB（それ以外は HSV）。
+// Oklch と LCh は明るさと C を保つ（Oklch は sRGB に無ければ C を下げる）
+float3 cs_hue_shift(float3 c, float turns, float space) {
+    float sp = cs_is_polar(space) ? space : 3.0;
+    float3 v = cs_to_space(c, sp);
+    v.x = frac(v.x + turns + 1.0);
+    return cs_from_space(v, sp);
+}
+
+// 鮮やかさを k 倍にする。space: 0 sRGB（Rec.709 の輝度との間で伸ばす。従来の式）/ 3 HSV / 4 HSL / 6 LCh / 7 Oklch
+float3 cs_scale_chroma(float3 c, float k, float space) {
+    float3 r = c;
+    if (cs_is_polar(space) && space < 8.5) {
+        float3 v = cs_to_space(c, space);
+        v.y = max(v.y * k, 0.0);
+        r = cs_from_space(v, space);
+    } else {
+        float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+        r = saturate(lerp(float3(y, y, y), c, k));
+    }
+    return r;
+}
+
+// 明るさ（0〜1）。space: 0 sRGB（Rec.709 をガンマのまま。従来の式）/ 1 リニア（相対輝度 Y）/ 2・7 Oklab の L / 5・6 Lab の L / 3 HSV の V / 4 HSL の L
+float cs_lightness(float3 c, float space) {
+    float r = dot(c, float3(0.2126, 0.7152, 0.0722));
+    if (space > 6.5 && space < 7.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c)).x;
+    } else if (space > 4.5 && space < 6.5) {
+        r = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c))).x / 100.0;
+    } else if (space > 3.5 && space < 4.5) {
+        r = cs_rgb_to_hsl(c).z;
+    } else if (space > 2.5 && space < 3.5) {
+        r = max(c.r, max(c.g, c.b));
+    } else if (space > 1.5 && space < 2.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c)).x;
+    } else if (space > 0.5 && space < 1.5) {
+        r = dot(cs_to_linear(c), float3(0.2126729, 0.7151522, 0.0721750));
+    }
+    return r;
+}
+
+// CIEDE2000（Sharma, Wu, Dalal 2005）。Lab（D65）の値どうし。戻り値は ΔE00（0〜100 程度）
+float cs_ciede2000(float3 lab1, float3 lab2) {
+    float c1 = length(lab1.yz);
+    float c2 = length(lab2.yz);
+    float cb = (c1 + c2) * 0.5;
+    float cb7 = pow(cb, 7.0);
+    float g = 0.5 * (1.0 - sqrt(cb7 / (cb7 + 6103515625.0)));
+    float a1p = lab1.y * (1.0 + g);
+    float a2p = lab2.y * (1.0 + g);
+    float c1p = length(float2(a1p, lab1.z));
+    float c2p = length(float2(a2p, lab2.z));
+    float h1p = (abs(a1p) + abs(lab1.z)) > 0.0 ? atan2(lab1.z, a1p) : 0.0;
+    float h2p = (abs(a2p) + abs(lab2.z)) > 0.0 ? atan2(lab2.z, a2p) : 0.0;
+    if (h1p < 0.0) {
+        h1p = h1p + CS_TAU;
+    }
+    if (h2p < 0.0) {
+        h2p = h2p + CS_TAU;
+    }
+    float dl = lab2.x - lab1.x;
+    float dc = c2p - c1p;
+    float dh = 0.0;
+    float hbp = h1p + h2p;
+    if (c1p * c2p > 0.0) {
+        dh = h2p - h1p;
+        if (dh > 3.14159265) {
+            dh = dh - CS_TAU;
+        } else if (dh < -3.14159265) {
+            dh = dh + CS_TAU;
+        }
+        if (abs(h1p - h2p) > 3.14159265) {
+            hbp = (h1p + h2p < CS_TAU) ? (h1p + h2p + CS_TAU) * 0.5 : (h1p + h2p - CS_TAU) * 0.5;
+        } else {
+            hbp = (h1p + h2p) * 0.5;
+        }
+    }
+    float dhh = 2.0 * sqrt(c1p * c2p) * sin(dh * 0.5);
+    float lbp = (lab1.x + lab2.x) * 0.5;
+    float cbp = (c1p + c2p) * 0.5;
+    float t = 1.0 - 0.17 * cos(hbp - 0.523598776) + 0.24 * cos(2.0 * hbp)
+        + 0.32 * cos(3.0 * hbp + 0.104719755) - 0.20 * cos(4.0 * hbp - 1.099557429);
+    float dtheta = 0.523598776 * exp(-pow((hbp * 57.29577951 - 275.0) / 25.0, 2.0));
+    float cbp7 = pow(cbp, 7.0);
+    float rc = 2.0 * sqrt(cbp7 / (cbp7 + 6103515625.0));
+    float l50 = (lbp - 50.0) * (lbp - 50.0);
+    float sl = 1.0 + 0.015 * l50 / sqrt(20.0 + l50);
+    float sc = 1.0 + 0.045 * cbp;
+    float sh = 1.0 + 0.015 * cbp * t;
+    float rt = -sin(2.0 * dtheta) * rc;
+    float tl = dl / sl;
+    float tc = dc / sc;
+    float th = dhh / sh;
+    return sqrt(max(tl * tl + tc * tc + th * th + rt * tc * th, 0.0));
+}
+
+// 2 色の差。metric: 0 RGB / 1 YCbCr（BT.709 の色差だけ）/ 2 Oklab / 3 CIEDE2000。黒と白の差がおよそ 1
+float cs_distance(float3 c0, float3 c1, float metric) {
+    float r = length(c0 - c1) * 0.57735027;
+    if (metric > 2.5) {
+        float3 l0 = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c0)));
+        float3 l1 = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c1)));
+        r = cs_ciede2000(l0, l1) / 100.0;
+    } else if (metric > 1.5) {
+        r = length(cs_linear_to_oklab(cs_to_linear(c0)) - cs_linear_to_oklab(cs_to_linear(c1)));
+    } else if (metric > 0.5) {
+        float3 d = c0 - c1;
+        float cb = dot(d, float3(-0.1146, -0.3854, 0.5));
+        float cr = dot(d, float3(0.5, -0.4542, -0.0458));
+        r = length(float2(cb, cr)) * 1.41421356;
+    }
+    return r;
+}
+// ==== colorspace.hlsl ここまで ====
 // 詰めた 2 枚（今と比較元）の差からマスクを作る。どちらも同じ詰め方を通っているので、止まった所の差は 0。
 // 読み戻しが切り捨てだと (2k+1)/255 は 2k になる（RGBA16F の値がわずかに小さい）。+0.25 で 2k も 2k+1 も k に戻す
 float md_dec(float v) {
     return floor(v * 127.5 + 0.25) / 127.0;
+}
+// v1.10: 詰めた Y'CbCr（ps_md_lum の BT.709。7bit）を sRGB に戻す。Cb・Cr の中心 0.5 は 7bit で 64/127 になるので、
+// そこを 0 にする（灰色が灰色に戻る。色の付いた灰色にすると Oklab・CIEDE2000 の色相の項が揺れる）
+float3 md_ycc_rgb(float3 v) {
+    float y = md_dec(v.r);
+    float cb = md_dec(v.g) - 64.0 / 127.0;
+    float cr = md_dec(v.b) - 64.0 / 127.0;
+    float r = y + 1.5748 * cr;
+    float b = y + 1.8556 * cb;
+    float g = (y - 0.2126 * r - 0.0722 * b) / 0.7152;
+    return saturate(float3(r, g, b));
 }
 float4 ps_md_diff(float4 pos : SV_Position) : SV_Target {
     uint2 ip = uint2(pos.xy);
@@ -658,6 +1111,10 @@ float4 ps_md_diff(float4 pos : SV_Position) : SV_Target {
         float3 a = cur.Load(int3(int2(ip), 0)).rgb;
         float3 b = prev.Load(int3(int2(ip), 0)).rgb;
         d = max(abs(md_dec(a.r) - md_dec(b.r)), max(abs(md_dec(a.g) - md_dec(b.g)), abs(md_dec(a.b) - md_dec(b.b))));
+        // v1.10: 色差が 今まで（4）以外なら、sRGB に戻して cs_distance で測り、metric_k で割って今までの目盛りに合わせる
+        if (metric < 3.5) {
+            d = cs_distance(md_ycc_rgb(a), md_ycc_rgb(b), metric) / metric_k;
+        }
     } else {
         uint tx = ip.x / 3u;
         uint ch = ip.x - tx * 3u;
@@ -809,6 +1266,16 @@ local w, h = obj.w, obj.h
 if w < 2 or h < 2 then return end
 local div = (res == 4) and 4 or ((res == 1) and 1 or 2)
 local color = (use_color == 1) and 1 or 0
+-- v1.10: 色の差の 色差。今まで（4）は v1.01 までの Y'CbCr の各成分の差の最大。ほかは ps_md_diff が詰めた Y'CbCr を
+-- sRGB に戻して cs_distance で測り、MD_K で割って今までの目盛り（しきい値・境界の幅・強度グラデーション）に合わせる。
+-- 係数は、しきい値 t で「止まっている」とみなす色の範囲（sRGB の立方体の中の体積）が今まで（Y'CbCr の各成分の差 <= t の箱）と
+-- 同じくらいになるように決めた: RGB は球と箱の体積が等しい値（式では 1.145。sRGB の端で切れる分を含めて数えると 1.13）。Oklab・CIEDE2000 は基準の色を一様に取って色ごとに
+-- 合わせた値の中央値（t = 0.10 で 0.78・1.01）。YCbCr は明るさを見ないので、明るさの同じ面の上で正方形と円の面積を合わせた
+-- （sqrt(8 / pi) = 1.60）。検証器 AI/scripts/キーイング_H/verify_colorspace_ext.py が数え直す。
+-- 詰める前の値は 7bit なので、Oklab ではほぼ黒の 1 段（0 と 1/127）の差が 0.11 になり、しきい値 10 を超える（暗所のノイズを拾いやすい）
+local MD_K = { [0] = 1.13, 1.60, 0.78, 1.01 }
+local cmetric = math.floor((tonumber(color_metric) or 4) + 0.5)
+if MD_K[cmetric] == nil then cmetric = 4 end
 -- v1.01: 元の画像は、object を読み替えるとき（動画ファイル・グリッド画像）だけ cache に退避する。作業用のバッファが
 -- cache と tempbuffer の枠（1600 万ドット）に収まらなければ作業解像度を 2 倍ずつ粗くし、それでも収まらなければ効果を掛けない
 -- （AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）
@@ -925,7 +1392,7 @@ end
 obj.clearbuffer("cache:md/m", lw, lh)
 if have_prev then
   obj.pixelshader("ps_md_diff", "cache:md/m", {"cache:md/pk", "cache:md/pp"}, {
-    lw, lh, threshold / 100, softness / 100, grad, color,
+    lw, lh, threshold / 100, softness / 100, grad, color, cmetric, MD_K[cmetric] or 1,
   }, "copy")
   blur("cache:md/m", "cache:md/b", smooth / div, (grad == 1) and 0 or 1)
 else
@@ -1081,12 +1548,13 @@ for i = 1, #rest do c[128 + i] = rest[i] end
 obj.pixelshader("ps_md_apply", "object", {src, "cache:md/m", keep_tex, grid_tex}, c, "copy", "clamp")
 
 @同型塗りつぶし
---information:同型塗りつぶし@キーイング_H v1.02 by HexBrowns
+--information:同型塗りつぶし@キーイング_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@seed_x:X,-4000,4000,0,0.1
 --track@seed_y:Y,-4000,4000,0,0.1
 --track@color_tol:色許容範囲,0,255,15,1
+--select@color_metric:色差=4,今まで=4,RGB=0,YCbCr=1,Oklab=2,CIEDE2000=3
 --track@shape_tol:同型許容範囲,0,100,20,0.1
 --check@allow_scale:大きさの違い,1
 --check@allow_mirror:鏡像も一致,0
@@ -1123,13 +1591,449 @@ cbuffer constant0 : register(b0) {
     float2 size;
     float2 seed;
     float tol;
+    float metric;
+    float thr;
 };
+// ==== colorspace.hlsl ここから（AI/tools/sync_colorspace.py が書き写す。直すのは正本） ====
+// colorspace.hlsl v1.01 — 色空間の変換・補間・色相回転・色差（HexBrowns）
+// 正本: AI/tools/assets/colorspace.hlsl。各スクリプトの印の間へは AI/tools/sync_colorspace.py が書き写す（写しを直さない）
+// Lua 側の同じ式: Script/EffectUtils_ColorSpace.lua。机上検証: AI/scripts/色空間拡張/verify_colorspace.py
+//
+// 色はすべてストレート（乗算済みでない）の sRGB（0〜1）で受け渡す。
+// 色空間の番号（全スクリプト共通。@図形グラデーション_H と同じ）
+//   0 sRGB / 1 リニア / 2 Oklab / 3 HSV / 4 HSL / 5 Lab / 6 LCh / 7 Oklch / 8 XYZ / 9 HWB
+// 色相のある色空間（3 / 4 / 6 / 7 / 9）は x に色相（0〜1 周）を置く。
+//   HSV (h, s, v) / HSL (h, s, l) / HWB (h, w, b) / LCh (h, C, L) / Oklch (h, C, L)
+// Lab は D65 の白（XYZ を経由。CSS の lab() は D50 なので値は少し違う）。
+// 色差の種類: 0 RGB / 1 YCbCr（色差だけ。明るさを見ない）/ 2 Oklab / 3 CIEDE2000。
+//   どれも黒と白の差がおよそ 1 になるように割ってある（YCbCr は明るさを見ないので黒と白は 0）
+
+#define CS_TAU 6.28318530717958647692
+
+float cs_lin1(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4);
+}
+
+float cs_srgb1(float c) {
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(abs(c), 1.0 / 2.4) - 0.055;
+}
+
+float3 cs_to_linear(float3 c) {
+    return float3(cs_lin1(c.r), cs_lin1(c.g), cs_lin1(c.b));
+}
+
+// リニア → sRGB。範囲外は切り詰める
+float3 cs_to_srgb(float3 c) {
+    float3 s = saturate(c);
+    return float3(cs_srgb1(s.r), cs_srgb1(s.g), cs_srgb1(s.b));
+}
+
+float cs_cbrt(float x) {
+    return sign(x) * pow(abs(x), 1.0 / 3.0);
+}
+
+// Oklab（Björn Ottosson, 2020）
+float3 cs_linear_to_oklab(float3 c) {
+    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    float l_ = cs_cbrt(l);
+    float m_ = cs_cbrt(m);
+    float s_ = cs_cbrt(s);
+    return float3(
+        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_);
+}
+
+float3 cs_oklab_to_linear(float3 c) {
+    float l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;
+    float m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;
+    float s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;
+    float l = l_ * l_ * l_;
+    float m = m_ * m_ * m_;
+    float s = s_ * s_ * s_;
+    return float3(
+         4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+}
+
+// sRGB（D65）のリニア ⇔ XYZ（IEC 61966-2-1）
+float3 cs_linear_to_xyz(float3 c) {
+    return float3(
+        0.4124564 * c.r + 0.3575761 * c.g + 0.1804375 * c.b,
+        0.2126729 * c.r + 0.7151522 * c.g + 0.0721750 * c.b,
+        0.0193339 * c.r + 0.1191920 * c.g + 0.9503041 * c.b);
+}
+
+float3 cs_xyz_to_linear(float3 c) {
+    return float3(
+         3.2404542 * c.x - 1.5371385 * c.y - 0.4985314 * c.z,
+        -0.9692660 * c.x + 1.8760108 * c.y + 0.0415560 * c.z,
+         0.0556434 * c.x - 0.2040259 * c.y + 1.0572252 * c.z);
+}
+
+// CIE 15: ε = 216/24389、κ = 24389/27
+float cs_lab_f(float t) {
+    return t > 0.008856452 ? cs_cbrt(t) : (903.2963 * t + 16.0) / 116.0;
+}
+
+float cs_lab_finv(float f) {
+    float f3 = f * f * f;
+    return f3 > 0.008856452 ? f3 : (116.0 * f - 16.0) / 903.2963;
+}
+
+float3 cs_xyz_to_lab(float3 c) {
+    float fx = cs_lab_f(c.x / 0.95047);
+    float fy = cs_lab_f(c.y);
+    float fz = cs_lab_f(c.z / 1.08883);
+    return float3(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz));
+}
+
+float3 cs_lab_to_xyz(float3 c) {
+    float fy = (c.x + 16.0) / 116.0;
+    float fx = fy + c.y / 500.0;
+    float fz = fy - c.z / 200.0;
+    return float3(cs_lab_finv(fx) * 0.95047, cs_lab_finv(fy), cs_lab_finv(fz) * 1.08883);
+}
+
+// (L, a, b) → (色相 0〜1 周, C, L)
+float3 cs_lab_to_polar(float3 v) {
+    return float3(frac(atan2(v.z, v.y) / CS_TAU + 1.0), length(float2(v.y, v.z)), v.x);
+}
+
+float3 cs_polar_to_lab(float3 p) {
+    return float3(p.z, p.y * cos(p.x * CS_TAU), p.y * sin(p.x * CS_TAU));
+}
+
+float cs_hue_of(float3 c, float mx, float mn) {
+    float d = mx - mn;
+    float h = 0.0;
+    if (d > 0.000001) {
+        if (mx == c.r) {
+            h = (c.g - c.b) / d;
+        } else if (mx == c.g) {
+            h = (c.b - c.r) / d + 2.0;
+        } else {
+            h = (c.r - c.g) / d + 4.0;
+        }
+    }
+    return frac(h / 6.0 + 1.0);
+}
+
+float3 cs_hue_rgb(float h) {
+    float3 p = abs(frac(float3(h, h, h) + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return saturate(p - 1.0);
+}
+
+float3 cs_rgb_to_hsv(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float s = mx > 0.000001 ? (mx - mn) / mx : 0.0;
+    return float3(cs_hue_of(c, mx, mn), s, mx);
+}
+
+float3 cs_hsv_to_rgb(float3 c) {
+    return c.z * lerp(float3(1.0, 1.0, 1.0), cs_hue_rgb(c.x), saturate(c.y));
+}
+
+float3 cs_rgb_to_hsl(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float l = (mx + mn) * 0.5;
+    float den = 1.0 - abs(2.0 * l - 1.0);
+    float s = den > 0.000001 ? (mx - mn) / den : 0.0;
+    return float3(cs_hue_of(c, mx, mn), s, l);
+}
+
+float3 cs_hsl_to_rgb(float3 c) {
+    float chroma = (1.0 - abs(2.0 * c.z - 1.0)) * saturate(c.y);
+    return (cs_hue_rgb(c.x) - 0.5) * chroma + c.z;
+}
+
+float3 cs_rgb_to_hwb(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    return float3(cs_hue_of(c, mx, mn), mn, 1.0 - mx);
+}
+
+float3 cs_hwb_to_rgb(float3 c) {
+    float w = max(c.y, 0.0);
+    float b = max(c.z, 0.0);
+    float sum = w + b;
+    if (sum > 1.0) {
+        w = w / sum;
+        b = b / sum;
+    }
+    return cs_hue_rgb(c.x) * (1.0 - w - b) + w;
+}
+
+// リニアが sRGB の範囲に入っているか。float32 の誤差の分だけ、値の大きさに比例して許す
+// （決まった幅で許すと、値の小さい暗い色で切り詰めたときに色相がずれる）
+bool cs_in_gamut(float3 lin) {
+    float e = max(abs(lin.r), max(abs(lin.g), abs(lin.b))) * 0.000002 + 0.000000001;
+    return all(lin >= -e) && all(lin <= 1.0 + e);
+}
+
+// Oklch (h, C, L) をリニアへ。sRGB に無い色は、明るさと色相を保ったまま C を下げて収める（二分探索 16 回）
+float3 cs_oklch_to_linear_fit(float3 p) {
+    float3 lab = cs_polar_to_lab(p);
+    float3 lin = cs_oklab_to_linear(lab);
+    if (!cs_in_gamut(lin)) {
+        float lo = 0.0;
+        float hi = max(p.y, 0.0);
+        [loop]
+        for (int i = 0; i < 16; i++) {
+            float mid = (lo + hi) * 0.5;
+            float3 t = cs_oklab_to_linear(cs_polar_to_lab(float3(p.x, mid, p.z)));
+            if (cs_in_gamut(t)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lin = cs_oklab_to_linear(cs_polar_to_lab(float3(p.x, lo, p.z)));
+    }
+    return lin;
+}
+
+// sRGB → 色空間の値
+float3 cs_to_space(float3 c, float space) {
+    float3 r = c;
+    if (space > 8.5) {
+        r = cs_rgb_to_hwb(c);
+    } else if (space > 7.5) {
+        r = cs_linear_to_xyz(cs_to_linear(c));
+    } else if (space > 6.5) {
+        r = cs_lab_to_polar(cs_linear_to_oklab(cs_to_linear(c)));
+    } else if (space > 5.5) {
+        r = cs_lab_to_polar(cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c))));
+    } else if (space > 4.5) {
+        r = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c)));
+    } else if (space > 3.5) {
+        r = cs_rgb_to_hsl(c);
+    } else if (space > 2.5) {
+        r = cs_rgb_to_hsv(c);
+    } else if (space > 1.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c));
+    } else if (space > 0.5) {
+        r = cs_to_linear(c);
+    }
+    return r;
+}
+
+// 色空間の値 → sRGB（0〜1）。Oklch だけは C を下げて sRGB に収め、ほかは切り詰める
+float3 cs_from_space(float3 v, float space) {
+    float3 r = saturate(v);
+    if (space > 8.5) {
+        r = saturate(cs_hwb_to_rgb(v));
+    } else if (space > 7.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(v));
+    } else if (space > 6.5) {
+        r = cs_to_srgb(cs_oklch_to_linear_fit(v));
+    } else if (space > 5.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(cs_lab_to_xyz(cs_polar_to_lab(v))));
+    } else if (space > 4.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(cs_lab_to_xyz(v)));
+    } else if (space > 3.5) {
+        r = saturate(cs_hsl_to_rgb(v));
+    } else if (space > 2.5) {
+        r = saturate(cs_hsv_to_rgb(v));
+    } else if (space > 1.5) {
+        r = cs_to_srgb(cs_oklab_to_linear(v));
+    } else if (space > 0.5) {
+        r = cs_to_srgb(v);
+    }
+    return r;
+}
+
+bool cs_is_polar(float space) {
+    return (space > 2.5 && space < 4.5) || (space > 5.5 && space < 7.5) || space > 8.5;
+}
+
+// 色相を持たない（無彩色の）値か
+bool cs_no_hue(float3 v, float space) {
+    bool r = v.y < 0.0001;
+    if (space > 8.5) {
+        r = v.y + v.z > 0.9999;
+    } else if (space > 6.5) {
+        r = v.y < 0.0002;
+    } else if (space > 5.5) {
+        r = v.y < 0.05;
+    }
+    return r;
+}
+
+// 色空間の値どうしの補間。a0 / a1 は不透明度で、乗算済みのまま混ぜる（透明へ向かっても黒ずまない。CSS と同じ）。
+// 色相のある色空間では色相だけは乗算せず、無彩色の側は相手の色相に合わせる。hue_long > 0.5 で長い方を回る。
+// 戻り値の xyz は色空間の値（cs_from_space で sRGB に戻す）、w は不透明度
+float4 cs_mix_values(float3 v0, float a0, float3 v1, float a1, float u, float space, float hue_long) {
+    float a = lerp(a0, a1, u);
+    float3 v = v0;
+    if (cs_is_polar(space)) {
+        float3 x0 = v0;
+        float3 x1 = v1;
+        if (cs_no_hue(x0, space)) {
+            x0.x = x1.x;
+        } else if (cs_no_hue(x1, space)) {
+            x1.x = x0.x;
+        }
+        float dh = x1.x - x0.x;
+        if (hue_long > 0.5) {
+            if (dh > 0.0 && dh < 0.5) {
+                dh = dh - 1.0;
+            } else if (dh <= 0.0 && dh > -0.5) {
+                dh = dh + 1.0;
+            }
+        } else {
+            if (dh > 0.5) {
+                dh = dh - 1.0;
+            } else if (dh < -0.5) {
+                dh = dh + 1.0;
+            }
+        }
+        float2 yz = lerp(float2(x0.y, x0.z) * a0, float2(x1.y, x1.z) * a1, u);
+        yz = a > 0.000001 ? yz / a : lerp(float2(x0.y, x0.z), float2(x1.y, x1.z), u);
+        v = float3(frac(x0.x + dh * u + 1.0), yz.x, yz.y);
+    } else {
+        float3 pc = lerp(v0 * a0, v1 * a1, u);
+        v = a > 0.000001 ? pc / a : lerp(v0, v1, u);
+    }
+    return float4(v, a);
+}
+
+// ストレートの sRGB 2 色を色空間で補間する。戻り値はストレートの sRGB と不透明度
+float4 cs_mix(float4 c0, float4 c1, float u, float space, float hue_long) {
+    float3 v0 = cs_to_space(c0.rgb, space);
+    float3 v1 = cs_to_space(c1.rgb, space);
+    float4 m = cs_mix_values(v0, c0.a, v1, c1.a, u, space, hue_long);
+    return float4(cs_from_space(m.xyz, space), m.w);
+}
+
+// 色相を turns 周だけ回す。space: 3 HSV / 4 HSL / 6 LCh / 7 Oklch / 9 HWB（それ以外は HSV）。
+// Oklch と LCh は明るさと C を保つ（Oklch は sRGB に無ければ C を下げる）
+float3 cs_hue_shift(float3 c, float turns, float space) {
+    float sp = cs_is_polar(space) ? space : 3.0;
+    float3 v = cs_to_space(c, sp);
+    v.x = frac(v.x + turns + 1.0);
+    return cs_from_space(v, sp);
+}
+
+// 鮮やかさを k 倍にする。space: 0 sRGB（Rec.709 の輝度との間で伸ばす。従来の式）/ 3 HSV / 4 HSL / 6 LCh / 7 Oklch
+float3 cs_scale_chroma(float3 c, float k, float space) {
+    float3 r = c;
+    if (cs_is_polar(space) && space < 8.5) {
+        float3 v = cs_to_space(c, space);
+        v.y = max(v.y * k, 0.0);
+        r = cs_from_space(v, space);
+    } else {
+        float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+        r = saturate(lerp(float3(y, y, y), c, k));
+    }
+    return r;
+}
+
+// 明るさ（0〜1）。space: 0 sRGB（Rec.709 をガンマのまま。従来の式）/ 1 リニア（相対輝度 Y）/ 2・7 Oklab の L / 5・6 Lab の L / 3 HSV の V / 4 HSL の L
+float cs_lightness(float3 c, float space) {
+    float r = dot(c, float3(0.2126, 0.7152, 0.0722));
+    if (space > 6.5 && space < 7.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c)).x;
+    } else if (space > 4.5 && space < 6.5) {
+        r = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c))).x / 100.0;
+    } else if (space > 3.5 && space < 4.5) {
+        r = cs_rgb_to_hsl(c).z;
+    } else if (space > 2.5 && space < 3.5) {
+        r = max(c.r, max(c.g, c.b));
+    } else if (space > 1.5 && space < 2.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c)).x;
+    } else if (space > 0.5 && space < 1.5) {
+        r = dot(cs_to_linear(c), float3(0.2126729, 0.7151522, 0.0721750));
+    }
+    return r;
+}
+
+// CIEDE2000（Sharma, Wu, Dalal 2005）。Lab（D65）の値どうし。戻り値は ΔE00（0〜100 程度）
+float cs_ciede2000(float3 lab1, float3 lab2) {
+    float c1 = length(lab1.yz);
+    float c2 = length(lab2.yz);
+    float cb = (c1 + c2) * 0.5;
+    float cb7 = pow(cb, 7.0);
+    float g = 0.5 * (1.0 - sqrt(cb7 / (cb7 + 6103515625.0)));
+    float a1p = lab1.y * (1.0 + g);
+    float a2p = lab2.y * (1.0 + g);
+    float c1p = length(float2(a1p, lab1.z));
+    float c2p = length(float2(a2p, lab2.z));
+    float h1p = (abs(a1p) + abs(lab1.z)) > 0.0 ? atan2(lab1.z, a1p) : 0.0;
+    float h2p = (abs(a2p) + abs(lab2.z)) > 0.0 ? atan2(lab2.z, a2p) : 0.0;
+    if (h1p < 0.0) {
+        h1p = h1p + CS_TAU;
+    }
+    if (h2p < 0.0) {
+        h2p = h2p + CS_TAU;
+    }
+    float dl = lab2.x - lab1.x;
+    float dc = c2p - c1p;
+    float dh = 0.0;
+    float hbp = h1p + h2p;
+    if (c1p * c2p > 0.0) {
+        dh = h2p - h1p;
+        if (dh > 3.14159265) {
+            dh = dh - CS_TAU;
+        } else if (dh < -3.14159265) {
+            dh = dh + CS_TAU;
+        }
+        if (abs(h1p - h2p) > 3.14159265) {
+            hbp = (h1p + h2p < CS_TAU) ? (h1p + h2p + CS_TAU) * 0.5 : (h1p + h2p - CS_TAU) * 0.5;
+        } else {
+            hbp = (h1p + h2p) * 0.5;
+        }
+    }
+    float dhh = 2.0 * sqrt(c1p * c2p) * sin(dh * 0.5);
+    float lbp = (lab1.x + lab2.x) * 0.5;
+    float cbp = (c1p + c2p) * 0.5;
+    float t = 1.0 - 0.17 * cos(hbp - 0.523598776) + 0.24 * cos(2.0 * hbp)
+        + 0.32 * cos(3.0 * hbp + 0.104719755) - 0.20 * cos(4.0 * hbp - 1.099557429);
+    float dtheta = 0.523598776 * exp(-pow((hbp * 57.29577951 - 275.0) / 25.0, 2.0));
+    float cbp7 = pow(cbp, 7.0);
+    float rc = 2.0 * sqrt(cbp7 / (cbp7 + 6103515625.0));
+    float l50 = (lbp - 50.0) * (lbp - 50.0);
+    float sl = 1.0 + 0.015 * l50 / sqrt(20.0 + l50);
+    float sc = 1.0 + 0.045 * cbp;
+    float sh = 1.0 + 0.015 * cbp * t;
+    float rt = -sin(2.0 * dtheta) * rc;
+    float tl = dl / sl;
+    float tc = dc / sc;
+    float th = dhh / sh;
+    return sqrt(max(tl * tl + tc * tc + th * th + rt * tc * th, 0.0));
+}
+
+// 2 色の差。metric: 0 RGB / 1 YCbCr（BT.709 の色差だけ）/ 2 Oklab / 3 CIEDE2000。黒と白の差がおよそ 1
+float cs_distance(float3 c0, float3 c1, float metric) {
+    float r = length(c0 - c1) * 0.57735027;
+    if (metric > 2.5) {
+        float3 l0 = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c0)));
+        float3 l1 = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c1)));
+        r = cs_ciede2000(l0, l1) / 100.0;
+    } else if (metric > 1.5) {
+        r = length(cs_linear_to_oklab(cs_to_linear(c0)) - cs_linear_to_oklab(cs_to_linear(c1)));
+    } else if (metric > 0.5) {
+        float3 d = c0 - c1;
+        float cb = dot(d, float3(-0.1146, -0.3854, 0.5));
+        float cr = dot(d, float3(0.5, -0.4542, -0.0458));
+        r = length(float2(cb, cr)) * 1.41421356;
+    }
+    return r;
+}
+// ==== colorspace.hlsl ここまで ====
 // 乗算済み → obj.getpixeldata と同じストレートの 8bit（a > 0 なら rgb / a。×255 の四捨五入。a も 8bit に丸める）
 float4 sf_u8(float4 c) {
     float3 st = (c.a > 0.0) ? saturate(c.rgb / c.a) : float3(0.0, 0.0, 0.0);
     return floor(float4(st, saturate(c.a)) * 255.0 + 0.5);
 }
 // 前景（8bit の a > 0 かつ RGBA の 4 成分すべてが種の色と tol 以内）を 1 ビットにして、24 画素ぶんを 1 テクセルの RGB に詰める
+// v1.10: 色差（metric）が 今まで（4）以外なら、RGB は 8bit のストレートの sRGB を cs_distance で測って thr 以内、
+// 不透明度は今までどおり 8bit の差が tol 以内なら前景
 // （テクセル x の R のビット b が画素 24x + b、G が 24x + 8 + b、B が 24x + 16 + b。same_shape.mod2 の find_bits が読む）
 float4 ps_sf_fg(float4 pos : SV_Position) : SV_Target {
     int2 isz = int2(size);
@@ -1148,6 +2052,9 @@ float4 ps_sf_fg(float4 pos : SV_Position) : SV_Target {
                 float4 c8 = sf_u8(src.Load(int3(x, y, 0)));
                 float4 d = abs(c8 - s8);
                 bool f = c8.a > 0.0 && max(max(d.r, d.g), max(d.b, d.a)) <= tol;
+                if (metric < 3.5) {
+                    f = c8.a > 0.0 && d.a <= tol && cs_distance(c8.rgb / 255.0, s8.rgb / 255.0, metric) <= thr;
+                }
                 uint bit = f ? (1u << (uint(j) & 7u)) : 0u;
                 if (j < 8) {
                     br |= bit;
@@ -1328,8 +2235,17 @@ local sx, sy = math.floor((seed_x + w / 2) / div), math.floor((seed_y + h / 2) /
 -- .mod2 が照合して一致した画素のビットに書き換え、同じバッファへ戻す
 local pw = math.ceil(mw / 24)
 local tol = math.floor(math.max(0, math.min(255, color_tol)) + 0.5)
+-- v1.10: 色差。今まで（4）は v1.02 までの RGBA の各成分の差の最大。ほかは RGB を cs_distance で測り、tol / 255 * SF_K 以内で比べる
+-- （許容値の目盛りは 1/255 のまま）。係数は、許容値 t で選ばれる色の範囲（種の色の周りの、sRGB の立方体の中の体積）が
+-- 今まで（各成分の差 <= t の立方体）と同じくらいになるように決めた: RGB は球と立方体の体積が等しい値（(6 / pi)^(1/3) / sqrt(3) = 0.716）。
+-- Oklab・CIEDE2000 は種を一様に取って種ごとに合わせた値の中央値（t = 15/255 で 0.46・0.57。t = 0.03 でも 0.46・0.55〜0.58）。
+-- YCbCr は明るさを見ないので、明るさの同じ面の上で面積を合わせた（0.94）。検証器 AI/scripts/キーイング_H/verify_colorspace_ext.py が数え直す
+local SF_K = { [0] = 0.72, 0.94, 0.46, 0.57 }
+local cmetric = math.floor((tonumber(color_metric) or 4) + 0.5)
+if SF_K[cmetric] == nil then cmetric = 4 end
+local thr = (cmetric == 4) and 0 or tol / 255 * SF_K[cmetric]
 obj.clearbuffer("cache:sf/bits", pw, mh)
-obj.pixelshader("ps_sf_fg", "cache:sf/bits", {fg_src}, { mw, mh, sx, sy, tol }, "copy")
+obj.pixelshader("ps_sf_fg", "cache:sf/bits", {fg_src}, { mw, mh, sx, sy, tol, cmetric, thr }, "copy")
 local data, dw, dh = obj.getpixeldata("cache:sf/bits")
 if data == nil or dw ~= pw or dh ~= mh then return end
 local matched, comps, state = mod.find_bits(data, dw, dh, mw, mh, sx, sy, shape_tol,
@@ -1600,3 +2516,665 @@ obj.pixelshader("ps_lw_apply", "object", { "object", "cache:lw/bg" }, {
   wrap, rings, strength / 100, threshold / 100, luma_weight / 100, blend,
   (edge_only == 1) and 1 or 0,
 }, "copy", "clamp")
+
+@色差領域塗りつぶし
+--information:色差領域塗りつぶし@キーイング_H v1.00 by HexBrowns
+--label:HexScript
+--filter
+--require:2010800
+--track@X:X,-4000,4000,0,0.1,,0.25
+--track@Y:Y,-4000,4000,0,0.1,,0.25
+--trackgroup@X,Y:Position
+--checksection@invert:反転,false,false
+--checksection@fixed_size:サイズ固定,true,false
+--hide@fixed_size:filter~=0
+--group:色/フィルタ設定,false
+--select@mode_filter:適用する操作=0,単色化=0,後続フィルタ=1,スクリプト実行=2
+--hide@fixed_size:mode_filter~=0
+--color@color:色,0xff0000
+--hide@color:mode_filter==1
+--track@intensity:強さ,0,100,100,0.1
+--hide@intensity:mode_filter==1
+--checksection@keep_luma:輝度を保持する,false,false
+--hide@keep_luma:mode_filter==1
+--text@script:スクリプト,obj.effect("縁取りσ",\n  "方式", "総和",\n  "縁色", color,\n  "サイズ", 20,\n  "透明度", 100 * (1 - intensity))
+--hide@script:mode_filter~=2
+--group:透明度/合成設定,false
+--track@alpha_eff:透明度,0,100,0,0.01
+--track@alpha_src:元画像透明度,0,100,0,0.01
+--select@mode_draw:モード=0,前方から合成=0,後方から合成=1
+--select@blend:合成モード=0,通常=0,加算=1,減算=2,乗算=3,スクリーン=4,オーバーレイ=5,比較(明)=6,比較(暗)=7,輝度=8,色差=9,陰影=10,明暗=11,差分=12
+--group:境界設定,false
+--select@color_metric:色差=4,今まで=4,RGB=0,YCbCr=1,Oklab=2,CIEDE2000=3
+--track@range:色範囲,0,100,3,0.01
+--track@range_R:R範囲補正,0,800,100,0.01,,0.25
+--hide@range_R:color_metric~=4
+--track@range_G:G範囲補正,0,800,100,0.01,,0.25
+--hide@range_G:color_metric~=4
+--track@range_B:B範囲補正,0,800,100,0.01,,0.25
+--hide@range_B:color_metric~=4
+--track@inflation:境界の膨張縮小,-500,500,0,0.01
+--checksection@conn_corner:角で隣接扱い,false,false
+--checksection@union_left:左端を連結扱い,false,false
+--checksection@union_right:右端を連結扱い,false,false
+--checksection@union_top:上端を連結扱い,false,false
+--checksection@union_bottom:下端を連結扱い,false,false
+--checksection@conn_empty:透明ピクセルを連結扱い,false,false
+--group:その他,false
+--value@PI:PI,{}
+--[[pixelshader@ps_rcf_bin:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float a_near;
+    float a_far;
+    float2 coord_src;
+    float3 diff;
+    float conn_empty;
+    float metric;
+    float thr;
+};
+// ==== colorspace.hlsl ここから（AI/tools/sync_colorspace.py が書き写す。直すのは正本） ====
+// colorspace.hlsl v1.01 — 色空間の変換・補間・色相回転・色差（HexBrowns）
+// 正本: AI/tools/assets/colorspace.hlsl。各スクリプトの印の間へは AI/tools/sync_colorspace.py が書き写す（写しを直さない）
+// Lua 側の同じ式: Script/EffectUtils_ColorSpace.lua。机上検証: AI/scripts/色空間拡張/verify_colorspace.py
+//
+// 色はすべてストレート（乗算済みでない）の sRGB（0〜1）で受け渡す。
+// 色空間の番号（全スクリプト共通。@図形グラデーション_H と同じ）
+//   0 sRGB / 1 リニア / 2 Oklab / 3 HSV / 4 HSL / 5 Lab / 6 LCh / 7 Oklch / 8 XYZ / 9 HWB
+// 色相のある色空間（3 / 4 / 6 / 7 / 9）は x に色相（0〜1 周）を置く。
+//   HSV (h, s, v) / HSL (h, s, l) / HWB (h, w, b) / LCh (h, C, L) / Oklch (h, C, L)
+// Lab は D65 の白（XYZ を経由。CSS の lab() は D50 なので値は少し違う）。
+// 色差の種類: 0 RGB / 1 YCbCr（色差だけ。明るさを見ない）/ 2 Oklab / 3 CIEDE2000。
+//   どれも黒と白の差がおよそ 1 になるように割ってある（YCbCr は明るさを見ないので黒と白は 0）
+
+#define CS_TAU 6.28318530717958647692
+
+float cs_lin1(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4);
+}
+
+float cs_srgb1(float c) {
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(abs(c), 1.0 / 2.4) - 0.055;
+}
+
+float3 cs_to_linear(float3 c) {
+    return float3(cs_lin1(c.r), cs_lin1(c.g), cs_lin1(c.b));
+}
+
+// リニア → sRGB。範囲外は切り詰める
+float3 cs_to_srgb(float3 c) {
+    float3 s = saturate(c);
+    return float3(cs_srgb1(s.r), cs_srgb1(s.g), cs_srgb1(s.b));
+}
+
+float cs_cbrt(float x) {
+    return sign(x) * pow(abs(x), 1.0 / 3.0);
+}
+
+// Oklab（Björn Ottosson, 2020）
+float3 cs_linear_to_oklab(float3 c) {
+    float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    float l_ = cs_cbrt(l);
+    float m_ = cs_cbrt(m);
+    float s_ = cs_cbrt(s);
+    return float3(
+        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_);
+}
+
+float3 cs_oklab_to_linear(float3 c) {
+    float l_ = c.x + 0.3963377774 * c.y + 0.2158037573 * c.z;
+    float m_ = c.x - 0.1055613458 * c.y - 0.0638541728 * c.z;
+    float s_ = c.x - 0.0894841775 * c.y - 1.2914855480 * c.z;
+    float l = l_ * l_ * l_;
+    float m = m_ * m_ * m_;
+    float s = s_ * s_ * s_;
+    return float3(
+         4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
+}
+
+// sRGB（D65）のリニア ⇔ XYZ（IEC 61966-2-1）
+float3 cs_linear_to_xyz(float3 c) {
+    return float3(
+        0.4124564 * c.r + 0.3575761 * c.g + 0.1804375 * c.b,
+        0.2126729 * c.r + 0.7151522 * c.g + 0.0721750 * c.b,
+        0.0193339 * c.r + 0.1191920 * c.g + 0.9503041 * c.b);
+}
+
+float3 cs_xyz_to_linear(float3 c) {
+    return float3(
+         3.2404542 * c.x - 1.5371385 * c.y - 0.4985314 * c.z,
+        -0.9692660 * c.x + 1.8760108 * c.y + 0.0415560 * c.z,
+         0.0556434 * c.x - 0.2040259 * c.y + 1.0572252 * c.z);
+}
+
+// CIE 15: ε = 216/24389、κ = 24389/27
+float cs_lab_f(float t) {
+    return t > 0.008856452 ? cs_cbrt(t) : (903.2963 * t + 16.0) / 116.0;
+}
+
+float cs_lab_finv(float f) {
+    float f3 = f * f * f;
+    return f3 > 0.008856452 ? f3 : (116.0 * f - 16.0) / 903.2963;
+}
+
+float3 cs_xyz_to_lab(float3 c) {
+    float fx = cs_lab_f(c.x / 0.95047);
+    float fy = cs_lab_f(c.y);
+    float fz = cs_lab_f(c.z / 1.08883);
+    return float3(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz));
+}
+
+float3 cs_lab_to_xyz(float3 c) {
+    float fy = (c.x + 16.0) / 116.0;
+    float fx = fy + c.y / 500.0;
+    float fz = fy - c.z / 200.0;
+    return float3(cs_lab_finv(fx) * 0.95047, cs_lab_finv(fy), cs_lab_finv(fz) * 1.08883);
+}
+
+// (L, a, b) → (色相 0〜1 周, C, L)
+float3 cs_lab_to_polar(float3 v) {
+    return float3(frac(atan2(v.z, v.y) / CS_TAU + 1.0), length(float2(v.y, v.z)), v.x);
+}
+
+float3 cs_polar_to_lab(float3 p) {
+    return float3(p.z, p.y * cos(p.x * CS_TAU), p.y * sin(p.x * CS_TAU));
+}
+
+float cs_hue_of(float3 c, float mx, float mn) {
+    float d = mx - mn;
+    float h = 0.0;
+    if (d > 0.000001) {
+        if (mx == c.r) {
+            h = (c.g - c.b) / d;
+        } else if (mx == c.g) {
+            h = (c.b - c.r) / d + 2.0;
+        } else {
+            h = (c.r - c.g) / d + 4.0;
+        }
+    }
+    return frac(h / 6.0 + 1.0);
+}
+
+float3 cs_hue_rgb(float h) {
+    float3 p = abs(frac(float3(h, h, h) + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+    return saturate(p - 1.0);
+}
+
+float3 cs_rgb_to_hsv(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float s = mx > 0.000001 ? (mx - mn) / mx : 0.0;
+    return float3(cs_hue_of(c, mx, mn), s, mx);
+}
+
+float3 cs_hsv_to_rgb(float3 c) {
+    return c.z * lerp(float3(1.0, 1.0, 1.0), cs_hue_rgb(c.x), saturate(c.y));
+}
+
+float3 cs_rgb_to_hsl(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float l = (mx + mn) * 0.5;
+    float den = 1.0 - abs(2.0 * l - 1.0);
+    float s = den > 0.000001 ? (mx - mn) / den : 0.0;
+    return float3(cs_hue_of(c, mx, mn), s, l);
+}
+
+float3 cs_hsl_to_rgb(float3 c) {
+    float chroma = (1.0 - abs(2.0 * c.z - 1.0)) * saturate(c.y);
+    return (cs_hue_rgb(c.x) - 0.5) * chroma + c.z;
+}
+
+float3 cs_rgb_to_hwb(float3 c) {
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    return float3(cs_hue_of(c, mx, mn), mn, 1.0 - mx);
+}
+
+float3 cs_hwb_to_rgb(float3 c) {
+    float w = max(c.y, 0.0);
+    float b = max(c.z, 0.0);
+    float sum = w + b;
+    if (sum > 1.0) {
+        w = w / sum;
+        b = b / sum;
+    }
+    return cs_hue_rgb(c.x) * (1.0 - w - b) + w;
+}
+
+// リニアが sRGB の範囲に入っているか。float32 の誤差の分だけ、値の大きさに比例して許す
+// （決まった幅で許すと、値の小さい暗い色で切り詰めたときに色相がずれる）
+bool cs_in_gamut(float3 lin) {
+    float e = max(abs(lin.r), max(abs(lin.g), abs(lin.b))) * 0.000002 + 0.000000001;
+    return all(lin >= -e) && all(lin <= 1.0 + e);
+}
+
+// Oklch (h, C, L) をリニアへ。sRGB に無い色は、明るさと色相を保ったまま C を下げて収める（二分探索 16 回）
+float3 cs_oklch_to_linear_fit(float3 p) {
+    float3 lab = cs_polar_to_lab(p);
+    float3 lin = cs_oklab_to_linear(lab);
+    if (!cs_in_gamut(lin)) {
+        float lo = 0.0;
+        float hi = max(p.y, 0.0);
+        [loop]
+        for (int i = 0; i < 16; i++) {
+            float mid = (lo + hi) * 0.5;
+            float3 t = cs_oklab_to_linear(cs_polar_to_lab(float3(p.x, mid, p.z)));
+            if (cs_in_gamut(t)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lin = cs_oklab_to_linear(cs_polar_to_lab(float3(p.x, lo, p.z)));
+    }
+    return lin;
+}
+
+// sRGB → 色空間の値
+float3 cs_to_space(float3 c, float space) {
+    float3 r = c;
+    if (space > 8.5) {
+        r = cs_rgb_to_hwb(c);
+    } else if (space > 7.5) {
+        r = cs_linear_to_xyz(cs_to_linear(c));
+    } else if (space > 6.5) {
+        r = cs_lab_to_polar(cs_linear_to_oklab(cs_to_linear(c)));
+    } else if (space > 5.5) {
+        r = cs_lab_to_polar(cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c))));
+    } else if (space > 4.5) {
+        r = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c)));
+    } else if (space > 3.5) {
+        r = cs_rgb_to_hsl(c);
+    } else if (space > 2.5) {
+        r = cs_rgb_to_hsv(c);
+    } else if (space > 1.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c));
+    } else if (space > 0.5) {
+        r = cs_to_linear(c);
+    }
+    return r;
+}
+
+// 色空間の値 → sRGB（0〜1）。Oklch だけは C を下げて sRGB に収め、ほかは切り詰める
+float3 cs_from_space(float3 v, float space) {
+    float3 r = saturate(v);
+    if (space > 8.5) {
+        r = saturate(cs_hwb_to_rgb(v));
+    } else if (space > 7.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(v));
+    } else if (space > 6.5) {
+        r = cs_to_srgb(cs_oklch_to_linear_fit(v));
+    } else if (space > 5.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(cs_lab_to_xyz(cs_polar_to_lab(v))));
+    } else if (space > 4.5) {
+        r = cs_to_srgb(cs_xyz_to_linear(cs_lab_to_xyz(v)));
+    } else if (space > 3.5) {
+        r = saturate(cs_hsl_to_rgb(v));
+    } else if (space > 2.5) {
+        r = saturate(cs_hsv_to_rgb(v));
+    } else if (space > 1.5) {
+        r = cs_to_srgb(cs_oklab_to_linear(v));
+    } else if (space > 0.5) {
+        r = cs_to_srgb(v);
+    }
+    return r;
+}
+
+bool cs_is_polar(float space) {
+    return (space > 2.5 && space < 4.5) || (space > 5.5 && space < 7.5) || space > 8.5;
+}
+
+// 色相を持たない（無彩色の）値か
+bool cs_no_hue(float3 v, float space) {
+    bool r = v.y < 0.0001;
+    if (space > 8.5) {
+        r = v.y + v.z > 0.9999;
+    } else if (space > 6.5) {
+        r = v.y < 0.0002;
+    } else if (space > 5.5) {
+        r = v.y < 0.05;
+    }
+    return r;
+}
+
+// 色空間の値どうしの補間。a0 / a1 は不透明度で、乗算済みのまま混ぜる（透明へ向かっても黒ずまない。CSS と同じ）。
+// 色相のある色空間では色相だけは乗算せず、無彩色の側は相手の色相に合わせる。hue_long > 0.5 で長い方を回る。
+// 戻り値の xyz は色空間の値（cs_from_space で sRGB に戻す）、w は不透明度
+float4 cs_mix_values(float3 v0, float a0, float3 v1, float a1, float u, float space, float hue_long) {
+    float a = lerp(a0, a1, u);
+    float3 v = v0;
+    if (cs_is_polar(space)) {
+        float3 x0 = v0;
+        float3 x1 = v1;
+        if (cs_no_hue(x0, space)) {
+            x0.x = x1.x;
+        } else if (cs_no_hue(x1, space)) {
+            x1.x = x0.x;
+        }
+        float dh = x1.x - x0.x;
+        if (hue_long > 0.5) {
+            if (dh > 0.0 && dh < 0.5) {
+                dh = dh - 1.0;
+            } else if (dh <= 0.0 && dh > -0.5) {
+                dh = dh + 1.0;
+            }
+        } else {
+            if (dh > 0.5) {
+                dh = dh - 1.0;
+            } else if (dh < -0.5) {
+                dh = dh + 1.0;
+            }
+        }
+        float2 yz = lerp(float2(x0.y, x0.z) * a0, float2(x1.y, x1.z) * a1, u);
+        yz = a > 0.000001 ? yz / a : lerp(float2(x0.y, x0.z), float2(x1.y, x1.z), u);
+        v = float3(frac(x0.x + dh * u + 1.0), yz.x, yz.y);
+    } else {
+        float3 pc = lerp(v0 * a0, v1 * a1, u);
+        v = a > 0.000001 ? pc / a : lerp(v0, v1, u);
+    }
+    return float4(v, a);
+}
+
+// ストレートの sRGB 2 色を色空間で補間する。戻り値はストレートの sRGB と不透明度
+float4 cs_mix(float4 c0, float4 c1, float u, float space, float hue_long) {
+    float3 v0 = cs_to_space(c0.rgb, space);
+    float3 v1 = cs_to_space(c1.rgb, space);
+    float4 m = cs_mix_values(v0, c0.a, v1, c1.a, u, space, hue_long);
+    return float4(cs_from_space(m.xyz, space), m.w);
+}
+
+// 色相を turns 周だけ回す。space: 3 HSV / 4 HSL / 6 LCh / 7 Oklch / 9 HWB（それ以外は HSV）。
+// Oklch と LCh は明るさと C を保つ（Oklch は sRGB に無ければ C を下げる）
+float3 cs_hue_shift(float3 c, float turns, float space) {
+    float sp = cs_is_polar(space) ? space : 3.0;
+    float3 v = cs_to_space(c, sp);
+    v.x = frac(v.x + turns + 1.0);
+    return cs_from_space(v, sp);
+}
+
+// 鮮やかさを k 倍にする。space: 0 sRGB（Rec.709 の輝度との間で伸ばす。従来の式）/ 3 HSV / 4 HSL / 6 LCh / 7 Oklch
+float3 cs_scale_chroma(float3 c, float k, float space) {
+    float3 r = c;
+    if (cs_is_polar(space) && space < 8.5) {
+        float3 v = cs_to_space(c, space);
+        v.y = max(v.y * k, 0.0);
+        r = cs_from_space(v, space);
+    } else {
+        float y = dot(c, float3(0.2126, 0.7152, 0.0722));
+        r = saturate(lerp(float3(y, y, y), c, k));
+    }
+    return r;
+}
+
+// 明るさ（0〜1）。space: 0 sRGB（Rec.709 をガンマのまま。従来の式）/ 1 リニア（相対輝度 Y）/ 2・7 Oklab の L / 5・6 Lab の L / 3 HSV の V / 4 HSL の L
+float cs_lightness(float3 c, float space) {
+    float r = dot(c, float3(0.2126, 0.7152, 0.0722));
+    if (space > 6.5 && space < 7.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c)).x;
+    } else if (space > 4.5 && space < 6.5) {
+        r = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c))).x / 100.0;
+    } else if (space > 3.5 && space < 4.5) {
+        r = cs_rgb_to_hsl(c).z;
+    } else if (space > 2.5 && space < 3.5) {
+        r = max(c.r, max(c.g, c.b));
+    } else if (space > 1.5 && space < 2.5) {
+        r = cs_linear_to_oklab(cs_to_linear(c)).x;
+    } else if (space > 0.5 && space < 1.5) {
+        r = dot(cs_to_linear(c), float3(0.2126729, 0.7151522, 0.0721750));
+    }
+    return r;
+}
+
+// CIEDE2000（Sharma, Wu, Dalal 2005）。Lab（D65）の値どうし。戻り値は ΔE00（0〜100 程度）
+float cs_ciede2000(float3 lab1, float3 lab2) {
+    float c1 = length(lab1.yz);
+    float c2 = length(lab2.yz);
+    float cb = (c1 + c2) * 0.5;
+    float cb7 = pow(cb, 7.0);
+    float g = 0.5 * (1.0 - sqrt(cb7 / (cb7 + 6103515625.0)));
+    float a1p = lab1.y * (1.0 + g);
+    float a2p = lab2.y * (1.0 + g);
+    float c1p = length(float2(a1p, lab1.z));
+    float c2p = length(float2(a2p, lab2.z));
+    float h1p = (abs(a1p) + abs(lab1.z)) > 0.0 ? atan2(lab1.z, a1p) : 0.0;
+    float h2p = (abs(a2p) + abs(lab2.z)) > 0.0 ? atan2(lab2.z, a2p) : 0.0;
+    if (h1p < 0.0) {
+        h1p = h1p + CS_TAU;
+    }
+    if (h2p < 0.0) {
+        h2p = h2p + CS_TAU;
+    }
+    float dl = lab2.x - lab1.x;
+    float dc = c2p - c1p;
+    float dh = 0.0;
+    float hbp = h1p + h2p;
+    if (c1p * c2p > 0.0) {
+        dh = h2p - h1p;
+        if (dh > 3.14159265) {
+            dh = dh - CS_TAU;
+        } else if (dh < -3.14159265) {
+            dh = dh + CS_TAU;
+        }
+        if (abs(h1p - h2p) > 3.14159265) {
+            hbp = (h1p + h2p < CS_TAU) ? (h1p + h2p + CS_TAU) * 0.5 : (h1p + h2p - CS_TAU) * 0.5;
+        } else {
+            hbp = (h1p + h2p) * 0.5;
+        }
+    }
+    float dhh = 2.0 * sqrt(c1p * c2p) * sin(dh * 0.5);
+    float lbp = (lab1.x + lab2.x) * 0.5;
+    float cbp = (c1p + c2p) * 0.5;
+    float t = 1.0 - 0.17 * cos(hbp - 0.523598776) + 0.24 * cos(2.0 * hbp)
+        + 0.32 * cos(3.0 * hbp + 0.104719755) - 0.20 * cos(4.0 * hbp - 1.099557429);
+    float dtheta = 0.523598776 * exp(-pow((hbp * 57.29577951 - 275.0) / 25.0, 2.0));
+    float cbp7 = pow(cbp, 7.0);
+    float rc = 2.0 * sqrt(cbp7 / (cbp7 + 6103515625.0));
+    float l50 = (lbp - 50.0) * (lbp - 50.0);
+    float sl = 1.0 + 0.015 * l50 / sqrt(20.0 + l50);
+    float sc = 1.0 + 0.045 * cbp;
+    float sh = 1.0 + 0.015 * cbp * t;
+    float rt = -sin(2.0 * dtheta) * rc;
+    float tl = dl / sl;
+    float tc = dc / sc;
+    float th = dhh / sh;
+    return sqrt(max(tl * tl + tc * tc + th * th + rt * tc * th, 0.0));
+}
+
+// 2 色の差。metric: 0 RGB / 1 YCbCr（BT.709 の色差だけ）/ 2 Oklab / 3 CIEDE2000。黒と白の差がおよそ 1
+float cs_distance(float3 c0, float3 c1, float metric) {
+    float r = length(c0 - c1) * 0.57735027;
+    if (metric > 2.5) {
+        float3 l0 = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c0)));
+        float3 l1 = cs_xyz_to_lab(cs_linear_to_xyz(cs_to_linear(c1)));
+        r = cs_ciede2000(l0, l1) / 100.0;
+    } else if (metric > 1.5) {
+        r = length(cs_linear_to_oklab(cs_to_linear(c0)) - cs_linear_to_oklab(cs_to_linear(c1)));
+    } else if (metric > 0.5) {
+        float3 d = c0 - c1;
+        float cb = dot(d, float3(-0.1146, -0.3854, 0.5));
+        float cr = dot(d, float3(0.5, -0.4542, -0.0458));
+        r = length(float2(cb, cr)) * 1.41421356;
+    }
+    return r;
+}
+// ==== colorspace.hlsl ここまで ====
+static const float4 c_src = src.Load(int3(coord_src, 0));
+// 種の色に近い画素を a_near、ほかを a_far にする（原作の bin_by_color）。
+// 色差=今まで（metric 4）は原作のまま: ストレートの sRGB の各成分の差がすべて diff 未満なら近い。
+// v1.00: ほかの色差では、ストレートの sRGB を cs_distance で測って thr 未満なら近い（diff は使わない）
+float4 ps_rcf_bin(float4 pos : SV_Position) : SV_Target
+{
+    const float4 c = src.Load(int3(pos.xy, 0));
+    bool near_c = all(abs(c_src.rgb / c_src.a - c.rgb / c.a) < diff);
+    if (metric < 3.5) {
+        near_c = cs_distance(c_src.rgb / c_src.a, c.rgb / c.a, metric) < thr;
+    }
+    const bool is_near = c_src.a > 0 && (c.a > 0 ? near_c : conn_empty > 0);
+    return float4(0, 0, 0, is_near ? a_near : a_far);
+}
+]]
+
+-- 色差領域塗りつぶし: 種（X・Y）の位置の色に近い色の、つながった領域を塗る（または後続フィルタ・スクリプトを掛ける）。
+-- @Region_S の 色領域塗りつぶし（σ軸、MIT）のフォーク。
+--   原作: Script/@Region_S.anm2 の 色領域塗りつぶし v1.10（https://github.com/sigma-axis/aviutl2_script_Region_S）
+--   変えた点: 色の範囲の判定（原作の bin_by_color の sRGB の各成分の箱）に 色差 を足した。
+--     今まで（既定）は原作と同じ判定。RGB / YCbCr / Oklab / CIEDE2000 では 色範囲 1 つで比べ、R・G・B 範囲補正は隠す（効かない）。
+--     ほかは原作のまま（項目名・既定値・PI の受け取り方・合成の手順）。
+--   連結成分の抽出と合成は、原作の Region_S.lua（Script/ 直下。require する）と、それが呼ぶ
+--   @Region_S.anm2 の const_alpha・bounded_mask をそのまま使う（取り込まない）。理由:
+--     - Region_S.lua の mask_and_combine は @Region_S.anm2 の節のシェーダーを名前で呼ぶので、Region_S.lua だけを
+--       取り込んでも @Region_S.anm2 は要る。全部を写すと 500 行近くを二重に持ち、原作の直しから外れる
+--     - 境界の膨張縮小（アウトラインσ）とスクリプトの既定（縁取りσ）は、原作でも別の配布物（Border_S）に頼っている
+--   なので、使うには Region_S（Region_S.lua と @Region_S.anm2）が入っている必要がある（公開するときも、それが要ると書く）。
+--   検証器: AI/scripts/キーイング_H/verify_colorspace_ext.py（既定で原作と同じ判定・同じ呼び出しになることを見る）
+--
+-- 原作の著作権表示と許諾表示（MIT License）:
+--   MIT License
+--
+--   Copyright (c) 2026 sigma-axis
+--
+--   Permission is hereby granted, free of charge, to any person obtaining a copy
+--   of this software and associated documentation files (the "Software"), to deal
+--   in the Software without restriction, including without limitation the rights
+--   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+--   copies of the Software, and to permit persons to whom the Software is
+--   furnished to do so, subject to the following conditions:
+--
+--   The above copyright notice and this permission notice shall be included in all
+--   copies or substantial portions of the Software.
+--
+--   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+--   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+--   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+--   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+--   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+--   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+--   SOFTWARE.
+
+local obj, math, tonumber = obj, math, tonumber
+
+-- 色差ごとの係数。色範囲 t（0〜1）のとき、色差 < t * RCF_K で比べる。同型塗りつぶしの SF_K と同じ値
+-- （どちらも今までの判定が「sRGB の各成分の差が t 未満」の立方体なので、根拠も同じ。同型塗りつぶしの Lua のコメント）
+local RCF_K = { [0] = 0.72, 0.94, 0.46, 0.57 }
+
+local ok_rs, region_s = pcall(require, "Region_S")
+if not ok_rs or type(region_s) ~= "table" or region_s.mask_and_combine == nil then
+  local G = _COLOR_DIFF_REGION_FILL_H or {}
+  _COLOR_DIFF_REGION_FILL_H = G
+  if not G.warned then
+    G.warned = true
+    print("@warn", "[色差領域塗りつぶし@キーイング_H] Region_S（σ軸。Script/Region_S.lua と Script/@Region_S.anm2）を読めません: " .. tostring(region_s))
+  end
+  return
+end
+
+-- set anchors.
+if obj.getoption("gui") then
+  obj.setanchor("X,Y", 0, "line")
+end
+
+--#region PI / normalize parameters.
+
+-- take parameters.
+X = tonumber(PI.X) or X
+Y = tonumber(PI.Y) or Y
+invert = region_s.PI_as_bool(PI.invert, invert)
+fixed_size = region_s.PI_as_bool(PI.fixed_size, fixed_size)
+if PI.mode_filter then
+  local name2num = { ["単色化"] = 0, ["後続フィルタ"] = 1, ["スクリプト実行"] = 2 }
+  mode_filter = name2num[PI.mode_filter] or mode_filter
+end
+color = tonumber(PI.color) or color
+intensity = tonumber(PI.intensity) or intensity
+keep_luma = region_s.PI_as_bool(PI.keep_luma, keep_luma)
+alpha_eff = tonumber(PI.alpha_eff) or alpha_eff
+alpha_src = tonumber(PI.alpha_src) or alpha_src
+if PI.mode_draw then
+  local name2num = { ["前方から合成"] = 0, ["後方から合成"] = 1 }
+  mode_draw = name2num[PI.mode_draw] or mode_draw
+end
+local blend_name = region_s.PI_choose_blend_mode(PI.blend, blend)
+-- v1.00: 色差（PI は名前か番号）
+if PI.color_metric then
+  local name2num = { ["今まで"] = 4, ["RGB"] = 0, ["YCbCr"] = 1, ["Oklab"] = 2, ["CIEDE2000"] = 3 }
+  color_metric = name2num[PI.color_metric] or tonumber(PI.color_metric) or color_metric
+end
+range = tonumber(PI.range) or range
+range_R = tonumber(PI.range_R) or range_R
+range_G = tonumber(PI.range_G) or range_G
+range_B = tonumber(PI.range_B) or range_B
+inflation = tonumber(PI.inflation) or inflation
+conn_corner = region_s.PI_as_bool(PI.conn_corner, conn_corner)
+union_left = region_s.PI_as_bool(PI.union_left, union_left)
+union_right = region_s.PI_as_bool(PI.union_right, union_right)
+union_top = region_s.PI_as_bool(PI.union_top, union_top)
+union_bottom = region_s.PI_as_bool(PI.union_bottom, union_bottom)
+conn_empty = region_s.PI_as_bool(PI.conn_empty, conn_empty)
+
+-- normalize parameters.
+mode_filter = math.min(math.max(math.floor(0.5 + mode_filter), 0), 2)
+color = math.floor(0.5 + color) % 2 ^ 24
+intensity = math.min(math.max(intensity / 100, 0), 1)
+alpha_eff = math.min(math.max(1 - alpha_eff / 100, 0), 1)
+alpha_src = math.min(math.max(1 - alpha_src / 100, 0), 1)
+mode_draw = math.min(math.max(math.floor(0.5 + mode_draw), 0), 1)
+range = math.min(math.max(range / 100, 0), 1)
+range_R = math.min(math.max(range * range_R / 100, 2 ^ -10), 1)
+range_G = math.min(math.max(range * range_G / 100, 2 ^ -10), 1)
+range_B = math.min(math.max(range * range_B / 100, 2 ^ -10), 1)
+inflation = math.min(math.max(inflation, -500), 500)
+fixed_size = fixed_size or obj.getinfo("filter") or
+  not ((invert and alpha_eff or alpha_src) <= 0 and mode_filter == 0)
+-- v1.00: 色差。今まで（4）は原作の箱（range_R・G・B）で、thr は使わない。ほかは色範囲 1 つで比べる。
+-- 色範囲 0 でも種と同じ色は残るように、原作の各成分の下限（2^-10）に揃える
+color_metric = math.floor(0.5 + (tonumber(color_metric) or 4))
+if RCF_K[color_metric] == nil then color_metric = 4 end
+local thr = (color_metric == 4) and 0 or math.max(range, 2 ^ -10) * RCF_K[color_metric]
+
+--#endregion PI / normalize parameters.
+
+-- further calculations.
+local no_effect = alpha_eff <= 0 or
+  (mode_filter == 0 and intensity == 0) or
+  (mode_filter == 2 and not script:find("%S"))
+
+-- apply.
+if fixed_size and
+  ((alpha_eff == alpha_src and no_effect) or (alpha_eff <= 0 and alpha_src <= 0)) then
+  -- trivial cases.
+  if alpha_src <= 0 then obj.clearbuffer("object")
+  elseif alpha_src < 1 then
+    obj.pixelshader("const_alpha@連結成分塗りつぶし@Region_S", "object", nil, { alpha_src }, "mask")
+  end
+else
+  -- apply library function.
+  region_s.mask_and_combine(inflation, conn_corner,
+    union_left, union_right, union_top, union_bottom,
+    invert, mode_draw, blend_name, alpha_eff, alpha_src, fixed_size,
+    1, { X, Y }, function(buf_src, buf_dst)
+      obj.pixelshader("ps_rcf_bin", buf_dst, buf_src, {
+        1, 0, math.floor(obj.w / 2 + X), math.floor(obj.h / 2 + Y),
+        range_R, range_G, range_B,
+        conn_empty and 1 or 0,
+        color_metric, thr,
+      })
+    end, not no_effect and (
+      mode_filter <= 1 and obj.effect or region_s.execute_script
+    ) or nil, unpack(
+    mode_filter == 0 and { "単色化", "色", color, "強さ", 100 * intensity, "輝度を保持する", keep_luma and 1 or 0 } or
+    mode_filter == 1 and {} or { script, "local color,intensity,keep_luma=...;", color, intensity, keep_luma }))
+  if obj.w <= 0 or obj.h <= 0 then return end
+end
+
+-- draw to the framebuffer if subsequent filters are applied.
+if mode_filter == 1 then
+  obj.setoption("drawtarget", "framebuffer")
+  obj.draw()
+end

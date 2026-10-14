@@ -24,7 +24,7 @@ AviUtl ExEdit2 向けに作ったスクリプト集です。設定ダイアロ�
 | `@ローポリ化.anm2` `@ローポリ背景.obj2` | `EffectUtils_Lowpoly.lua` `EffectUtils_ColorSpace.lua` |
 | `@拡張パーティクル_H.anm2`           | `Particle_H.lua` `EffectUtils_ColorSpace.lua`          |
 | `カラフルランダム配置_H.obj2` `カラフルパーティクル_H.obj2` | 色空間を HSV / Oklch にするなら `EffectUtils_ColorSpace.lua` |
-| `@キーイング_H.anm2`             | 同型塗りつぶしを使うなら `SameShapeFill_H` のフォルダごと |
+| `@キーイング_H.anm2`             | 同型塗りつぶしを使うなら `SameShapeFill_H` のフォルダごと。色差領域塗りつぶしを使うなら σ軸さんの Region_S（HexScript には入っていない） |
 | `@ShapeDistort_H.anm2`       | パペットを使うなら `Puppet_H` のフォルダごと |
 | `@キーイング_H.anm2` `@2Dライティング_H.anm2` `ビーム化_H.anm2` `光束_H.anm2` `ベクトルブラー_H.anm2` `押し出し_H.anm2` `ボールアクション_H.anm2` `コンテンツに応じた塗りつぶし_H.anm2` | `EffectUtils_Budget.lua`（cache と tempbuffer の枠の見積もり） |
 
@@ -37,7 +37,7 @@ AviUtl ExEdit2 向けに作ったスクリプト集です。設定ダイアロ�
 | <img src="images/HexBrowns.ColorSpaceBlend_H_thumbnail.png" width="160"> | `色空間合成_H.anm2` | 下の絵と合成する。色相・カラー・彩度・輝度を Oklch / LCh で（明るさの並びが崩れない）、通常・加算・スクリーン・乗算・比較(明・暗)をリニア（光の強さ）で。extra_blend_mode.anm2（sevenc-nanashi、MIT）のフォーク | [docs](docs/色空間合成_H.md) |
 | <img src="images/HexBrowns.Filters_H_thumbnail.png" width="160">      | `@Filters_H.anm2`  | フィルム調の加工 29 種（グリッチ、グレイン、ハレーション、ライトリーク、ビネット、アナモルフィックフレア、リキッドディストーション、シマー、フォグヘイズ、フィルムバーン、カラーグレード、リフト・ガンマ・ゲイン、バレル歪み、ノイズオーバーレイ、バイブランス、HSL選択補正、LUT適用、色調転写、局所トーン補正、ローカルラプラシアン、暗所視、ホログラム箔、多面体ガラス、レンズの汚れ、古いフィルム、自動レベル補正、美肌、タイムディスプレイスメント＝場所ごとに何フレーム前の絵を出すかを変える、色ノイズ） | [docs](docs/Filtersフィルタ使用ガイド.md) |
 | <img src="images/HexBrowns.OpticalBokeh_thumbnail.png" width="160">   | `@光学系ボケ.anm2`      | レンズで撮ったようなボケ 5 種（玉ボケ、レンズぼかし、チルトシフト、球面収差ボケ、マップぼかし＝深度マップなどの明るさで場所ごとにぼかしの量を変える）                                                                                                                                          | [docs](docs/光学系ボケ.md)            |
-| <img src="images/HexBrowns.Keying_H_thumbnail.png" width="160">       | `@キーイング_H.anm2`    | 背景を抜いた素材の仕上げ 6 種（マット調整、スピル除去、トラックマット、動体抽出＝前のフレームとの差で動いた所だけ残す / 同型塗りつぶし＝同じ形の領域を全部見つけて塗る / 光の回り込み＝背景の光を縁へにじませてなじませる）                                                                                                                       | [docs](docs/キーイング_H.md)          |
+| <img src="images/HexBrowns.Keying_H_thumbnail.png" width="160">       | `@キーイング_H.anm2`    | 背景を抜いた素材の仕上げ 7 種（マット調整、スピル除去、トラックマット、動体抽出＝前のフレームとの差で動いた所だけ残す / 同型塗りつぶし＝同じ形の領域を全部見つけて塗る / 光の回り込み＝背景の光を縁へにじませてなじませる / 色差領域塗りつぶし＝Region_S の色領域塗りつぶしに色差を足したフォーク）                                                                                                                       | [docs](docs/キーイング_H.md)          |
 | <img src="images/HexBrowns.Lighting2D_H_thumbnail.gif" width="160">   | `@2Dライティング_H.anm2` | 平たい素材に立体の光と陰を足す 3 種（大域照明＝明るい所を光源にして、物で遮りながら光を広げ影を落とす / 環境遮蔽＝くぼみ・溝・接触部に陰を落とす / 光の帯＝表面をなめる光沢の帯）                                                                                                        | [docs](docs/2Dライティング_H.md)       |
 | <img src="images/HexBrowns.RangeWarning_H_thumbnail.png" width="160"> | `レンジ警告_H.anm2`     | 白飛び・黒潰れ・色域外の画素をゼブラで示す検査用の効果                                                                                                                                                         | [docs](docs/レンジ警告_H.md)          |
 
