@@ -1,5 +1,8 @@
 # 色空間合成_H
 
+<!-- サンプル動画 -->
+<img src="samples/%E8%89%B2%E7%A9%BA%E9%96%93%E5%90%88%E6%88%90_H/%E8%89%B2%E7%A9%BA%E9%96%93%E5%90%88%E6%88%90_H.webp" width="480" alt="色空間合成_H のサンプル">
+
 オブジェクトを下の絵に、色相・カラー・彩度・輝度や、光の強さで足し合わせる合成で重ねるアニメーション効果です。
 sevenc-nanashiさんの [extra_blend_mode.anm2](https://github.com/sevenc-nanashi/extra_blend_mode.anm2)（MIT）をフォークし、色空間に関係するモードだけを、見た目に近い色空間と光の強さ（リニア）で計算し直したものです。
 
