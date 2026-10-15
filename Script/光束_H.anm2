@@ -1,4 +1,4 @@
---information:光束_H v1.14 by HexBrowns
+--information:光束_H v1.20 by HexBrowns
 --label:HexScript
 --group:形
 --select@ray_mode:光の出方=0,平行=0,放射=1,収束=2
@@ -28,10 +28,13 @@
 --track@seed:シード,-1000,1000,0,1
 --group:品質
 --select@res:解像度=2,等倍=1,1/2=2,1/4=4
+--select@march_mode:光線の作り方=0,倍々の畳み込み=0,等間隔の歩み=1
+--track@march_steps:歩数,2,256,16,1
+--hide@march_steps:march_mode==0
 --group
 
 --[[
-光束_H v1.13
+光束_H v1.20
 
 掛けたオブジェクトの光る部分から光の筋を伸ばす。
   光の出方  平行（光の柱・窓からの日差し）/ 放射（光源から広がる）/ 収束（光源へ吸い込まれる）
@@ -63,6 +66,10 @@ v1.13: 1 フレームに持つ cache が枠（cache と tempbuffer で合わせ�
 作業解像度を自動で下げる条件に cache の合計を足した（広げた画像が大きいと黒いフレームになっていた）。
 v1.14: 広げた画像を cache に退避せず object のまま読む（横長の巨大素材で枠を超えて消えていた）。目安は共有の
 EffectUtils_Budget（1400 万ドット）にし、1/4 でも収まらなければ効果を掛けない（AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md）。
+v1.20: 光線の作り方 に 等間隔の歩み を足した（既定は今までの 倍々の畳み込み）。光線を N 歩さかのぼる範囲を
+歩数 個の等間隔の点だけで読み重ねる（ps_lb_march を 1 回）。歩数が少ないと光線が形の写しの段や縞になる（古いゲームの
+ゴッドレイ風）。歩数が全体の歩数以上なら 1 歩ずつ読むので、倍々の畳み込みと同じ光になる（双線形の読み直しが無いぶん鋭い）。
+広げる量・作業解像度・cache の数え方は 倍々の畳み込み と同じ（使う cache はこちらの方が少ない）。
 ]]
 
 --[[pixelshader@ps_lb_pool:
@@ -173,6 +180,53 @@ float4 ps_lb_step(float4 pos : SV_Position) : SV_Target {
     float a = x.a + (1.0 - x.a) * y.a;
     float t = x.r + (1.0 - x.a) * (y.r + d * y.a);
     return float4(t, 0.0, 0.0, a);
+}
+]]
+
+--[[pixelshader@ps_lb_march:
+// 等間隔の歩み（v1.20）。光線を n_total 歩さかのぼる範囲を count 個の等間隔の点 i_k = k·delta（delta = n_total / count）で読む。
+// T_i(p) は平行移動なら p − i·dir、拡大なら c + e^(−λ i)(p − c)。作業解像度の座標で、外は透明（sampler "clip"）。
+// op 0（体積光）: Σ delta·w(i_k)·g^(i_k)·S(T_i p)。w は平らな部分 n_flat まで 1、その先は e^(−(i − n_flat)/tail)。
+//                g^i は拡大のときの 1 歩の長さの違い e^(−λ i)（ps_lb_step の鎖の gain と同じ）
+// op 1（ベタ）  : 前から順に over。r = 当たった点までの距離 x 被覆（乗算済み）、a = 被覆（ps_lb_step の op 1 と同じ形）
+Texture2D sb : register(t0);
+SamplerState smp : register(s0);
+cbuffer P : register(b0) {
+    float2 size;
+    float2 center;
+    float2 dir;
+    float count;
+    float delta;
+    float kind;
+    float lam_re;
+    float n_flat;
+    float tail;
+    float op;
+};
+float4 ps_lb_march(float4 pos : SV_Position) : SV_Target {
+    float2 p = pos.xy;
+    float2 q = p - center;
+    float4 acc = float4(0, 0, 0, 0);
+    float t = 0.0;
+    float a = 0.0;
+    [loop]
+    for (int k = 0; k < 256; k++) {
+        if ((float)k >= count) break;
+        float i = (float)k * delta;
+        float e = exp(-lam_re * i);
+        float2 sp = kind < 0.5 ? p - i * dir : p + (e - 1.0) * q;
+        float4 y = sb.SampleLevel(smp, sp / size, 0);
+        if (op < 0.5) {
+            float w = i < n_flat ? 1.0 : (tail > 0.0 ? exp(-(i - n_flat) / tail) : 0.0);
+            float g = kind < 0.5 ? 1.0 : e;
+            acc += (delta * w * g) * y;
+        } else {
+            float d = length(p - sp);
+            t += (1.0 - a) * d * y.a;
+            a += (1.0 - a) * y.a;
+        }
+    }
+    return op < 0.5 ? acc : float4(t, 0.0, 0.0, a);
 }
 ]]
 
@@ -612,7 +666,29 @@ local function chain(seed_buf, n, rho, op, out)
   obj.copybuffer(out, acc)
 end
 
-if fill_mode == 0 then
+-- 等間隔の歩み（v1.20）: 全体 N1 + N2 歩を 歩数 個の等間隔の点で読む 1 パス。歩数が全体より多ければ 1 歩ずつ読む
+local function march(seed_buf, op, out)
+  local n_total = N1 + N2
+  local count = math.max(1, math.min(256, math.floor(march_steps + 0.5), n_total))
+  obj.clearbuffer(out, Ww, Hw)
+  obj.pixelshader("ps_lb_march", out, seed_buf, {
+    Ww, Hw, cwx, cwy,
+    dx, dy, count, n_total / count,
+    kind, lam_re, N1, lam,
+    op,
+  }, "copy", "clip")
+end
+
+if march_mode == 1 then
+  if fill_mode == 0 then
+    emit("cache:lb/S", 0, 1 / ell)
+    march("cache:lb/S", 0, "cache:lb/R")
+  else
+    emit("cache:lb/S", 0, 1)
+    emit("cache:lb/seed", 1, 1)
+    march("cache:lb/seed", 1, "cache:lb/R")
+  end
+elseif fill_mode == 0 then
   -- 体積光: 平らな部分 Box と、減衰する尾 Exp を別に作って継ぐ
   emit("cache:lb/S", 0, 1 / ell)
   local r_tail = lam > 0 and math.exp(-1 / lam) or 0

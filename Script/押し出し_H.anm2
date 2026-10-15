@@ -1,4 +1,4 @@
---information:押し出し_H v1.01 by HexBrowns
+--information:押し出し_H v1.10 by HexBrowns
 --label:HexScript
 
 --group:押し出し
@@ -27,6 +27,10 @@
 --check@shade_face:表面にも陰影,0
 --group
 
+--group:描き方
+--select@interp:補間=0,補間あり=0,補間なし=1
+--group
+
 --[[
 After Effects の 3D テキストの「押し出し」と「ベベル」に当たる効果。オブジェクトの形（アルファ）を奥行き方向に押し出して、
 縁に面取りか丸みを付けた立体にする。カメラ制御の下では本当の 3D として見える。
@@ -47,6 +51,11 @@ After Effects の 3D テキストの「押し出し」と「ベベル」に当�
 v1.01: 4K・横長の巨大素材で cache と tempbuffer の枠（1600 万ドット）を超えないように、元の画像の退避 1 枚と
 一番近い外側の 2 枚が枠に収まらなければ、一番近い外側を縮めた解像度で求める（位置は元の解像度の px で持つ）。
 元の画像の退避だけで収まらなければ効果を掛けない。AI/scripts/issues/20261013_cache_budget_4k_wide_materials.md
+
+v1.10: 補間を足した。補間あり（既定・v1.01 と同じ）は drawpoly の既定のサンプラー（"clamp"）。補間なしは
+obj.setoption("sampler", "dot") で板の画素を補間せずに拾う（拡大・回転してもドットのまま）。"dot" は画像の外を透明として読む
+（lua.txt の「サンプラーモード」）ので、板の uv を画像の端の画素の内側へ 1/32 px 寄せ、丸めで外を読んで縁が透けるのを防ぐ。
+描き終えたらサンプラーを既定に戻す
 ]]
 
 --[[pixelshader@ps_ext_seed:
@@ -206,8 +215,16 @@ local function slice(erode, kind, use_src, nr, nz)
   })
 end
 
+-- 補間なし（v1.10）: uv を画像の端の画素の内側へ 1/32 px 寄せる（補間ありは 0〜W・0〜H のまま）
+local DOT = math.floor(num(interp, 0) + 0.5) == 1
+local U0, V0, U1, V1 = 0, 0, W, H
+if DOT then
+  local e = 1 / 32
+  U0, V0, U1, V1 = e, e, W - e, H - e
+end
+
 local function quad(z)
-  return {-W / 2, -H / 2, z, W / 2, -H / 2, z, W / 2, H / 2, z, -W / 2, H / 2, z, 0, 0, W, 0, W, H, 0, H}
+  return {-W / 2, -H / 2, z, W / 2, -H / 2, z, W / 2, H / 2, z, -W / 2, H / 2, z, U0, V0, U1, V0, U1, V1, U0, V1}
 end
 
 -- ベベルの削る量 e(t) と面の向き（t = 0 が表面、1 がベベルの奥の端）
@@ -254,6 +271,7 @@ if cam == 0 then
   end
 end
 
+if DOT then obj.setoption("sampler", "dot") end
 for _, s in ipairs(plan) do
   if s.kind == 0 then
     slice(BW, 0, 1, 0, -1)
@@ -276,3 +294,4 @@ for _, s in ipairs(plan) do
     obj.drawpoly({quad(s.z)})
   end
 end
+if DOT then obj.setoption("sampler") end   -- サンプラーを既定に戻す

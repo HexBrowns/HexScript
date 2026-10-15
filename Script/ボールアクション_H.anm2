@@ -1,4 +1,4 @@
---information:ボールアクション_H v1.01 by HexBrowns
+--information:ボールアクション_H v1.10 by HexBrowns
 --label:HexScript
 
 --group:ボール
@@ -31,6 +31,10 @@
 --track@spec:ハイライト,0,100,60,0.1
 --group
 
+--group:描き方
+--select@interp:補間=0,補間あり=0,補間なし=1
+--group
+
 --[[
 After Effects の「CC Ball Action」に当たる効果。オブジェクトを 間隔 ごとの格子で区切り、各点の色を拾った球（ボール）に置き換える。
 ボールは散らばり・ねじれ・回転で 3D に動かせる。
@@ -40,6 +44,9 @@ After Effects の「CC Ball Action」に当たる効果。オブジェクトを 
    奥行きがあるときは奥（Z が大きい）から描く（Z を 4096 段に分けて数える並べ替え）
 - 以降のフィルタ効果は掛からない（lua.txt の obj.drawpoly）
 - ボールの位置: 格子点 → 散らばり → ねじれ（オブジェクトの中心を通る軸のまわりに、基準の値 x 角度だけ回す）→ 回転 → 揺れ
+- 補間（v1.10）: 補間あり（既定・v1.01 と同じ）は drawpoly の既定のサンプラー（"clamp"）。補間なしは obj.setoption("sampler", "dot") で
+  アトラスの画素を補間せずに拾う（拡大したボールの縁がドットの階段になる）。"dot" は画像の外を透明として読む（lua.txt の
+  「サンプラーモード」）が、タイルの外周 1px はもともと透明なので、四角形の縁で外を読んでも見た目は変わらない。描き終えたら既定に戻す
 
 机上検証: AI/scripts/ボールアクション_H/verify_ball_action.py
 ]]
@@ -266,4 +273,7 @@ end
 
 -- 画像をアトラスに差し替えて描く（以降のフィルタ効果は掛からない）
 obj.copybuffer("object", ATLAS)
+local DOT = math.floor(num(interp, 0) + 0.5) == 1
+if DOT then obj.setoption("sampler", "dot") end
 obj.drawpoly(list)
+if DOT then obj.setoption("sampler") end   -- サンプラーを既定に戻す

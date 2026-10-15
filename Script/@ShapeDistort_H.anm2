@@ -1,5 +1,5 @@
 --[[
-ShapeDistort_H.anm2 v1.10
+ShapeDistort_H.anm2 v1.20
 
 図形変形フィルタ 5 種（回転 / 放射 / 方向 / ジグザグ / 無限ズーム）を HLSL 1 パスで実装したもの。
 6 種目のパペットだけは三角網を obj.drawpoly で描く（変形の計算は puppet.mod2）。
@@ -63,12 +63,20 @@ v1.10（2026-10-12、無限ズームとパペットを足した。既存の 4 �
   - 仕様: AI/specifications/20261012_ShapeDistort_H_パペット_spec.md
     検証器: AI/scripts/ShapeDistort_H/verify_puppet.py
 
+v1.20（2026-10-15、回転 / 放射 / 方向 / ジグザグ / 無限ズーム の 5 つ。パペットは変えていない）
+  - 「画像の読み方」（バイリニア / 最近傍 / バイキュービック）を足した。既定のバイリニアは v1.10 と同じ読み方・同じ絵
+  - 最近傍: 読む位置を画素の中心に丸めて、その画素をそのまま読む。歪んだ所がドット絵のように角張る
+  - バイキュービック: 周りの 4x4 画素を Catmull-Rom の 3 次の重みで混ぜる。強く引き伸ばした所が滑らかで、やや鋭い
+  - どちらも同じ sampler を通して読むので、端の扱い（ラップ ON の "loop"・フィルタオブジェクトの "clamp"・
+    ラップ OFF の "clip"）はバイリニアと同じ
+  - 検証器: AI/scripts/ShapeDistort_H/verify_sampling.py
+
 ※このコメント内で行頭に @ を置かないこと。ホストはブロックコメントの中も走査し、
   行頭 @ をセクション区切りとして扱うため、偽のスクリプトがエフェクト一覧に並ぶ。
 ]]
 
 @回転
---information:回転@ShapeDistort_H v1.03 by HexBrowns
+--information:回転@ShapeDistort_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 
@@ -93,6 +101,7 @@ v1.10（2026-10-12、無限ズームとパペットを足した。既存の 4 �
 --group:表示,0
 --check@wrap:ラップ,1
 --check@compose_bg:背景を合成,0
+--select@read_mode:画像の読み方=0,バイリニア=0,最近傍=1,バイキュービック=2
 --group
 
 --[[pixelshader@ps_sd_swirl:
@@ -110,6 +119,7 @@ cbuffer P : register(b0) {
     float2 pad;          // 12-13 広げた画像の中の、元の画像の左上（px）。広げていなければ 0
     float2 buf_size;     // 14-15 広げた画像の大きさ
     float clip_out;      // 16   1 = 元の画像の外を透明として読む（通常のオブジェクトでラップ OFF）
+    float read_mode;     // 17   画像の読み方（0 = バイリニア / 1 = 最近傍 / 2 = バイキュービック）
 };
 
 Texture2D tex : register(t0);
@@ -132,6 +142,47 @@ float sd_wave(float x, float shape) {
 float sd_jitter(float x, float rnd, float seed) {
     float r = sd_hash(float2(floor(x), seed));
     return lerp(1.0, r * 2.0, saturate(rnd));
+}
+
+// 画像の読み方（v1.20）。バイリニア（0）は呼び出し側の tex.Sample のまま（v1.10 と同じ）で、ここは通らない。
+// 1 = 最近傍: 読む位置を画素の中心に丸めて読む（中心ちょうどなのでバイリニアの sampler でも補間されない）。
+// 2 = バイキュービック: 周りの 4x4 画素を Catmull-Rom の重みで混ぜる。
+// どちらも同じ sampler を通して読むので、範囲の外の扱い（"loop" / "clamp" / "clip"）はバイリニアと同じ。
+// 乗算済みのまま混ぜ、Catmull-Rom の行き過ぎは α を 0〜1、色を 0〜α に収める。tsize は読む画像（t0）の大きさ（px）。
+// 勾配を使わない SampleLevel で読む（分岐とループの中から呼ぶため）
+float4 sd_row(float x0, float y, float dx, float4 wx) {
+    return tex.SampleLevel(smp, float2(x0 - dx, y), 0) * wx.x
+         + tex.SampleLevel(smp, float2(x0, y), 0) * wx.y
+         + tex.SampleLevel(smp, float2(x0 + dx, y), 0) * wx.z
+         + tex.SampleLevel(smp, float2(x0 + dx * 2.0, y), 0) * wx.w;
+}
+
+float4 sd_read(float2 tuv, float mode, float2 tsize) {
+    float2 ts = max(tsize, float2(1.0, 1.0));
+    float2 inv = 1.0 / ts;
+    float4 res = float4(0.0, 0.0, 0.0, 0.0);
+    if (mode > 1.5) {
+        float2 tp = tuv * ts - 0.5;
+        float2 base = floor(tp);
+        float2 f = tp - base;
+        float2 c0 = (base + 0.5) * inv;
+        float2 f2 = f * f;
+        float2 f3 = f2 * f;
+        float2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+        float2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+        float2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+        float2 w3 = 0.5 * f3 - 0.5 * f2;
+        float4 wx = float4(w0.x, w1.x, w2.x, w3.x);
+        res = sd_row(c0.x, c0.y - inv.y, inv.x, wx) * w0.y
+            + sd_row(c0.x, c0.y, inv.x, wx) * w1.y
+            + sd_row(c0.x, c0.y + inv.y, inv.x, wx) * w2.y
+            + sd_row(c0.x, c0.y + inv.y * 2.0, inv.x, wx) * w3.y;
+        res.a = saturate(res.a);
+        res.rgb = clamp(res.rgb, float3(0.0, 0.0, 0.0), float3(res.a, res.a, res.a));
+    } else {
+        res = tex.SampleLevel(smp, (floor(tuv * ts) + 0.5) * inv, 0);
+    }
+    return res;
 }
 
 float4 ps_sd_swirl(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
@@ -179,6 +230,9 @@ float4 ps_sd_swirl(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
     float2 tuv = expanded ? (suv * resolution + pad) / buf_size : suv;
 
     float4 fg = tex.Sample(smp, tuv);
+    if (read_mode > 0.5) {
+        fg = sd_read(tuv, read_mode, buf_size);
+    }
     if (compose_bg > 0.5) {
         // 内部フォーマットは Premultiplied Alpha。over 合成は fg + bg*(1-fg.a)。
         // 旧版は lerp(bg, fg, fg.a) としており、乗算済みの fg にさらに α を掛けていた。
@@ -239,6 +293,7 @@ if not is_filter and wrap ~= 1 then
     amount, ridges, wave, randomness / 100,
     random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, extra,
     pad_x, pad_y, obj.w, obj.h, 1,
+    read_mode,
   }, "copy", "clip")
 else
   -- 端を読む経路は sampler を明示する（v1.03）。省くと範囲外を透明として補間し、
@@ -249,11 +304,12 @@ else
     amount, ridges, wave, randomness / 100,
     random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, extra,
     0, 0, obj.w, obj.h, 0,
+    read_mode,
   }, "copy", (wrap == 1) and "loop" or "clamp")
 end
 
 @放射
---information:放射@ShapeDistort_H v1.03 by HexBrowns
+--information:放射@ShapeDistort_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 
@@ -278,6 +334,7 @@ end
 --group:表示,0
 --check@wrap:ラップ,1
 --check@compose_bg:背景を合成,0
+--select@read_mode:画像の読み方=0,バイリニア=0,最近傍=1,バイキュービック=2
 --group
 
 --[[pixelshader@ps_sd_radial:
@@ -295,6 +352,7 @@ cbuffer P : register(b0) {
     float2 pad;          // 12-13
     float2 buf_size;     // 14-15
     float clip_out;      // 16
+    float read_mode;     // 17
 };
 
 Texture2D tex : register(t0);
@@ -316,6 +374,42 @@ float sd_wave(float x, float shape) {
 float sd_jitter(float x, float rnd, float seed) {
     float r = sd_hash(float2(floor(x), seed));
     return lerp(1.0, r * 2.0, saturate(rnd));
+}
+
+// 正本: @回転 の sd_read（説明もそこ。直すときは 5 つとも直す）
+float4 sd_row(float x0, float y, float dx, float4 wx) {
+    return tex.SampleLevel(smp, float2(x0 - dx, y), 0) * wx.x
+         + tex.SampleLevel(smp, float2(x0, y), 0) * wx.y
+         + tex.SampleLevel(smp, float2(x0 + dx, y), 0) * wx.z
+         + tex.SampleLevel(smp, float2(x0 + dx * 2.0, y), 0) * wx.w;
+}
+
+float4 sd_read(float2 tuv, float mode, float2 tsize) {
+    float2 ts = max(tsize, float2(1.0, 1.0));
+    float2 inv = 1.0 / ts;
+    float4 res = float4(0.0, 0.0, 0.0, 0.0);
+    if (mode > 1.5) {
+        float2 tp = tuv * ts - 0.5;
+        float2 base = floor(tp);
+        float2 f = tp - base;
+        float2 c0 = (base + 0.5) * inv;
+        float2 f2 = f * f;
+        float2 f3 = f2 * f;
+        float2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+        float2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+        float2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+        float2 w3 = 0.5 * f3 - 0.5 * f2;
+        float4 wx = float4(w0.x, w1.x, w2.x, w3.x);
+        res = sd_row(c0.x, c0.y - inv.y, inv.x, wx) * w0.y
+            + sd_row(c0.x, c0.y, inv.x, wx) * w1.y
+            + sd_row(c0.x, c0.y + inv.y, inv.x, wx) * w2.y
+            + sd_row(c0.x, c0.y + inv.y * 2.0, inv.x, wx) * w3.y;
+        res.a = saturate(res.a);
+        res.rgb = clamp(res.rgb, float3(0.0, 0.0, 0.0), float3(res.a, res.a, res.a));
+    } else {
+        res = tex.SampleLevel(smp, (floor(tuv * ts) + 0.5) * inv, 0);
+    }
+    return res;
 }
 
 float4 ps_sd_radial(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
@@ -358,6 +452,9 @@ float4 ps_sd_radial(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target 
     float2 tuv = expanded ? (suv * resolution + pad) / buf_size : suv;
 
     float4 fg = tex.Sample(smp, tuv);
+    if (read_mode > 0.5) {
+        fg = sd_read(tuv, read_mode, buf_size);
+    }
     if (compose_bg > 0.5) {
         float4 bg = tex.Sample(smp, buf_uv);
         return fg + bg * (1.0 - fg.a);
@@ -424,6 +521,7 @@ if not is_filter and wrap ~= 1 then
     random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0,
     (extra == 1) and 1 or 0,
     pad_x, pad_y, obj.w, obj.h, 1,
+    read_mode,
   }, "copy", "clip")
 else
   -- 端を読む経路は sampler を明示する（v1.03）。省くと範囲外を透明として補間し、
@@ -435,11 +533,12 @@ else
     random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0,
     (extra == 1) and 1 or 0,
     0, 0, obj.w, obj.h, 0,
+    read_mode,
   }, "copy", (wrap == 1) and "loop" or "clamp")
 end
 
 @方向
---information:方向@ShapeDistort_H v1.03 by HexBrowns
+--information:方向@ShapeDistort_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 
@@ -458,6 +557,7 @@ end
 --group:表示,0
 --check@wrap:ラップ,1
 --check@compose_bg:背景を合成,0
+--select@read_mode:画像の読み方=0,バイリニア=0,最近傍=1,バイキュービック=2
 --group
 
 --[[pixelshader@ps_sd_direction:
@@ -475,6 +575,7 @@ cbuffer P : register(b0) {
     float2 pad;          // 12-13
     float2 buf_size;     // 14-15
     float clip_out;      // 16
+    float read_mode;     // 17
 };
 
 Texture2D tex : register(t0);
@@ -496,6 +597,42 @@ float sd_wave(float x, float shape) {
 float sd_jitter(float x, float rnd, float seed) {
     float r = sd_hash(float2(floor(x), seed));
     return lerp(1.0, r * 2.0, saturate(rnd));
+}
+
+// 正本: @回転 の sd_read（説明もそこ。直すときは 5 つとも直す）
+float4 sd_row(float x0, float y, float dx, float4 wx) {
+    return tex.SampleLevel(smp, float2(x0 - dx, y), 0) * wx.x
+         + tex.SampleLevel(smp, float2(x0, y), 0) * wx.y
+         + tex.SampleLevel(smp, float2(x0 + dx, y), 0) * wx.z
+         + tex.SampleLevel(smp, float2(x0 + dx * 2.0, y), 0) * wx.w;
+}
+
+float4 sd_read(float2 tuv, float mode, float2 tsize) {
+    float2 ts = max(tsize, float2(1.0, 1.0));
+    float2 inv = 1.0 / ts;
+    float4 res = float4(0.0, 0.0, 0.0, 0.0);
+    if (mode > 1.5) {
+        float2 tp = tuv * ts - 0.5;
+        float2 base = floor(tp);
+        float2 f = tp - base;
+        float2 c0 = (base + 0.5) * inv;
+        float2 f2 = f * f;
+        float2 f3 = f2 * f;
+        float2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+        float2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+        float2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+        float2 w3 = 0.5 * f3 - 0.5 * f2;
+        float4 wx = float4(w0.x, w1.x, w2.x, w3.x);
+        res = sd_row(c0.x, c0.y - inv.y, inv.x, wx) * w0.y
+            + sd_row(c0.x, c0.y, inv.x, wx) * w1.y
+            + sd_row(c0.x, c0.y + inv.y, inv.x, wx) * w2.y
+            + sd_row(c0.x, c0.y + inv.y * 2.0, inv.x, wx) * w3.y;
+        res.a = saturate(res.a);
+        res.rgb = clamp(res.rgb, float3(0.0, 0.0, 0.0), float3(res.a, res.a, res.a));
+    } else {
+        res = tex.SampleLevel(smp, (floor(tuv * ts) + 0.5) * inv, 0);
+    }
+    return res;
 }
 
 float4 ps_sd_direction(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
@@ -528,6 +665,9 @@ float4 ps_sd_direction(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Targ
     float2 tuv = expanded ? (suv * resolution + pad) / buf_size : suv;
 
     float4 fg = tex.Sample(smp, tuv);
+    if (read_mode > 0.5) {
+        fg = sd_read(tuv, read_mode, buf_size);
+    }
     if (compose_bg > 0.5) {
         float4 bg = tex.Sample(smp, buf_uv);
         return fg + bg * (1.0 - fg.a);
@@ -576,6 +716,7 @@ if not is_filter and wrap ~= 1 then
     amount, ridges, wave, randomness / 100,
     random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, extra,
     pad_x, pad_y, obj.w, obj.h, 1,
+    read_mode,
   }, "copy", "clip")
 else
   -- 端を読む経路は sampler を明示する（v1.03）。省くと範囲外を透明として補間し、
@@ -586,11 +727,12 @@ else
     amount, ridges, wave, randomness / 100,
     random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, extra,
     0, 0, obj.w, obj.h, 0,
+    read_mode,
   }, "copy", (wrap == 1) and "loop" or "clamp")
 end
 
 @ジグザグ
---information:ジグザグ@ShapeDistort_H v1.04 by HexBrowns
+--information:ジグザグ@ShapeDistort_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 
@@ -609,6 +751,7 @@ end
 --group:表示,0
 --check@wrap:ラップ,1
 --check@compose_bg:背景を合成,0
+--select@read_mode:画像の読み方=0,バイリニア=0,最近傍=1,バイキュービック=2
 --group
 
 --[[pixelshader@ps_sd_zigzag:
@@ -626,6 +769,7 @@ cbuffer P : register(b0) {
     float2 pad;          // 12-13
     float2 buf_size;     // 14-15
     float clip_out;      // 16
+    float read_mode;     // 17
 };
 
 Texture2D tex : register(t0);
@@ -647,6 +791,42 @@ float sd_wave(float x, float shape) {
 float sd_jitter(float x, float rnd, float seed) {
     float r = sd_hash(float2(floor(x), seed));
     return lerp(1.0, r * 2.0, saturate(rnd));
+}
+
+// 正本: @回転 の sd_read（説明もそこ。直すときは 5 つとも直す）
+float4 sd_row(float x0, float y, float dx, float4 wx) {
+    return tex.SampleLevel(smp, float2(x0 - dx, y), 0) * wx.x
+         + tex.SampleLevel(smp, float2(x0, y), 0) * wx.y
+         + tex.SampleLevel(smp, float2(x0 + dx, y), 0) * wx.z
+         + tex.SampleLevel(smp, float2(x0 + dx * 2.0, y), 0) * wx.w;
+}
+
+float4 sd_read(float2 tuv, float mode, float2 tsize) {
+    float2 ts = max(tsize, float2(1.0, 1.0));
+    float2 inv = 1.0 / ts;
+    float4 res = float4(0.0, 0.0, 0.0, 0.0);
+    if (mode > 1.5) {
+        float2 tp = tuv * ts - 0.5;
+        float2 base = floor(tp);
+        float2 f = tp - base;
+        float2 c0 = (base + 0.5) * inv;
+        float2 f2 = f * f;
+        float2 f3 = f2 * f;
+        float2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+        float2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+        float2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+        float2 w3 = 0.5 * f3 - 0.5 * f2;
+        float4 wx = float4(w0.x, w1.x, w2.x, w3.x);
+        res = sd_row(c0.x, c0.y - inv.y, inv.x, wx) * w0.y
+            + sd_row(c0.x, c0.y, inv.x, wx) * w1.y
+            + sd_row(c0.x, c0.y + inv.y, inv.x, wx) * w2.y
+            + sd_row(c0.x, c0.y + inv.y * 2.0, inv.x, wx) * w3.y;
+        res.a = saturate(res.a);
+        res.rgb = clamp(res.rgb, float3(0.0, 0.0, 0.0), float3(res.a, res.a, res.a));
+    } else {
+        res = tex.SampleLevel(smp, (floor(tuv * ts) + 0.5) * inv, 0);
+    }
+    return res;
 }
 
 float4 ps_sd_zigzag(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
@@ -686,6 +866,9 @@ float4 ps_sd_zigzag(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target 
     float2 tuv = expanded ? (suv * resolution + pad) / buf_size : suv;
 
     float4 fg = tex.Sample(smp, tuv);
+    if (read_mode > 0.5) {
+        fg = sd_read(tuv, read_mode, buf_size);
+    }
     if (compose_bg > 0.5) {
         float4 bg = tex.Sample(smp, buf_uv);
         return fg + bg * (1.0 - fg.a);
@@ -734,6 +917,7 @@ if not is_filter and wrap ~= 1 then
     amount, ridges, wave, randomness / 100,
     random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, order,
     pad_x, pad_y, obj.w, obj.h, 1,
+    read_mode,
   }, "copy", "clip")
 else
   -- 端を読む経路は sampler を明示する（v1.03）。省くと範囲外を透明として補間し、
@@ -744,11 +928,12 @@ else
     amount, ridges, wave, randomness / 100,
     random_seed, (wrap == 1) and 1 or 0, (compose_bg == 1) and 1 or 0, order,
     0, 0, obj.w, obj.h, 0,
+    read_mode,
   }, "copy", (wrap == 1) and "loop" or "clamp")
 end
 
 @無限ズーム
---information:無限ズーム@ShapeDistort_H v1.00 by HexBrowns
+--information:無限ズーム@ShapeDistort_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 
@@ -774,6 +959,7 @@ end
 --group:品質,0
 --track@levels:段の数,1,32,8,1
 --select@aa:アンチエイリアス=1,なし=0,2x2=1,4x4=2
+--select@read_mode:画像の読み方=0,バイリニア=0,最近傍=1,バイキュービック=2
 --group
 
 --[[pixelshader@ps_sd_droste:
@@ -788,6 +974,7 @@ cbuffer P : register(b0) {
     float max_levels;    // 11   1 画素で重ねる段（覆う段だけを数える）の数の上限
     float feather;       // 12   継ぎ目のなじませの幅（高さ = 1 の単位）
     float aa_n;          // 13   1 軸あたりの副標本の数（1 / 2 / 4）
+    float read_mode;     // 14   画像の読み方（0 = バイリニア / 1 = 最近傍 / 2 = バイキュービック）
 };
 
 Texture2D tex : register(t0);
@@ -800,6 +987,42 @@ SamplerState smp : register(s0);
 // 透明な所は下（外側）の段が透ける。手前から奥へ（n の大きい方から）乗算済みのまま重ねる。
 // 覆わない段（画像の外）は「段の数」に数えない。縮小率が大きく中心が辺に近いと覆わない段が続くので、
 // 調べる段は別に 64 段で打ち切る（縮小率 90% でも r_in / r_out が 0.9^64 = 0.001 までの中心なら届く）
+// 正本: @回転 の sd_read（説明もそこ。直すときは 5 つとも直す）
+float4 sd_row(float x0, float y, float dx, float4 wx) {
+    return tex.SampleLevel(smp, float2(x0 - dx, y), 0) * wx.x
+         + tex.SampleLevel(smp, float2(x0, y), 0) * wx.y
+         + tex.SampleLevel(smp, float2(x0 + dx, y), 0) * wx.z
+         + tex.SampleLevel(smp, float2(x0 + dx * 2.0, y), 0) * wx.w;
+}
+
+float4 sd_read(float2 tuv, float mode, float2 tsize) {
+    float2 ts = max(tsize, float2(1.0, 1.0));
+    float2 inv = 1.0 / ts;
+    float4 res = float4(0.0, 0.0, 0.0, 0.0);
+    if (mode > 1.5) {
+        float2 tp = tuv * ts - 0.5;
+        float2 base = floor(tp);
+        float2 f = tp - base;
+        float2 c0 = (base + 0.5) * inv;
+        float2 f2 = f * f;
+        float2 f3 = f2 * f;
+        float2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+        float2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+        float2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+        float2 w3 = 0.5 * f3 - 0.5 * f2;
+        float4 wx = float4(w0.x, w1.x, w2.x, w3.x);
+        res = sd_row(c0.x, c0.y - inv.y, inv.x, wx) * w0.y
+            + sd_row(c0.x, c0.y, inv.x, wx) * w1.y
+            + sd_row(c0.x, c0.y + inv.y, inv.x, wx) * w2.y
+            + sd_row(c0.x, c0.y + inv.y * 2.0, inv.x, wx) * w3.y;
+        res.a = saturate(res.a);
+        res.rgb = clamp(res.rgb, float3(0.0, 0.0, 0.0), float3(res.a, res.a, res.a));
+    } else {
+        res = tex.SampleLevel(smp, (floor(tuv * ts) + 0.5) * inv, 0);
+    }
+    return res;
+}
+
 float4 ps_sd_droste(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
     float aspect = resolution.x / max(resolution.y, 1.0);
     // 不動点から最も遠い角までの距離。|u| がこれより大きい段は画像の外（覆わない）
@@ -847,6 +1070,9 @@ float4 ps_sd_droste(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target 
                     hit += 1;
                     // ループの中なので勾配を使わない SampleLevel で読む（Sample は X3570 になりうる）
                     float4 col = tex.SampleLevel(smp, iuv, 0);
+                    if (read_mode > 0.5) {
+                        col = sd_read(iuv, read_mode, resolution);
+                    }
                     if (edge < frame_width) {
                         col = float4(frame_color, 1.0);
                     }
@@ -881,6 +1107,7 @@ obj.pixelshader("ps_sd_droste", "object", "object", {
   frame_w / math.max(H0, 1),
   t, math.log(s), math.rad(step_rot), levels,
   feather / math.max(H0, 1), aa_n,
+  read_mode,
 }, "copy", "clamp")
 
 @パペット

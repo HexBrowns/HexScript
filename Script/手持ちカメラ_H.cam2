@@ -1,4 +1,4 @@
---information:手持ちカメラ_H v1.03 by HexBrowns
+--information:手持ちカメラ_H v1.10 by HexBrowns
 --label:HexScript
 
 --group:強さ
@@ -13,6 +13,9 @@
 --group:性格
 --track@drift:ドリフト,0,100,50,0.1
 --track@breath:呼吸,0,100,30,0.1
+--select@method:揺れの作り方=0,値ノイズ=0,コマ打ち=1,勾配ノイズ=2,正弦の和=3
+--track@hold:コマ打ちのフレーム数,1,30,3,1
+--hide@hold:method~=1
 
 --group:その他
 --track@seed:シード,-10000,10000,0,1
@@ -50,6 +53,21 @@ v1.03 から、速さ 0〜1 の間で 1 と 2 の重み（motion_w）を 0→1 �
 
 速さ 0〜1 の間でも base_hz は速さに比例したまま（1 で v1.02 と一致させるため）。
 机上の検証器: AI/scripts/手持ちカメラ_H/verify_handheld.py
+
+揺れの作り方（v1.10）
+
+1 と 2 のノイズの作り方を選べる。初期値の「値ノイズ」は v1.03 と同じ式・同じ値。
+
+  値ノイズ   格子点ごとの乱数を三次補間でつなぐ（vnoise）。山の高さがまちまち
+  コマ打ち   値ノイズのまま、読む時刻を「コマ打ちのフレーム数」ごとに止める
+             （サンプル＆ホールド）。呼吸も同じ時刻で読むので、カメラ全体が
+             N フレームずつ止まってから次の位置へ跳ぶ。低フレームレートの手ブレ
+  勾配ノイズ 格子点で 0 を通り、傾きだけを乱数にする 1 次元の Perlin 型（gnoise）。
+             値ノイズより山の大きさがそろう。格子点（読む位置が整数）では必ず 0
+  正弦の和   オクターブ k ごとに周波数 2^k の正弦を重ねる（位相だけを乱数にする）。
+             ドリフト 0 なら 1 / (速さ × 0.04) 秒の周期で同じ揺れを繰り返す機械的な揺れ
+
+速さ 0 の扱い・呼吸・軸ごとのオフセットは全方式で共通。
 
 シードについて
 
@@ -93,29 +111,72 @@ local function vnoise(x)
   return (a + (b - a) * u) * 2 - 1
 end
 
--- fBm。octaves は小数を許し、端数は最終オクターブの振幅で按分する
-local function fbm(x, octaves)
+-- 1次元勾配ノイズ（Perlin 型）。格子点 i の傾き g(i) を -1〜1 の乱数にし、
+-- 両端からの直線 g0*f と g1*(f-1) を五次補間でつなぐ。格子点では 0。
+-- 振幅の上限は 0.5 なので 2 倍して -1.0〜1.0 にそろえる
+local function gnoise(x)
+  local i = floor(x)
+  local f = x - i
+  local u = f * f * f * (f * (f * 6 - 15) + 10)
+  local a = (hash1(i) * 2 - 1) * f
+  local b = (hash1(i + 1) * 2 - 1) * (f - 1)
+  return (a + (b - a) * u) * 2
+end
+
+-- fBm。octaves は小数を許し、端数は最終オクターブの振幅で按分する。
+-- noise は vnoise か gnoise
+local function fbm(x, octaves, noise)
   local n = floor(octaves)
   local frac = octaves - n
   local sum, amp, freq, norm = 0, 1, 1, 0
   for _ = 1, n do
-    sum = sum + amp * vnoise(x * freq)
+    sum = sum + amp * noise(x * freq)
     norm = norm + amp
     amp = amp * 0.5
     freq = freq * 2
   end
   if frac > 0 then
-    sum = sum + amp * frac * vnoise(x * freq)
+    sum = sum + amp * frac * noise(x * freq)
     norm = norm + amp * frac
   end
   if norm <= 0 then return 0 end
   return sum / norm
 end
 
+-- 正弦の和。オクターブ k（0 始まり）は周波数 2^k・振幅 0.5^k、位相は key と k から決める。
+-- x は時刻 × 周波数（オフセットを足さない。足すと整数のシードで位相が変わらない）
+local function sfbm(x, octaves, key)
+  local n = floor(octaves)
+  local frac = octaves - n
+  local sum, amp, freq, norm = 0, 1, 1, 0
+  for k = 0, n - 1 do
+    sum = sum + amp * sin(TWO_PI * (x * freq + hash1(key + k * 7.31)))
+    norm = norm + amp
+    amp = amp * 0.5
+    freq = freq * 2
+  end
+  if frac > 0 then
+    sum = sum + amp * frac * sin(TWO_PI * (x * freq + hash1(key + n * 7.31)))
+    norm = norm + amp * frac
+  end
+  if norm <= 0 then return 0 end
+  return sum / norm
+end
+
+-- 揺れの作り方（0 値ノイズ / 1 コマ打ち / 2 勾配ノイズ / 3 正弦の和）
+local mode = tonumber(method) or 0
+
 -- 時間（秒）。obj.frame は @tim.cam2.cam2 に .cam2 での使用実績がある
 local fps = tonumber(obj.framerate) or 30
 if fps <= 0 then fps = 30 end
-local t = (tonumber(obj.frame) or 0) / fps
+local frame = tonumber(obj.frame) or 0
+if mode == 1 then
+  -- コマ打ち: N フレームごとに同じ時刻を読む（オブジェクトの先頭から数える）
+  local hold_n = floor(tonumber(hold) or 1)
+  if hold_n < 1 then hold_n = 1 end
+  frame = floor(frame / hold_n) * hold_n
+end
+local t = frame / fps
 
 local seed_off = floor(seed) * 1013
 local base_hz = speed * 0.04        -- 速さ100 でおよそ 4Hz
@@ -136,10 +197,19 @@ local BREATH_HZ = 0.25              -- 呼吸は4秒周期
 local OFF_X, OFF_Y, OFF_Z = 0.0, 91.7, 213.3
 local OFF_RZ, OFF_D = 347.9, 521.1
 
--- 微振動と重心移動をクロスフェードした 1 チャンネル分の値（-1.0〜1.0）
+-- 微振動と重心移動をクロスフェードした 1 チャンネル分の値（-1.0〜1.0）。
+-- 値ノイズ・コマ打ちは v1.03 と同じ式（足し算の順も同じにして値を変えない）
+local noise = (mode == 2) and gnoise or vnoise
 local function channel(off)
-  local jitter = fbm(t * base_hz + seed_off + off, roughness)
-  local slow = vnoise(t * base_hz * DRIFT_RATE + seed_off + off + 0.37)
+  local jitter, slow
+  if mode == 3 then
+    local key = seed_off + off
+    jitter = sfbm(t * base_hz, roughness, key)
+    slow = sfbm(t * base_hz * DRIFT_RATE, 1, key + 0.37)
+  else
+    jitter = fbm(t * base_hz + seed_off + off, roughness, noise)
+    slow = noise(t * base_hz * DRIFT_RATE + seed_off + off + 0.37)
+  end
   return (jitter * (1 - drift_w) + slow * drift_w) * motion_w
 end
 

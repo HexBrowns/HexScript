@@ -1,4 +1,4 @@
---information:ベクトルブラー_H v1.01 by HexBrowns
+--information:ベクトルブラー_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 
@@ -7,6 +7,9 @@
 --track@blur_angle:角度,-360,360,0,0.01
 --select@blur_mode:種類=0,平均=0,最大値=1,最小値=2
 --select@len_mode:長さの決め方=0,一定=0,勾配に比例=1
+--select@blur_weight:重み=0,一様=0,三角=1,ガウス=2,片側に減衰=3
+--select@tail_dir:尾の向き=0,前=0,後=1
+--hide@tail_dir:blur_weight~=3
 --group
 
 --group:ベクトルマップ
@@ -28,6 +31,18 @@ After Effects の「ベクトルブラー」に近い効果。ベクトルマッ
    テンソルは向きの正負を持たないので、勾配が反対向きの所（尾根・谷）でも向きが打ち消し合わない
 4. テンソルの第 1 固有ベクトル（勾配の向き）に直交する向き＝輪郭に沿う向きを 0 度とし、「角度」だけ回す。
    画素から両側へ、その向きの場をたどって（流線に沿って）長さの分だけ標本を取り、平均・最大値・最小値をとる
+
+v1.10: 線に沿って読んだ標本の「重み」を選べる。画素からの道のりを u、読む範囲を R とする（両側なら長さの半分、片側なら長さ）。
+  一様        どの標本も 1（v1.00 と同じ。既定）
+  三角        1 - u / (R + 1 歩)。筆跡の中央が濃い柔らかい筋になる
+  ガウス      exp(-2 (u / R)²)（σ = R / 2）。三角より裾が滑らか
+  片側に減衰  片側だけを長さいっぱいまで読み、重みは三角と同じく直線で減る。尾が片側にだけ伸びる（彗星の尾・スピード線）
+  平均は重み付きの平均。最大値・最小値は、各標本を重みの分だけ元の画素の色へ寄せた色 lerp(元, 標本, 重み) で比べる
+  （一様なら v1.00 と同じ。三角・ガウス・片側は、遠い標本ほど元の色に近づくので、太りや尾が先細りになる）。
+  尾の向き（片側に減衰のときだけ）: マップの勾配の符号で向きを揃える。角度 90 のとき、前はマップの明るい側へ、後は暗い側へ尾が伸びる
+  （角度 0 は、そこから 90 度回した輪郭に沿う向き。勾配の無い所は、角度 0 で前が右）。
+  勾配の符号はテンソルのバッファのアルファに入れた値（マップの値。リッジの滑らかさで一緒にぼける）の差で決める。
+  尾根の真上など、符号付きの勾配が打ち消し合う所では向きが定まらない（固有ベクトルの向きのまま）。
 
 オブジェクトの大きさと変数は変えない（フィルタオブジェクトでもそのまま使える）。
 中間のバッファは cache:vbh/ の 2 枚（オブジェクトと同じ大きさ。マップがレイヤーなら読む間だけ元の画像の退避 1 枚）。
@@ -107,7 +122,9 @@ float4 ps_vbh_tensor(float4 pos : SV_Position) : SV_Target {
     // Sobel を 8 で割ると、1px あたりの変化量になる。16bit float の桁落ちを避けるため 4 倍してから二乗する
     float gx = ((tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl)) * 0.5;
     float gy = ((bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr)) * 0.5;
-    return float4(gx * gx, gy * gy, gx * gy, 1.0);
+    // アルファにはマップの値そのものを入れる（v1.10。片側に減衰で勾配の符号を決めるのに使う。テンソルの 3 つには触れない）
+    float mc = val.Load(int3(clamp(p, int2(0, 0), hi), 0)).r;
+    return float4(gx * gx, gy * gy, gx * gy, mc);
 }
 ]]
 
@@ -118,13 +135,15 @@ cbuffer P : register(b0) {
     float ang;      // 3   角度（ラジアン）。0 で輪郭に沿う
     float mode;     // 4   0 平均 / 1 最大値 / 2 最小値
     float natural;  // 5   1 で長さを勾配に比例させる
+    float weight;   // 6   0 一様 / 1 三角 / 2 ガウス / 3 片側に減衰（v1.10）
+    float tail;     // 7   片側に減衰の尾の向き 0 前 / 1 後（v1.10）
 };
 Texture2D src : register(t0);
 Texture2D tensor : register(t1);
 SamplerState smp : register(s0);
 
-static const float GRAD_REF = 0.1;   // 勾配に比例: 1px あたり 0.1 変わる所で長さいっぱい
-static const float MAX_STEPS = 48.0; // 片側の標本の上限
+static const float GRAD_REF = 0.1;      // 勾配に比例: 1px あたり 0.1 変わる所で長さいっぱい
+static const float MAX_SAMPLES = 96.0;  // 標本の上限（両側の合計。片側に減衰でも同じ数）
 
 float4 ps_vbh_blur(float4 pos : SV_Position) : SV_Target {
     float4 t0 = tensor.SampleLevel(smp, pos.xy / size, 0);
@@ -137,18 +156,33 @@ float4 ps_vbh_blur(float4 pos : SV_Position) : SV_Target {
     float4 orig = src.SampleLevel(smp, pos.xy / size, 0);
     if (l < 0.5) return orig;
 
-    float half_len = l * 0.5;
-    float n = min(ceil(half_len), MAX_STEPS);
-    float step_len = half_len / n;
+    // 両側なら長さの半分ずつ、片側に減衰なら片側だけを長さいっぱいまで読む
+    bool one_side = weight > 2.5;
+    int nside = one_side ? 1 : 2;
+    float reach = one_side ? l : l * 0.5;
+    float n = min(ceil(reach), MAX_SAMPLES / float(nside));
+    float step_len = reach / n;
     float ca = cos(ang);
     float sa = sin(ang);
+    float wr = reach + step_len;               // 三角・片側: 重みが 0 になる道のり（最後の標本も 0 より大きい）
+    float gk = 2.0 / max(reach * reach, 1e-6); // ガウス: σ = reach / 2 → exp(-u² / 2σ²) = exp(-gk u²)
+
+    // 片側に減衰: マップの値（テンソルのアルファ）の差で勾配の符号を取る。前は尾が +向き へ伸びる＝-向き へ読む
+    float2 gsig = float2(0.0, 0.0);
+    if (one_side) {
+        gsig.x = tensor.SampleLevel(smp, (pos.xy + float2(2.0, 0.0)) / size, 0).a
+               - tensor.SampleLevel(smp, (pos.xy - float2(2.0, 0.0)) / size, 0).a;
+        gsig.y = tensor.SampleLevel(smp, (pos.xy + float2(0.0, 2.0)) / size, 0).a
+               - tensor.SampleLevel(smp, (pos.xy - float2(0.0, 2.0)) / size, 0).a;
+    }
+    float read_sign = (tail > 0.5) ? 1.0 : -1.0;
 
     float4 acc = orig;
     float cnt = 1.0;
     float4 best = orig;
     float best_lum = dot(orig.rgb, float3(0.2126, 0.7152, 0.0722));
 
-    [loop] for (int side = 0; side < 2; side++) {
+    [loop] for (int side = 0; side < nside; side++) {
         float2 p = pos.xy;
         float2 prev = float2(0.0, 0.0);
         [loop] for (float i = 0.0; i < n; i += 1.0) {
@@ -164,24 +198,38 @@ float4 ps_vbh_blur(float4 pos : SV_Position) : SV_Target {
             if (cs2.y < 0.0) st = -st;
             // 輪郭の向きは θ に 90 度足したもの (-sin θ, cos θ)。一様な所（勾配なし）は (1, 0)
             float2 d = float2(-st, ct);
-            if (t.r + t.g < 1e-10) d = float2(1.0, 0.0);
+            if (t.r + t.g < 1e-10) {
+                d = float2(1.0, 0.0);
+            } else if (one_side && i < 0.5) {
+                // 符号付きの勾配と同じ向きの固有ベクトル s(cos θ, sin θ) を -90 度回した向き = -s d。
+                // 角度 90 でちょうど勾配の向き（明るい側）になる
+                d = (dot(gsig, float2(ct, st)) < 0.0) ? d : -d;
+            }
             d = float2(d.x * ca - d.y * sa, d.x * sa + d.y * ca);
-            // 向きは正負を持たないので、前の一歩と揃える。最初の一歩は side で向きを決める
+            // 向きは正負を持たないので、前の一歩と揃える。最初の一歩は side（片側に減衰なら尾の向き）で向きを決める
             if (i < 0.5) {
-                if (side == 1) d = -d;
+                if (one_side) d *= read_sign;
+                else if (side == 1) d = -d;
             } else if (dot(d, prev) < 0.0) {
                 d = -d;
             }
             prev = d;
             p += d * step_len;
             float4 c = src.SampleLevel(smp, p / size, 0);
-            acc += c;
-            cnt += 1.0;
-            float lum = dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
+            // 重み（v1.10）。一様は 1 のまま（v1.00 と同じ計算）
+            float u = (i + 1.0) * step_len;
+            float w = 1.0;
+            if (weight > 1.5 && weight < 2.5) w = exp(-gk * u * u);
+            else if (weight > 0.5) w = 1.0 - u / wr;
+            acc += c * w;
+            cnt += w;
+            // 最大値・最小値は、標本を重みの分だけ元の色へ寄せてから比べる（一様ならそのまま）
+            float4 cand = (weight > 0.5) ? lerp(orig, c, w) : c;
+            float lum = dot(cand.rgb, float3(0.2126, 0.7152, 0.0722));
             if (mode > 1.5) {
-                if (lum < best_lum) { best = c; best_lum = lum; }
+                if (lum < best_lum) { best = cand; best_lum = lum; }
             } else if (mode > 0.5) {
-                if (lum > best_lum) { best = c; best_lum = lum; }
+                if (lum > best_lum) { best = cand; best_lum = lum; }
             }
         }
     }
@@ -254,4 +302,5 @@ end
 obj.pixelshader("ps_vbh_blur", "object", {"object", B}, {
   W, H, L, math.rad(num(blur_angle, 0)),
   math.floor(num(blur_mode, 0) + 0.5), math.floor(num(len_mode, 0) + 0.5),
+  math.floor(num(blur_weight, 0) + 0.5), math.floor(num(tail_dir, 0) + 0.5),
 }, "copy", "clamp")

@@ -14,7 +14,12 @@ local abs, max, min, pi, huge = math.abs, math.max, math.min, math.pi, math.huge
 local RAD = pi / 180
 
 local M = {}
-M.VERSION = "0.18.0"      -- v0.18.0: 色の変化・軌跡（帯）の補間に色空間と色相経路、出た所の色の近い色選びに色差を足した（既定は今までの計算）
+M.VERSION = "0.19.0"      -- v0.19.0: ノイズ場の元のノイズ（勾配ノイズ・ブロック）、積分法（陽的オイラー・RK4）と刻みの倍率を足した（既定は今までの計算）
+                          -- v0.18.0: 色の変化・軌跡（帯）の補間に色空間と色相経路、出た所の色の近い色選びに色差を足した（既定は今までの計算）
+-- 焼き付けのシグネチャに入れる版。同じ設定で動き（位置と回転）が変わるか、ファイルの形が変わる版でだけ上げる。
+-- 機能を足しただけの版で M.VERSION を入れると、既定のまま動きが同じでも焼き付けが全部「設定と違う」になり、
+-- 読むだけ（計算しない）の焼き付けでは粒が描かれなくなる（v0.19.0 で気づいた。v0.19.0 の既定は v0.18.0 と同じ動き）
+M.BAKE_VERSION = "0.18.0"
 M.MAX_PARTICLES = 10000   -- 生きている粒子の上限（実機 PRP-12 / 18 で決めた）
 M.INTER_MAX = 3000        -- 粒子どうし（v0.12.0）で一緒に進める粒子の上限（超えた分は力を受けず、今までどおり粒子ごとに進める）
 M.INTER_CP = 64           -- 粒子どうしのチェックポイントの数の上限（間隔はオブジェクトの長さ ÷ この数、1 秒より短くしない）
@@ -1293,9 +1298,71 @@ local function noise3(x, y, z, s)
 end
 M.noise3 = noise3
 
+-- 勾配ノイズ（v0.19.0。Perlin 型）の格子点の勾配: 立方体の辺の中点への 12 方向（長さ √2）。番号は h3 と同じハッシュから取る
+local GRAD12 = { 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1 }
+local function g3(ix, iy, iz, s, fx, fy, fz)
+  local x = bit.bxor(bit.tobit(ix * 73856093), bit.tobit(iy * 19349663), bit.tobit(iz * 83492791), s)
+  x = mix(bit.tobit(x + 0x27D4EB2D))
+  local o = ((x % 65536) % 12) * 3
+  local gx, gy, gz = GRAD12[o + 1], GRAD12[o + 2], GRAD12[o + 3]
+  return gx * fx + gy * fy + gz * fz, gx, gy
+end
+-- 3 次元の勾配ノイズと、x・y の偏微分（なめらかさは 6t^5 - 15t^4 + 10t^3）。値は格子点で 0、勾配は格子点でも 0 にならない。
+-- 値ノイズと同じ強さで流れるよう、偏微分を GRAD_K 倍して返す（verify_noise_integ.py で、ランダムな点の勾配の二乗平均をそろえた値）
+local GRAD_K = 0.946      -- 値ノイズ 0.941 / 勾配ノイズ 0.995（偏微分 x・y の二乗平均の平方根。20 万点）
+local function noise3g(x, y, z, s)
+  local ix, iy, iz = floor(x), floor(y), floor(z)
+  local fx, fy, fz = x - ix, y - iy, z - iz
+  local ux, uy, uz = fx * fx * fx * (fx * (fx * 6 - 15) + 10), fy * fy * fy * (fy * (fy * 6 - 15) + 10), fz * fz * fz * (fz * (fz * 6 - 15) + 10)
+  local dux, duy = 30 * fx * fx * (fx - 1) * (fx - 1), 30 * fy * fy * (fy - 1) * (fy - 1)
+  local a, ax, ay = g3(ix, iy, iz, s, fx, fy, fz)
+  local b, bx, by = g3(ix + 1, iy, iz, s, fx - 1, fy, fz)
+  local c, cx, cy = g3(ix, iy + 1, iz, s, fx, fy - 1, fz)
+  local d, dx, dy = g3(ix + 1, iy + 1, iz, s, fx - 1, fy - 1, fz)
+  local e, ex, ey = g3(ix, iy, iz + 1, s, fx, fy, fz - 1)
+  local f, fx2, fy2 = g3(ix + 1, iy, iz + 1, s, fx - 1, fy, fz - 1)
+  local g, gx, gy = g3(ix, iy + 1, iz + 1, s, fx, fy - 1, fz - 1)
+  local hh, hx, hy = g3(ix + 1, iy + 1, iz + 1, s, fx - 1, fy - 1, fz - 1)
+  local k1, k2, k3 = b - a, c - a, e - a
+  local k4, k5, k6 = a - b - c + d, a - c - e + g, a - b - e + f
+  local k7 = -a + b + c - d + e - f - g + hh
+  local n = a + k1 * ux + k2 * uy + k3 * uz + k4 * ux * uy + k5 * uy * uz + k6 * ux * uz + k7 * ux * uy * uz
+  -- 角の値そのものも位置で変わる（勾配との内積）ので、角の勾配を同じ重みで補間して足す
+  local uxy, uyz, uxz, uxyz = ux * uy, uy * uz, ux * uz, ux * uy * uz
+  local nx = dux * (k1 + k4 * uy + k6 * uz + k7 * uyz)
+    + ax + (bx - ax) * ux + (cx - ax) * uy + (ex - ax) * uz + (ax - bx - cx + dx) * uxy + (ax - cx - ex + gx) * uyz
+    + (ax - bx - ex + fx2) * uxz + (-ax + bx + cx - dx + ex - fx2 - gx + hx) * uxyz
+  local ny = duy * (k2 + k4 * ux + k5 * uz + k7 * uxz)
+    + ay + (by - ay) * ux + (cy - ay) * uy + (ey - ay) * uz + (ay - by - cy + dy) * uxy + (ay - cy - ey + gy) * uyz
+    + (ay - by - ey + fy2) * uxz + (-ay + by + cy - dy + ey - fy2 - gy + hy) * uxyz
+  return n, nx * GRAD_K, ny * GRAD_K
+end
+M.noise3g = noise3g
+
+-- 元のノイズを値ノイズ以外にしたときのカール（v0.19.0。ノイズ場の「元のノイズ」）。N.kind: 1 = 勾配ノイズ / 2 = ブロック（補間なし）
+-- ブロック: 升（大きさ = ノイズの大きさ）の中では力が一定。升の真ん中の値ノイズのカールを、縦か横の強い方の向きへそろえる。
+-- 粒子は升の境目で直角に折れ、格子に沿って進む（発散は 0 ではない）
+local function curl_alt(px, py, pz, t, N)
+  local x, y, z = px * N.inv + N.ox, py * N.inv + N.oy, pz * N.inv + t * N.speed
+  if N.kind == 1 then
+    local _, gx_, gy_ = noise3g(x, y, z, N.seed)
+    local gz_ = 0
+    if N.z then gz_ = noise3g(x + 31.7, y - 17.3, z, N.seed2) end
+    return gy_, -gx_, gz_
+  end
+  local cx_, cy_ = floor(x) + 0.5, floor(y) + 0.5
+  local _, bx_, by_ = noise3(cx_, cy_, z, N.seed)
+  local rx, ry = by_, -bx_
+  if abs(rx) >= abs(ry) then ry = 0 else rx = 0 end
+  local bz_ = 0
+  if N.z then bz_ = noise3(cx_ + 31.7, cy_ - 17.3, z, N.seed2) end
+  return rx, ry, bz_
+end
+
 -- カールノイズの力（XY）。ノイズの勾配を 90 度回したもので、発散が無い（渦を巻く流れになる）
 -- 座標は端数 ox, oy だけずらす。値ノイズは格子点で勾配が 0 なので、ずらさないと原点（粒子の出る所）で力が 0 になる
 function M.curl(px, py, pz, t, N)
+  if N.kind then return curl_alt(px, py, pz, t, N) end
   local _, nx, ny = noise3(px * N.inv + N.ox, py * N.inv + N.oy, pz * N.inv + t * N.speed, N.seed)
   local fz = 0
   if N.z then fz = noise3(px * N.inv + N.ox + 31.7, py * N.inv + N.oy - 17.3, pz * N.inv + t * N.speed, N.seed2) end
@@ -1792,7 +1859,48 @@ M.F_DEAD = F_DEAD
 M.F_BNC = F_BNC
 M.F_DISP = F_DISP
 
+-- 位置 p・速度 v・時刻 t（年齢 ta）での力（px/秒²）。RK4 の 2〜4 段目に使う（v0.19.0。1 段目は advance の中で同じ式を直接計算する）。
+-- 正本は advance の中の 重力・風・ノイズ場・力場・子粒子の空気抵抗。直すときは両方を直す
+local function force_at(P, q, px, py, pz, vx, vy, vz, t, ta)
+  local W, N, FL = P.wind, P.noise, P.fields
+  local fx, fy, fz = q.gx, q.gy, q.gz
+  if W then
+    local f = q.fwind
+    if W.point then
+      local ex, ey, ez = px - W.px, py - W.py, pz - W.pz
+      f = f * math.exp(-sqrt(ex * ex + ey * ey + ez * ez) / W.range)
+    end
+    local ax_, ay_, az_ = W.cx, W.cy, W.cz
+    if W.moving then ax_, ay_, az_ = W.val("wx", t), W.val("wy", t), W.val("wz", t) end
+    fx, fy, fz = fx + ax_ * f - W.drag * vx, fy + ay_ * f - W.drag * vy, fz + az_ * f - W.drag * vz
+  end
+  if N then
+    local amp = (N.moving and N.val("str", t) or N.cstr) * q.fnoise
+    if N.fade > 0 then amp = amp * min(max((ta - N.start) / N.fade, 0), 1)
+    elseif ta < N.start then amp = 0 end
+    if amp ~= 0 then
+      local cx, cy, cz = M.curl(px, py, pz, t, N)
+      fx, fy, fz = fx + cx * amp, fy + cy * amp, fz + cz * amp
+    end
+  end
+  if FL then
+    local tobj = P.obj_time and P.obj_time(t) or t
+    for fi = 1, #FL do
+      local G = FL[fi]
+      if G.type ~= 3 then
+        local ax_, ay_, az_ = M.field_force(G, q.ff[fi], px, py, pz, tobj, ta, vx, vy, vz)
+        fx, fy, fz = fx + ax_, fy + ay_, fz + az_
+      end
+    end
+  end
+  if q.drag then fx, fy, fz = fx - q.drag * vx, fy - q.drag * vy, fz - q.drag * vz end
+  return fx, fy, fz
+end
+
 -- 粒子 1 個を from 刻みから to 刻みまで進める（S は状態、q は粒子ごとの値、P は全体の設定）。
+-- 積分法（v0.19.0。P.integ）: nil = 半陰的オイラー（速度を先に更新し、その速度で位置を進める。今までの計算）/
+-- 1 = 陽的オイラー（位置は刻みの始めの速度で進める）/ 2 = RK4（力を 4 回求め、位置と速度を重み付きの平均で進める）。
+-- 集結点・双極の向きの寄せと跳ね返りは、どの方法でも刻みの終わりに 1 回だけ掛ける
 -- 状態は刻みの境目だけに置く。同じ刻みを同じ順で積むので、前のフレームから進めても誕生から計算し直しても同じ値になる
 local function advance(P, q, S, from, to)
   local h = P.h
@@ -1885,12 +1993,35 @@ local function advance(P, q, S, from, to)
         -- 子粒子の空気抵抗（v0.15.0。子に動きの拡張を掛けるとき。閉じた式の子と同じ、速さに比例する抵抗）
         fx, fy, fz = fx - q.drag * (dx * s + wx), fy - q.drag * (dy * s + wy), fz - q.drag * (dz * s + wz)
       end
+      -- 積分法（v0.19.0）: 位置を進める速さ（bx0..）を方法ごとに決め、RK4 は力を 4 段の重み付きの平均にする
+      local IM, bx0, by0, bz0 = P.integ, 0, 0, 0
+      if IM == 1 then
+        bx0, by0, bz0 = dx * s + wx, dy * s + wy, dz * s + wz
+      elseif IM == 2 then
+        local hh = 0.5 * h
+        local s2, s4 = s, s
+        if ac ~= 0 then
+          s2, s4 = s + ac * hh, s + ac * h
+          if ac < 0 then s2, s4 = max(s2, 0), max(s4, 0) end
+        end
+        local v1x, v1y, v1z = dx * s + wx, dy * s + wy, dz * s + wz
+        local v2x, v2y, v2z = dx * s2 + wx + fx * hh, dy * s2 + wy + fy * hh, dz * s2 + wz + fz * hh
+        local a2x, a2y, a2z = force_at(P, q, px + v1x * hh, py + v1y * hh, pz + v1z * hh, v2x, v2y, v2z, t + hh, ta + hh)
+        local v3x, v3y, v3z = dx * s2 + wx + a2x * hh, dy * s2 + wy + a2y * hh, dz * s2 + wz + a2z * hh
+        local a3x, a3y, a3z = force_at(P, q, px + v2x * hh, py + v2y * hh, pz + v2z * hh, v3x, v3y, v3z, t + hh, ta + hh)
+        local v4x, v4y, v4z = dx * s4 + wx + a3x * h, dy * s4 + wy + a3y * h, dz * s4 + wz + a3z * h
+        local a4x, a4y, a4z = force_at(P, q, px + v3x * h, py + v3y * h, pz + v3z * h, v4x, v4y, v4z, t + h, ta + h)
+        bx0, by0, bz0 = (v1x + 2 * v2x + 2 * v3x + v4x) / 6, (v1y + 2 * v2y + 2 * v3y + v4y) / 6, (v1z + 2 * v2z + 2 * v3z + v4z) / 6
+        fx, fy, fz = (fx + 2 * a2x + 2 * a3x + a4x) / 6, (fy + 2 * a2y + 2 * a3y + a4y) / 6, (fz + 2 * a2z + 2 * a3z + a4z) / 6
+      end
       if ac ~= 0 then
         s = s + ac * h
         if ac < 0 and s < 0 then s = 0 end
       end
       wx, wy, wz = wx + fx * h, wy + fy * h, wz + fz * h
       vx, vy, vz = dx * s + wx, dy * s + wy, dz * s + wz
+      -- 位置を進める速さと、刻みの終わりの速さの差（向きの寄せの後も保つ）
+      if IM then bx0, by0, bz0 = bx0 - vx, by0 - vy, bz0 - vz end
       if A then
         local on
         if A.rel then on = ta >= q.t_att else on = A.obj(t) >= q.t_att end
@@ -1951,6 +2082,7 @@ local function advance(P, q, S, from, to)
         end
       end
       local mx_, my_, mz_ = vx, vy, vz
+      if IM then mx_, my_, mz_ = vx + bx0, vy + by0, vz + bz0 end
       if P.vmul then
         -- 速度倍率（拡大率と透過率）: 自分の速さの項だけに掛ける。状態の速さは変えず、位置にだけ使う
         local mm = P.vmul((ta + 0.5 * h) / q.L) - 1     -- 刻みの真ん中の倍率（端の値だと刻み幅に比例してずれる）
@@ -2731,6 +2863,11 @@ function M.prepare_motion(cfg)
   if fld and #fld == 0 then fld = nil end
   if O or PA or not (wind or nz or att or bnc or dispon or stopon or sus or vec or fld or inter) then return nil, O, J, WB, TW, PA end
   local P = { h = 1 / (cfg.fps * max(floor(cfg.precision or 2), 1)), steps = 0 }
+  -- 積分法と刻みの倍率（v0.19.0。本体の「積分法」「刻みの倍率」）。既定（半陰的オイラー・1 倍）は今までと同じ計算
+  local im = floor(tonumber(cfg.integ) or 0)
+  if im == 1 or im == 2 then P.integ = im end
+  local hmul = tonumber(cfg.hmul) or 1
+  if hmul > 1 then P.h = P.h * min(hmul, 20) end
   if fld then
     P.fields = {}
     for i, F in ipairs(fld) do
@@ -2764,6 +2901,9 @@ function M.prepare_motion(cfg)
                 ox = 0.1 + 0.8 * rnd(floor(nz.seed), CH.noise + 100, 0), oy = 0.1 + 0.8 * rnd(floor(nz.seed), CH.noise + 101, 0),
                 val = function(var, t) return ev("noise", var, t) end,
                 moving = next(nz.mv or {}) ~= nil, cstr = nz.str }
+    -- 元のノイズ（v0.19.0）: 0 = 値ノイズ（今まで）/ 1 = 勾配ノイズ / 2 = ブロック（補間なし）
+    local nk = floor(tonumber(nz.ntype) or 0)
+    if nk == 1 or nk == 2 then P.noise.kind = nk end
   end
   if att then
     local np = min(max(floor(att.n), 1), floor(#att.pts / 3))

@@ -20,6 +20,10 @@ drawpoly は使わない（後続フィルタを維持するため）。
   ばらつき（apply_hsv_jitter）は space に 7 を渡すと Oklch の h・C・L を揺らす。
   省略・3 のときは今までと同じ HSV。color_at の引数は末尾に足しただけで、今までの呼び方はそのまま通る。
   検証器: AI/scripts/ローポリ/verify_colorspace_ext.py
+
+グーロー（2026-10-15、ローポリ背景 v3.40 / ローポリ化 v3.40）:
+  build_tri_records_vertex / append_tri_list4 / GOURAUD_BATCH を足した（頂点ごとの値を 1 三角形 4 float4 で渡す）。
+  既存の関数は変えていない。検証器: AI/scripts/ローポリ/verify_gouraud.py
 ]]
 
 local EffectUtils_Lowpoly = {}
@@ -857,6 +861,64 @@ function EffectUtils_Lowpoly.append_tri_list(consts, recs, idx, batch_n)
   return math_min(m, batch_n)
 end
 
+-- グーロー（ローポリ化 v3.40・ローポリ背景 v3.40） -------------------------------------
+--
+-- 塗り方「グーロー」は、頂点ごとに色（ローポリ背景）か色のばらつき（ローポリ化）を持たせ、三角形の中で補間する。
+-- 1 三角形に頂点 3 つ分の値（9 個）が要るので、1 三角形 = 4 float4（三角形ごとに 1 色の今までのレイアウトは 3 float4）。
+-- シェーダーの tri[768] に 192 三角形が入る（GOURAUD_BATCH）。今までの関数（build_tri_records / append_tri_batch /
+-- append_tri_list）は変えていない。
+-- 検証器: AI/scripts/ローポリ/verify_gouraud.py
+
+local GOURAUD_BATCH = 192
+
+--- 頂点ごとの値を持つ三角形レコード。vals[j] は点 j の 3 値の表、last は 1 三角形の 10 個目の値（省略で 0）。
+--- 同じ点を共有する三角形には同じ値が入るので、補間した色は辺をまたいでつながる（継ぎ目が出ない）。
+function EffectUtils_Lowpoly.build_tri_records_vertex(points, tris, vals, last)
+  local recs = {}
+  last = last or 0
+  for i = 1, #tris do
+    local t = tris[i]
+    local p0, p1, p2 = points[t[1]], points[t[2]], points[t[3]]
+    local a, b, c = vals[t[1]], vals[t[2]], vals[t[3]]
+    recs[i] = {
+      x0 = p0.x, y0 = p0.y,
+      x1 = p1.x, y1 = p1.y,
+      x2 = p2.x, y2 = p2.y,
+      g = { a[1], a[2], a[3], b[1], b[2], b[3], c[1], c[2], c[3], last },
+    }
+  end
+  return recs
+end
+
+--- consts の末尾に 1 バッチ分を追加する（グーロー。1 三角形 = 4 float4）。
+--- x0,y0,x1,y1 / x2,y2,g1,g2 / g3,g4,g5,g6 / g7,g8,g9,g10。batch_n に満たない分は 0 で埋める。返り値は詰めた三角形数。
+function EffectUtils_Lowpoly.append_tri_list4(consts, recs, idx, batch_n)
+  local k = #consts
+  local m = #idx
+  for i = 1, batch_n do
+    local r = (i <= m) and recs[idx[i]] or nil
+    if r then
+      local g = r.g
+      consts[k + 1] = r.x0
+      consts[k + 2] = r.y0
+      consts[k + 3] = r.x1
+      consts[k + 4] = r.y1
+      consts[k + 5] = r.x2
+      consts[k + 6] = r.y2
+      for j = 1, 10 do
+        consts[k + 6 + j] = g[j]
+      end
+    else
+      for j = 1, 16 do
+        consts[k + j] = 0
+      end
+    end
+    k = k + 16
+  end
+  return math_min(m, batch_n)
+end
+
+EffectUtils_Lowpoly.GOURAUD_BATCH = GOURAUD_BATCH
 EffectUtils_Lowpoly.MAX_POINTS = MAX_POINTS
 EffectUtils_Lowpoly.BATCH_SIZE = BATCH_SIZE
 EffectUtils_Lowpoly.OKLCH_C_REF = OKLCH_C_REF

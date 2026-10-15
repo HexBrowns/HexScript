@@ -1,5 +1,5 @@
 --[[
-2Dライティング_H v1.11 by HexBrowns
+2Dライティング_H v1.20 by HexBrowns
 MIT No Attribution (MIT-0) / Copyright (c) 2026 HexBrowns
 
   環境遮蔽 : 明るさ（またはアルファ）を高さとみなし、くぼみ・接触部に陰を落とす 2D のアンビエントオクルージョン
@@ -10,10 +10,11 @@ MIT No Attribution (MIT-0) / Copyright (c) 2026 HexBrowns
 
 v1.10: 光の帯を足した（既存の 2 つは変えていない）
 v1.11: 環境遮蔽 v1.01・大域照明 v1.01。4K・横長の巨大素材でも cache と tempbuffer の枠に収める（元の画像を退避しない・作業解像度を下げる）
+v1.20: 環境遮蔽 v1.10。陰の作り方（ずらしてぼかす／固定／ノイズのまま）を足した（既定は今までと同じ絵）
 ]]
 
 @環境遮蔽
---information:環境遮蔽@2Dライティング_H v1.01 by HexBrowns
+--information:環境遮蔽@2Dライティング_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@strength:強さ,0,200,100,0.1
@@ -23,6 +24,7 @@ v1.11: 環境遮蔽 v1.01・大域照明 v1.01。4K・横長の巨大素材で�
 --check@invert:高さを反転,0
 --track@dirs:方向数,2,16,8,1
 --track@steps:サンプル数,2,32,8,1
+--select@ao_mode:陰の作り方=0,ずらしてぼかす=0,固定=1,ノイズのまま=2
 --track@pattern:模様の抑制,0,100,30,0.1
 --color@shadow_color:陰の色,0x000000
 --select@blend:合成=0,通常=0,乗算=1
@@ -105,17 +107,19 @@ cbuffer constant0 : register(b0) {
     float dirs;
     float steps;
     float strength;
+    float jitter;
 };
 // Interleaved Gradient Noise（画素位置だけで決まる。毎フレーム同じ）
 float ao_ign(float2 p) {
     return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
 }
-// 水平線方式: 方向ごとに、半径の中で最も高く見える遮り（仰角の正接 e）を探し、sin(atan e) を距離で弱めて平均する
+// 水平線方式: 方向ごとに、半径の中で最も高く見える遮り（仰角の正接 e）を探し、sin(atan e) を距離で弱めて平均する。
+// jitter > 0.5 なら方向と歩幅を画素ごとにずらす。0 なら方向は 0 から等分・歩幅は間隔の真ん中（全画素で同じ。方向数ぶんの縞が出る）
 float4 ps_ao_main(float4 pos : SV_Position) : SV_Target {
     float2 p = floor(pos.xy) + 0.5;
     float h0 = hgt.Load(int3(int2(pos.xy), 0)).r;
-    float n1 = ao_ign(floor(pos.xy));
-    float n2 = ao_ign(floor(pos.xy) + float2(37.0, 17.0));
+    float n1 = (jitter > 0.5) ? ao_ign(floor(pos.xy)) : 0.0;
+    float n2 = (jitter > 0.5) ? ao_ign(floor(pos.xy) + float2(37.0, 17.0)) : 0.5;
     int nd = int(dirs);
     int ns = int(steps);
     float occ = 0.0;
@@ -228,10 +232,15 @@ if ps >= 0.5 then
   obj.copybuffer("cache:ao/h", "cache:ao/hb")
 end
 
+-- 陰の作り方（v1.10）: 0 = 方向を画素ごとにずらし、粒をぼかしで消す（v1.01 までと同じ） / 1 = 固定（ずらさない。ぼかしは掛ける） /
+-- 2 = ノイズのまま（ずらすが、ぼかさない。粒が砂目として残る）
+local mode = math.floor((ao_mode or 0) + 0.5)
 obj.clearbuffer("cache:ao/o", lw, lh)
-obj.pixelshader("ps_ao_main", "cache:ao/o", {"cache:ao/h"}, { lw, lh, rad, nd, ns, strength / 100 }, "copy", "clamp")
+obj.pixelshader("ps_ao_main", "cache:ao/o", {"cache:ao/h"}, { lw, lh, rad, nd, ns, strength / 100, (mode == 1) and 0 or 1 }, "copy", "clamp")
 -- 方向のノイズの粒を、高さの差で止めるぼかしで消す
-blur("cache:ao/o", "cache:ao/o", math.max(hs * 0.05, 0.5), 2)
+if mode ~= 2 then
+  blur("cache:ao/o", "cache:ao/o", math.max(hs * 0.05, 0.5), 2)
+end
 
 if grow then obj.clearbuffer("object", w, h) end
 obj.pixelshader("ps_ao_comp", "object", {src, "cache:ao/o"}, {

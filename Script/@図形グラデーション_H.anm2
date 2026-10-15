@@ -1,5 +1,5 @@
 @描画
---information:描画@図形グラデーション_H v2.02 by HexBrowns
+--information:描画@図形グラデーション_H v2.10 by HexBrowns
 --label:HexScript
 --filter
 
@@ -78,11 +78,14 @@
 --track@repeat_n:繰り返し,1,100,1,1
 --check@mirror:折り返す,0
 --check@invert:反転,0
+--track@grad_steps:段数(0で連続),0,256,0,1
+--select@grad_dither:ディザ=0,なし=0,Bayer=1,ノイズ=2
 --group
 
 --[[
-図形グラデーション_H v2.02 描画
+図形グラデーション_H v2.10 描画
 
+  v2.10: 段数(0で連続) / ディザ を足した（多色グラデーション_H v1.10 と同じ項目名・同じ式）。既定の 0 / なし で v2.02 と同じ絵。
   v2.02: 合成モードのときの素材の退避（cache）を 1 つの名前にし、読み終えたら縮める。
   並べたオブジェクトを描き直すと退避が消えて invalid buffer type になりうる（多色グラデーション_H v1.03 と同じ直し）
 
@@ -131,6 +134,14 @@
     遷移方法  変わる場所。ストップに収束 = 区間の始め、中間 = 真ん中、次のストップ = 区間の終わり
     変化の仕方 直線 / なめらか / イーズイン / イーズアウト
 
+  段数とディザ（v2.10）
+    段数      2 以上で、上の手順で作った位置 t を段数で等分し、段 k（0〜段数-1）を位置 k/(段数-1) の色で塗る
+              （最初の段は開始色、最後の段は終了色）。色ではなく位置を区切るので、どの色空間・遷移の設定でも
+              各段はそのグラデーションの途中の色になる。繰り返し・折り返しでは 1 回ごとに段数の帯になる。0 と 1 は連続
+    ディザ    段の中心どうしの間で隣の段を混ぜて、段をつなぐ（混ぜる割合は位置に比例）。
+              Bayer は 8x8 の組織的ディザ、ノイズは画素ごとのハッシュ。どちらもオブジェクトの画素の位置で決まる
+              （オブジェクトと一緒に動く）。段数が 0 / 1 のときは効かない（トラックは --hide@ の条件に書けないので隠していない）
+
   合成モード
     塗り替え  形はそのまま中身を置き換える。「透明な色」で、色の透明度を
               形ごと透明にする（抜き）か、元の色を残す（下の色が透ける）かを選ぶ
@@ -175,6 +186,8 @@ cbuffer Params : register(b0) {
     float offset;         // 48    t のずれ（0〜1 が 100%）
     float aspect_before;  // 49
     float fixed_width;    // 50
+    float step_count;     // 51    [v2.10] 段数（2 未満は連続）
+    float dither_mode;    // 52    [v2.10] ディザ（0 なし / 1 Bayer / 2 ノイズ）
 };
 
 Texture2D tex : register(t0);
@@ -547,6 +560,42 @@ float4 grad_color(float t) {
     return float4(from_space(v) * a, a);
 }
 
+// ---- [v2.10 から] 段数とディザ（多色グラデーション_H の ps_gradient にも同じものがある。変えるときは両方を直す）----
+// 段数 n（2 以上）: 位置 t を n 等分し、段 k（0..n-1）を位置 k/(n-1) にする（色ではなく位置を区切る）。
+// ディザ: 段の番号 = floor(t x n - 0.5 + しきい値)。段の中心（t x n - 0.5 が整数）では混ざらず、
+// 中心どうしの間で隣の段の割合が位置に比例して増える。なしは floor(t x n)（等幅の段）
+uint grad_pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// しきい値（0..1）。1 = Bayer 8x8、2 = ノイズ（画素ごとの PCG ハッシュの上位 24 ビット）、それ以外は 0.5
+float grad_dither_threshold(uint2 ip, float mode) {
+    float thr = 0.5;
+    if (mode > 1.5) {
+        thr = (float)(grad_pcg_hash(ip.x + grad_pcg_hash(ip.y)) >> 8u) / 16777216.0;
+    } else if (mode > 0.5) {
+        uint x = ip.x & 7u;
+        uint y = ip.y & 7u;
+        uint xy = x ^ y;
+        uint m = ((xy & 1u) << 5u) | ((y & 1u) << 4u) | ((xy & 2u) << 2u) | ((y & 2u) << 1u)
+               | ((xy & 4u) >> 1u) | ((y & 4u) >> 2u);
+        thr = ((float)m + 0.5) / 64.0;
+    }
+    return thr;
+}
+
+float grad_quantize(float u, float n, float mode, float thr) {
+    float r = u;
+    if (n > 1.5) {
+        float lv = mode > 0.5 ? floor(u * n - 0.5 + thr) : floor(u * n);
+        r = clamp(lv, 0.0, n - 1.0) / (n - 1.0);
+    }
+    return r;
+}
+// ---- [v2.10 まで] ----
+
 float4 ps_sg_main(float4 pos : SV_Position) : SV_Target {
     float4 src = tex.Load(int3(int2(pos.xy), 0));
     float4 result = float4(0.0, 0.0, 0.0, 0.0);
@@ -557,9 +606,11 @@ float4 ps_sg_main(float4 pos : SV_Position) : SV_Target {
         // 継ぎ目・繰り返しの境目・遷移範囲 0 の境目のジャギー対策（回転格子の 4 点）。
         // [loop] で回す: 展開すると grad_color が 4 回複製されてコンパイルに約 1 秒かかった（v2.00、実機 1021.9ms）
         float4 g = float4(0.0, 0.0, 0.0, 0.0);
+        // [v2.10] 段数とディザ: 4 点とも画素の同じしきい値で位置 t を段に区切ってから色を決める
+        float q_thr = step_count > 1.5 ? grad_dither_threshold(uint2(pos.xy), dither_mode) : 0.5;  // [v2.10]
         [loop]
         for (int k = 0; k < 4; k++) {
-            g += grad_color(grad_t(p + AA_OFFSET[k]));
+            g += grad_color(grad_quantize(grad_t(p + AA_OFFSET[k]), step_count, dither_mode, q_thr));  // [v2.10]
         }
         g *= 0.25;
 
@@ -720,6 +771,8 @@ local C = {
   offset / 100,
   (aspect_before == 1 or aspect_before == true) and 1 or 0,
   fixed,
+  math.floor((grad_steps or 0) + 0.5),   -- [v2.10] 段数（2 未満は連続）
+  grad_dither or 0,                      -- [v2.10] ディザ
 }
 
 if mode == 0 then

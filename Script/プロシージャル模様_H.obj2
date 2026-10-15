@@ -1,4 +1,4 @@
---information:プロシージャル模様_H v1.10 by HexBrowns
+--information:プロシージャル模様_H v1.20 by HexBrowns
 --label:HexScript
 --object
 
@@ -32,6 +32,13 @@
 -- issue: AI/scripts/issues/20260923_procedural_texture_hide_rule_on_track.md
 --group
 
+--group:雲
+--select@noise_type:ノイズの種類=0,勾配ノイズ=0,値ノイズ=1,ブロック=2,セルノイズ=3
+--hide@noise_type:form~=0
+-- v1.20: 雲のノイズの種類を足した。既定の勾配ノイズは v1.10 までと同じ fbm（歪み・縞の不均等は種類によらず勾配ノイズ）。
+-- 値ノイズは格子に沿った縞が出る、ブロックは補間しない（ドット絵の雲）、セルノイズは泡状の雲。
+--group
+
 --group:縞
 --track@uneven:不均等,0,200,0,0.1
 --hide@uneven:form~=1
@@ -42,6 +49,14 @@
 --hide@cell_out:form~=2
 --track@jitter:ばらけ,0,100,80,0.1
 --hide@jitter:form~=2
+--select@cell_dist:距離の種類=0,ユークリッド=0,マンハッタン=1,チェビシェフ=2,ミンコフスキー=3
+--hide@cell_dist:form~=2
+--track@mink_p:距離の次数,1.00,10.00,3.00,0.01
+--hide@mink_p:form~=2
+--hide@mink_p:cell_dist~=3
+-- v1.20: セルの距離の種類を足した。既定のユークリッドは v1.10 までと同じ voronoi。
+-- マンハッタンはひし形・斜めの境界、チェビシェフは四角いセル。ミンコフスキーは次数 1 でマンハッタン、
+-- 2 でユークリッド、大きいほどチェビシェフに近づく。
 --group
 
 --group:六方格子
@@ -230,6 +245,16 @@
   同じ項目に複数行書くと OR で効く（au2-script-header）。線幅を
   「階調が 連続 でも 段 でもないときだけ出す」形で使っている。
 
+  --- v1.20: 方式の選択（演出として選べるアルゴリズムの違い） ---
+
+  雲のノイズの種類（勾配ノイズ / 値ノイズ / ブロック / セルノイズ）と、
+  セルの距離の種類（ユークリッド / マンハッタン / チェビシェフ / ミンコフスキー）。
+  **既定はどちらも v1.10 までの式をそのまま通る**（新しい関数は別に置き、既定では呼ばない）。
+  値ノイズ・ブロック・セルノイズは、1 段の標準偏差が勾配ノイズと揃うように係数を決めてある
+  （同じ 振幅 / コントラスト で同じくらいの明暗になる）。ユークリッド以外の距離は
+  F1 の取りこぼしを避けて近傍を 5x5 に広げた（次数 1 以上なら 5x5 で F1 は取りこぼさない）。
+  検証: AI/scripts/プロシージャルテクスチャ_H/verify_modes.py
+
   --- 未対応 ---
 
   タイル状に繰り返しても継ぎ目が出ない（シームレス）生成には対応していない。
@@ -275,13 +300,16 @@ cbuffer Params : register(b0) {
     float hex_out;       // 34
     float cs_space;      // 35   色空間（0 sRGB = v1.02 までと同じ lerp。それ以外は col_lo / col_hi がその色空間の値）
     float hue_long;      // 36   色相経路（1 で長い方を回る）
+    float cell_dist;     // 37   セルの距離の種類（0 ユークリッド = v1.10 までと同じ voronoi）
+    float mink_p;        // 38   ミンコフスキーの次数（1〜10）
+    float noise_kind;    // 39   雲のノイズの種類（0 勾配ノイズ = v1.10 までと同じ fbm）
 };
 
 Texture2D pre : register(t0);
 SamplerState smp : register(s0);
 
 // ベクトル型を先に並べて 16 バイト境界の穴を無くしてある（au2-shader-lua）。
-// 37 スロット。ダミーは 1 つも要らない。
+// 40 スロット。ダミーは 1 つも要らない。
 // 追加はスカラーだけなので末尾に積んでよい。ここに float2 以上を足すと
 // 境界をまたいで穴が開くので、そのときは並べ直すこと。
 
@@ -796,6 +824,111 @@ float3 voronoi(float2 p) {
     return float3(f1, f2, id);
 }
 
+// ---- v1.20: 方式の選択。ここから下の関数は既定（勾配ノイズ・ユークリッド）では呼ばない ----
+
+// 値ノイズ。格子点にハッシュの値を置き、gnoise と同じ 5 次の補間で繋ぐ。
+// 格子に沿った縞が出るのが癖（gnoise の上のコメントでわざと避けていたもの）。
+// 1 段の標準偏差は勾配ノイズとほぼ同じ（0.22 / 0.21。verify_modes.py で測った）ので係数は掛けない。
+float vnoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = frac(p);
+    float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    float a = hash21(i);
+    float b = hash21(i + float2(1.0, 0.0));
+    float c = hash21(i + float2(0.0, 1.0));
+    float d = hash21(i + float2(1.0, 1.0));
+    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y) - 0.5;
+}
+
+// ブロック。補間しない値ノイズ（格子の 1 マスが 1 色）。重ねるとドット絵の雲になる。
+// 一様乱数の標準偏差 0.289 を 0.75 倍して勾配ノイズ（0.21）に揃える
+float bnoise(float2 p) {
+    return (hash21(floor(p)) - 0.5) * 0.75;
+}
+
+// セルノイズ。ばらけ 1 の F1（最も近い点までの距離）を反転したもの。点の上が明るい泡になる。
+// 0.43 は F1 の平均、1.1 は標準偏差を勾配ノイズに揃える係数（verify_modes.py で測った）
+float cnoise(float2 p) {
+    float2 ip = floor(p);
+    float2 fp = p - ip;
+    float f1 = 8.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            float2 g = float2((float)i, (float)j);
+            float2 pt = g + hash22(ip + g);
+            f1 = min(f1, length(pt - fp));
+        }
+    }
+    return (0.43 - f1) * 1.1;
+}
+
+// fbm の種類違い。kind: 1 値ノイズ / 2 ブロック / 3 セルノイズ（0 は上の fbm を使う）
+float fbm_kind(float2 p, int kind) {
+    float sum = 0.0;
+    float a = 1.0;
+    float norm = 0.0;
+    float2 q = p;
+    int n = (int)(octaves + 0.5);
+    for (int i = 0; i < 6; ++i) {
+        if (i < n) {
+            float nv = 0.0;
+            if (kind == 1) {
+                nv = vnoise(q);
+            } else if (kind == 2) {
+                nv = bnoise(q);
+            } else {
+                nv = cnoise(q);
+            }
+            sum += nv * a;
+            norm += a;
+            q *= lacunarity;
+            a *= gain;
+        }
+    }
+    return sum / max(norm, 1.0e-5);
+}
+
+// セルの距離。cell_dist: 1 マンハッタン / 2 チェビシェフ / 3 ミンコフスキー（0 ユークリッドは上の voronoi）
+float cell_metric(float2 d) {
+    float r = abs(d.x) + abs(d.y);
+    if (cell_dist > 2.5) {
+        float pp = clamp(mink_p, 1.0, 10.0);
+        r = pow(abs(pow(abs(d.x), pp) + pow(abs(d.y), pp)), 1.0 / pp);
+    } else if (cell_dist > 1.5) {
+        r = max(abs(d.x), abs(d.y));
+    }
+    return r;
+}
+
+// voronoi の距離違い。返り値の形は voronoi と同じ（x=F1, y=F2, z=セルのハッシュ）。
+// マンハッタンでは自分のマスの点まで最大 2 離れるので、3x3 だと 2 マス先の点を取りこぼす。
+// 5x5 なら 3 マス先の点は 2 以上離れるので、次数 1 以上で F1 を取りこぼさない
+float3 voronoi_metric(float2 p) {
+    float2 ip = floor(p);
+    float2 fp = p - ip;
+    float f1 = 64.0;
+    float f2 = 64.0;
+    float id = 0.0;
+    [loop]
+    for (int j = -2; j <= 2; ++j) {
+        [loop]
+        for (int i = -2; i <= 2; ++i) {
+            float2 g = float2((float)i, (float)j);
+            float2 o = hash22(ip + g);
+            float2 pt = g + float2(0.5, 0.5) + (o - float2(0.5, 0.5)) * jitter;
+            float d = cell_metric(pt - fp);
+            if (d < f1) {
+                f2 = f1;
+                f1 = d;
+                id = hash21(ip + g);
+            } else if (d < f2) {
+                f2 = d;
+            }
+        }
+    }
+    return float3(f1, f2, id);
+}
+
 // 六方格子。2 つのずらした矩形格子のうち近い方を採る。
 // xy=セル中心からの相対、zw=セルの識別座標
 float4 hex_local(float2 p) {
@@ -855,7 +988,13 @@ float4 ps_ptex_field(float4 sv_pos : SV_Position, float2 uv : TEXCOORD) : SV_Tar
         // 雲: fBm を 0〜1 へ載せる。係数 1.2 は実測で決めた
         // （0.7 だと場が範囲を使い切らず、指定した振幅の半分しか出ない。
         //   1.2 で pp 0.90〜0.96 / クリップ 5% 以下。重ね回数 1〜6 で確認）
-        v = saturate(fbm(p) * 1.2 + 0.5);
+        int nk = (int)(noise_kind + 0.5);
+        if (nk == 0) {
+            v = saturate(fbm(p) * 1.2 + 0.5);
+        } else {
+            // v1.20: ノイズの種類違い。係数 1.2 と 0.5 は勾配ノイズと同じ（1 段の標準偏差を揃えてある）
+            v = saturate(fbm_kind(p, nk) * 1.2 + 0.5);
+        }
     } else if (mode == 1) {
         // 縞: 1 単位で 1 周期。歪みを足すと大理石・風紋になる
         //
@@ -870,7 +1009,12 @@ float4 ps_ptex_field(float4 sv_pos : SV_Position, float2 uv : TEXCOORD) : SV_Tar
         }
         v = sin(u * 6.2831853) * 0.5 + 0.5;
     } else if (mode == 2) {
-        float3 vo = voronoi(p);
+        float3 vo = float3(0.0, 0.0, 0.0);
+        if (cell_dist > 0.5) {
+            vo = voronoi_metric(p);   // v1.20: マンハッタン / チェビシェフ / ミンコフスキー
+        } else {
+            vo = voronoi(p);
+        }
         int co = (int)(cell_out + 0.5);
         if (co == 0) {
             v = saturate(vo.x);                    // 距離: 丸い塊
@@ -1116,4 +1260,8 @@ obj.pixelshader("ps_ptex_field", "object", { FIELD }, {
   math.floor(hex_out + 0.5),
   cs_space,
   cs_long,
+  -- v1.20: 方式の選択。既定（ユークリッド・勾配ノイズ）は 0 で、シェーダーは v1.10 までの式を通る
+  math.floor(cell_dist + 0.5),
+  mink_p,
+  math.floor(noise_type + 0.5),
 }, "copy", "loop")

@@ -1,5 +1,5 @@
 --[[
-ローポリ背景.obj2 v3.20
+ローポリ背景.obj2 v3.40
 
   通常 : ジッター格子 → Bowyer-Watson Delaunay → cbuffer バッチで HLSL 塗り。
          メッシュは EffectUtils_Lowpoly 側でメモ化されるので、アニメ OFF なら再計算は初回のみ。
@@ -26,12 +26,22 @@ v3.20 で色空間を選べるようにした（仕様 AI/specifications/2026101
 （HSV / Oklch の h と L）選ぶ。既定（sRGB・HSV）は v3.11 と同じ計算になる。明転は決まった色に掛けるので変えていない。
 検証器: AI/scripts/ローポリ/verify_colorspace_ext.py
 
+v3.40 で「塗り方」（フラット / グーロー）を足した（候補 13。AI/docs/20261015_方式の選択肢_候補.md）。
+  フラット : 今までどおり三角形ごとに 1 色（既定。v3.20 と同じ定数・同じ本文の経路を通る）。
+  グーロー : 頂点ごとに色を決めて三角形の中で補間する。頂点の色は「頂点の位置の色」。配色・ばらつき・明転を
+             三角形の重心と三角形の番号の代わりに、頂点の位置と頂点の番号で決める（ランダム配色も頂点ごとに色1・色2 を振る）。
+             同じ頂点を共有する三角形は同じ色を使うので、面の継ぎ目が消え、ローポリの形のままグラデーションがなめらかにつながる。
+  通常 は頂点の色を Lua で決め、新しいシェーダー ps_lpbg_gouraud で塗る（1 三角形 4 float4・1 パス 192 三角形・
+  場所ごとのバッチ）。高速 は ps_lpbg_grid の中に分岐を足した（頂点 3 つ分の色をその場で決める）。
+  明転は頂点ごとの係数を補間して掛ける。エッジ色の明転は フラット と同じ扱い（通常 は中央の係数、高速 は画素ごと）。
+  検証器: AI/scripts/ローポリ/verify_gouraud.py
+
 ※このコメント内で行頭に @ を置かないこと。ホストはブロックコメントの中も走査し、
   行頭 @ をセクション区切りとして扱うため、偽のスクリプトがエフェクト一覧に並ぶ。
 ]]
 
 @通常
---information:通常@ローポリ背景 v3.20 by HexBrowns
+--information:通常@ローポリ背景 v3.40 by HexBrowns
 --label:HexScript
 --object
 
@@ -45,6 +55,7 @@ v3.20 で色空間を選べるようにした（仕様 AI/specifications/2026101
 --track@cell_size:セルサイズ,20,500,100,1
 --track@jitter:揺らぎ,0,100,40,0.1
 --track@seed:シード,-9999,9999,0,1
+--select@shading:塗り方=0,フラット=0,グーロー=1
 --separator:※CPU分割のためセルは点数上限で自動的に粗くなります
 --group
 
@@ -153,6 +164,88 @@ float4 ps_lpbg_fill(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : S
 }
 ]]
 
+--[[pixelshader@ps_lpbg_gouraud:
+// 塗り方「グーロー」（v3.40）。1 パス 192 三角形（Lua 側 EffectUtils_Lowpoly.GOURAUD_BATCH と必ず一致させること）。
+// 1 三角形 = 4 float4: x0,y0,x1,y1 / x2,y2,r0,g0 / b0,r1,g1,b1 / r2,g2,b2,a（頂点の色はストレート。明転は掛けてある）
+cbuffer Params : register(b0) {
+    float4 meta;      // w, h, tri_count, show_edges
+    float4 edge;      // r, g, b, edge_width
+    float4 bbox;      // このバッチの三角形の外接矩形 x0, y0, x1, y1（画素。1 画素の余裕込み）
+    float4 tri[768];  // 192 tris * 4 float4
+};
+
+// 正本: ps_lpbg_fill（セクションの中でもシェーダーをまたいでヘルパーは共有できないので複製。直すときは両方直す）
+float sign2d(float2 p1, float2 p2, float2 p3) {
+    return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+}
+
+bool point_in_tri(float2 pt, float2 v0, float2 v1, float2 v2) {
+    float d1 = sign2d(pt, v0, v1);
+    float d2 = sign2d(pt, v1, v2);
+    float d3 = sign2d(pt, v2, v0);
+    bool has_neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    bool has_pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    return !(has_neg && has_pos);
+}
+
+float dist_seg(float2 p, float2 a, float2 b) {
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float denom = dot(ba, ba);
+    float h = (denom > 1e-8) ? saturate(dot(pa, ba) / denom) : 0.0;
+    return length(pa - ba * h);
+}
+
+// 重心座標（a, b, c の重み）。三角形が潰れていれば等分。辺の上の画素のわずかな外れは 0〜1 に収めて足し 1 に直す
+float3 lpg_bary(float2 p, float2 a, float2 b, float2 c) {
+    float3 wv = float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0);
+    float d = sign2d(a, b, c);
+    if (abs(d) > 1e-8) {
+        wv.x = sign2d(p, b, c) / d;
+        wv.y = sign2d(a, p, c) / d;
+        wv.z = 1.0 - wv.x - wv.y;
+        wv = saturate(wv);
+        wv = wv / max(wv.x + wv.y + wv.z, 1e-6);
+    }
+    return wv;
+}
+
+float4 ps_lpbg_gouraud(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target {
+    float2 pos = sv_pos.xy;
+    float4 result = float4(0.0, 0.0, 0.0, 0.0);
+    // 場所ごとのバッチなので、外接矩形の外の画素はどの三角形にも入らない
+    if (pos.x < bbox.x || pos.y < bbox.y || pos.x > bbox.z || pos.y > bbox.w) {
+        return result;
+    }
+    int count = (int)meta.z;
+    [loop]
+    for (int i = 0; i < 192; i++) {
+        if (i >= count) break;
+        int base = i * 4;
+        float2 v0 = tri[base].xy;
+        float2 v1 = tri[base].zw;
+        float2 v2 = tri[base + 1].xy;
+        float a = tri[base + 3].w;
+        if (a <= 0.0) continue;
+        if (point_in_tri(pos, v0, v1, v2)) {
+            float3 c0 = float3(tri[base + 1].z, tri[base + 1].w, tri[base + 2].x);
+            float3 c1 = float3(tri[base + 2].y, tri[base + 2].z, tri[base + 2].w);
+            float3 c2 = float3(tri[base + 3].x, tri[base + 3].y, tri[base + 3].z);
+            float3 wv = lpg_bary(pos, v0, v1, v2);
+            float3 rgb = saturate(c0 * wv.x + c1 * wv.y + c2 * wv.z);
+            if (meta.w > 0.5) {
+                float d = min(min(dist_seg(pos, v0, v1), dist_seg(pos, v1, v2)), dist_seg(pos, v2, v0));
+                float ea = 1.0 - smoothstep(edge.w * 0.5, edge.w * 0.5 + 1.0, d);
+                rgb = lerp(rgb, edge.rgb, ea);
+            }
+            result = float4(rgb * a, a);
+            break;
+        }
+    }
+    return result;
+}
+]]
+
 local ok_lp, lp = pcall(require, "EffectUtils_Lowpoly")
 if not ok_lp or not lp then
   return
@@ -208,37 +301,73 @@ if #tris < 1 then
   return
 end
 
-local recs = lp.build_tri_records(points, tris, function(i, t, p0, p1, p2)
-  local cx = (p0.x + p1.x + p2.x) / 3
-  local cy = (p0.y + p1.y + p2.y) / 3
-  local mix_t
-  if color_random then
-    mix_t = lp.random_mix_t(lp.tri_vertex_hash(t, 13, seed + 700), mix_center, mix_blend01)
-  else
-    mix_t = lp.gradient_t(cx, cy, w, h, gdir)
+if (shading or 0) == 1 then
+  -- v3.40: グーロー。頂点ごとに色を決める（三角形の重心・番号の代わりに、頂点の位置・番号を使う）。
+  -- 点の番号は格子の並びで決まり、メッシュのアニメでも入れ替わらない。ランダム配色の乱数は格子の番号から作る
+  local vcol = {}
+  for j = 1, #points do
+    local p = points[j]
+    local mix_t
+    if color_random then
+      mix_t = lp.random_mix_t(lp.hash21(p.ix, p.iy, seed + 713), mix_center, mix_blend01)
+    else
+      mix_t = lp.gradient_t(p.x, p.y, w, h, gdir)
+    end
+    local r, g, b = lp.color_at(
+      mix_t, r1, g1, b1, r2, g2, b2, j, seed, hue_var, val_var, hue_phase, val_phase, mix_cs, var_sp)
+    if fade_on then
+      local key = lp.fade_key(fade_order, j, seed, p.x, p.y, w, h, gdir, r, g, b, mix_t)
+      r, g, b = lp.fade_mix(r, g, b, lp.fade_factor(fade_prog, key, fade_spread01), fade_dark01)
+    end
+    vcol[j] = { r, g, b }
   end
-  local r, g, b = lp.color_at(
-    mix_t, r1, g1, b1, r2, g2, b2, i, seed, hue_var, val_var, hue_phase, val_phase, mix_cs, var_sp)
-  if fade_on then
-    local key = lp.fade_key(fade_order, i, seed, cx, cy, w, h, gdir, r, g, b, mix_t)
-    r, g, b = lp.fade_mix(r, g, b, lp.fade_factor(fade_prog, key, fade_spread01), fade_dark01)
+  local grecs = lp.build_tri_records_vertex(points, tris, vcol, 1)
+  local gbatch = lp.GOURAUD_BATCH
+  local batches = lp.spatial_batches(points, tris, gbatch)
+  for bi = 1, #batches do
+    local b = batches[bi]
+    local consts = {
+      w, h, 0, is_edges and 1 or 0,
+      er, eg, eb, edge_width,
+      b.x0 - 1, b.y0 - 1, b.x1 + 1, b.y1 + 1,
+    }
+    local n = lp.append_tri_list4(consts, grecs, b.idx, gbatch)
+    consts[3] = n
+    obj.pixelshader("ps_lpbg_gouraud", "object", nil, consts, "draw")
   end
-  return r, g, b, 1
-end)
+else
+  local recs = lp.build_tri_records(points, tris, function(i, t, p0, p1, p2)
+    local cx = (p0.x + p1.x + p2.x) / 3
+    local cy = (p0.y + p1.y + p2.y) / 3
+    local mix_t
+    if color_random then
+      mix_t = lp.random_mix_t(lp.tri_vertex_hash(t, 13, seed + 700), mix_center, mix_blend01)
+    else
+      mix_t = lp.gradient_t(cx, cy, w, h, gdir)
+    end
+    local r, g, b = lp.color_at(
+      mix_t, r1, g1, b1, r2, g2, b2, i, seed, hue_var, val_var, hue_phase, val_phase, mix_cs, var_sp)
+    if fade_on then
+      local key = lp.fade_key(fade_order, i, seed, cx, cy, w, h, gdir, r, g, b, mix_t)
+      r, g, b = lp.fade_mix(r, g, b, lp.fade_factor(fade_prog, key, fade_spread01), fade_dark01)
+    end
+    return r, g, b, 1
+  end)
 
-local batch = lp.BATCH_SIZE
-for start = 1, #recs, batch do
-  local consts = {
-    w, h, 0, is_edges and 1 or 0,
-    er, eg, eb, edge_width,
-  }
-  local n = lp.append_tri_batch(consts, recs, start, batch)
-  consts[3] = n
-  obj.pixelshader("ps_lpbg_fill", "object", nil, consts, "draw")
+  local batch = lp.BATCH_SIZE
+  for start = 1, #recs, batch do
+    local consts = {
+      w, h, 0, is_edges and 1 or 0,
+      er, eg, eb, edge_width,
+    }
+    local n = lp.append_tri_batch(consts, recs, start, batch)
+    consts[3] = n
+    obj.pixelshader("ps_lpbg_fill", "object", nil, consts, "draw")
+  end
 end
 
 @高速
---information:高速@ローポリ背景 v3.20 by HexBrowns
+--information:高速@ローポリ背景 v3.40 by HexBrowns
 --label:HexScript
 --object
 
@@ -252,6 +381,7 @@ end
 --track@cell_size:セルサイズ,20,500,100,1
 --track@jitter:揺らぎ,0,100,40,0.1
 --track@seed:シード,-9999,9999,0,1
+--select@shading:塗り方=0,フラット=0,グーロー=1
 --group
 
 --group:色設定,1
@@ -316,6 +446,7 @@ cbuffer Params : register(b0) {
     float4 csv1;    // 色1 を色空間の値にしたもの x, y, z, 色空間（0 = sRGB。上の lerp のまま）（v3.20）
     float4 csv2;    // 色2 を色空間の値にしたもの x, y, z, 色相経路（1 = 長経路）
     float var_sp;   // ばらつきの色空間（3 = HSV、7 = Oklch）
+    float g_shade;  // 塗り方（0 = フラット、1 = グーロー。v3.40）
 };
 
 // 正本: @通常 の ps_lpbg_fill（セクションをまたいでヘルパーは共有できないので複製。直すときは両方直す）
@@ -823,6 +954,79 @@ float2 mesh_point(int ix, int iy) {
     return clamp(p, float2(0.0, 0.0), float2(size.x, size.y));
 }
 
+// ==== グーロー（v3.40）ここから ====
+float3 lpg_bary(float2 p, float2 a, float2 b, float2 c) {
+    float3 wv = float3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0);
+    float d = sign2d(a, b, c);
+    if (abs(d) > 1e-8) {
+        wv.x = sign2d(p, b, c) / d;
+        wv.y = sign2d(a, p, c) / d;
+        wv.z = 1.0 - wv.x - wv.y;
+        wv = saturate(wv);
+        wv = wv / max(wv.x + wv.y + wv.z, 1e-6);
+    }
+    return wv;
+}
+
+// 頂点（格子の番号 iv・位置 p）の色と明転の係数。式は下の ps_lpbg_grid の三角形ごとの色・明転と同じで、
+// 重心の代わりに頂点の位置、三角形の番号の代わりに格子の番号を使う。戻り値は (ストレートの rgb, 明転の係数)
+float4 lpg_vertex(float2 iv, float2 p) {
+    float grad = anim.w;
+    float t = (grad < 0.5) ? (p.y / max(size.y, 1.0))
+            : ((grad < 1.5) ? (p.x / max(size.x, 1.0))
+                            : ((p.x + p.y) / max(size.x + size.y, 1.0)));
+    if (mixp.x > 0.5) {
+        // ランダム配色。頂点ごとに色1・色2 を振る（鍵は格子の番号。三角形の側とは別の種 +713）
+        uint mseed = pcg_hash((uint)((int)grid.w + 713));
+        uint vid = (uint)((int)iv.y * (int)grid.x + (int)iv.x);
+        float mu = (float)(pcg_hash(vid ^ mseed) >> 8u) / 16777216.0;
+        float mc = mixp.y;
+        float mb = saturate(mixp.z);
+        if (mb < 1e-4) {
+            t = (mu < mc) ? 1.0 : 0.0;
+        } else {
+            t = saturate((mc - mu) / mb + 0.5);
+        }
+    }
+    float3 rgb = lerp(col1.rgb, col2.rgb, saturate(t));
+    if (csv1.w > 0.5) {
+        float4 cmix = cs_mix_values(csv1.xyz, 1.0, csv2.xyz, 1.0, saturate(t), csv1.w, csv2.w);
+        rgb = cs_from_space(cmix.xyz, csv1.w);
+    }
+    if (anim.z > 0.5) {
+        float hue_off = (hash21f(iv, grid.w + 100.0) - 0.5) * 2.0 * vari.y + vari.x;
+        float val_off = (hash21f(iv, grid.w + 300.0) - 0.5) * 2.0 * vari.w * opt.x;
+        float3 var_in = saturate(rgb);
+        float3 hsv = rgb_to_hsv(saturate(rgb));
+        hsv.x = frac(hsv.x + hue_off);
+        hsv.z = saturate(hsv.z + val_off);
+        rgb = hsv_to_rgb(hsv);
+        if (var_sp > 6.5) {
+            float3 lch = cs_to_space(var_in, 7.0);
+            lch.x = frac(lch.x + hue_off);
+            lch.z = saturate(lch.z + val_off);
+            rgb = cs_from_space(lch, 7.0);
+        }
+    }
+    float fkey = hash21f(iv, grid.w + 500.0);
+    float forder = fade.y;
+    if (forder > 0.5 && forder < 1.5) {
+        fkey = saturate(t);
+    } else if (forder > 1.5 && forder < 2.5) {
+        fkey = 1.0 - max(rgb.r, max(rgb.g, rgb.b));
+    } else if (forder > 2.5 && forder < 3.5) {
+        fkey = max(rgb.r, max(rgb.g, rgb.b));
+    } else if (forder > 3.5) {
+        float2 half_size = max(float2(size.x, size.y) * 0.5, float2(1.0, 1.0));
+        fkey = saturate(length((p - half_size) / half_size) / 1.4142136);
+    }
+    float fspread = saturate(fade.z) * 0.9;
+    float fk = saturate((saturate(fade.x) - saturate(fkey) * fspread) / (1.0 - fspread));
+    fk = fk * fk * (3.0 - 2.0 * fk);
+    return float4(rgb, fade.w + (1.0 - fade.w) * fk);
+}
+// ==== グーロー（v3.40）ここまで ====
+
 float4 ps_lpbg_grid(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target {
     float2 pos = sv_pos.xy;
     int nx = (int)grid.x;
@@ -873,6 +1077,51 @@ float4 ps_lpbg_grid(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : S
         v2 = mesh_point(cx0 + 1, cy0 + 1);
         tri_id = (float)(cy0 * nx + cx0) * 2.0;
     }
+
+    // ==== グーロー（v3.40）ここから ====
+    // 塗り方がグーローのとき。頂点の格子の番号を三角形の番号から戻す（上のループの v0 / v1 / v2 と同じ並び）
+    if (g_shade > 0.5) {
+        float gcell = floor(tri_id * 0.5 + 0.25);
+        float gcy = floor((gcell + 0.5) / max(grid.x, 1.0));
+        float gcx = gcell - gcy * grid.x;
+        bool godd = (tri_id - gcell * 2.0) > 0.5;
+        bool gdiag = hash21f(float2(gcx, gcy), grid.w + 7.0) < 0.5;
+        float2 i0 = float2(gcx, gcy);
+        float2 i1 = float2(gcx + 1.0, gcy);
+        float2 i2 = gdiag ? float2(gcx + 1.0, gcy + 1.0) : float2(gcx, gcy + 1.0);
+        if (godd) {
+            i0 = gdiag ? float2(gcx, gcy) : float2(gcx + 1.0, gcy);
+            i1 = float2(gcx + 1.0, gcy + 1.0);
+            i2 = float2(gcx, gcy + 1.0);
+        }
+        if (!found) {
+            i0 = float2(cx0, cy0);
+            i1 = float2(cx0 + 1, cy0);
+            i2 = float2(cx0 + 1, cy0 + 1);
+        }
+        float3 wv = lpg_bary(pos, v0, v1, v2);
+        float3 grgb = float3(0.0, 0.0, 0.0);
+        float gfv = 0.0;
+        // 頂点 3 つを [loop] で回す（展開すると色空間の変換が 3 回複製され、最初のフレームのコンパイルが重くなる）
+        [loop]
+        for (int gk = 0; gk < 3; gk++) {
+            float2 giv = (gk == 0) ? i0 : ((gk == 1) ? i1 : i2);
+            float2 gvp = (gk == 0) ? v0 : ((gk == 1) ? v1 : v2);
+            float gw = (gk == 0) ? wv.x : ((gk == 1) ? wv.y : wv.z);
+            float4 gc = lpg_vertex(giv, gvp);
+            grgb += gc.rgb * gw;
+            gfv += gc.w * gw;
+        }
+        grgb = saturate(grgb);
+        if (opt.y > 0.5) {
+            float gd = min(min(dist_seg(pos, v0, v1), dist_seg(pos, v1, v2)), dist_seg(pos, v2, v0));
+            float gea = 1.0 - smoothstep(opt.z * 0.5, opt.z * 0.5 + 1.0, gd);
+            grgb = lerp(grgb, edgec.rgb, gea);
+        }
+        // 明転は頂点の係数を補間して掛ける（明転 OFF なら係数は厳密に 1）
+        return float4(grgb * gfv, 1.0);
+    }
+    // ==== グーロー（v3.40）ここまで ====
 
     float2 cen = (v0 + v1 + v2) / 3.0;
     float grad = anim.w;
@@ -1011,6 +1260,7 @@ local consts = {
   cs_v[1], cs_v[2], cs_v[3], cs_v[4],
   cs_v[5], cs_v[6], cs_v[7], cs_v[8],
   var_space or 3,
+  shading or 0,   -- v3.40: 塗り方（0 = フラット、1 = グーロー）
 }
 
 obj.clearbuffer("object", w, h)

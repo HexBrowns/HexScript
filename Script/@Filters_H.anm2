@@ -174,7 +174,7 @@ else
 end
 
 @グレイン
---information:グレイン@Filters_H v1.21 by HexBrowns
+--information:グレイン@Filters_H v1.30 by HexBrowns
 --label:HexScript
 --filter
 --track@intensity:強度,0,100,10,0.1
@@ -187,6 +187,12 @@ end
 --check@animated:アニメーション,true
 --select@blend_mode:合成モード=0,加算=0,オーバーレイ=1,ソフトライト=2,乗算=3
 --track@loop:重ねがけ,1,100,1,1
+--select@grain_read:粒の読み方=0,点=0,補間=1,ハッシュ=2
+-- v1.30: 粒の読み方を選べるようにした（初期値の 点 は v1.21 と同じ絵）。
+--   点 … 組み込みの乱数（256x256）を点で読む。粒サイズが小さいと四角い粒、256 マスごとに模様が繰り返す
+--   補間 … 同じ乱数を 4 点のバイリニアで読む。丸く柔らかい粒。1 画素あたりのばらつきは 点 と同じになるよう重みで割り戻す
+--   ハッシュ … 乱数を使わずマスの番号の整数ハッシュで決める。粒の形は 点 と同じ四角で、模様が繰り返さない
+-- 検証器: AI/scripts/Filters_H/verify_noise_modes.py
 --[[pixelshader@grain:
 Texture2D src : register(t0);
 Texture2D noise_tex : register(t1);
@@ -200,7 +206,45 @@ cbuffer constant0 : register(b0) {
     float luminance_balance;
     float blend_mode;
     float noise_offset;
+    float read_mode;
 };
+// v1.30 粒の読み方（正本。@ノイズオーバーレイ の read_noise_no は同じ式の複製。変更時は両方を直す）
+float hash_cell_gr(int2 c) {
+    uint h = ((uint)c.x * 1597334677u) ^ ((uint)c.y * 3812015801u);
+    h = h ^ (h >> 16);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16);
+    return (float)(h & 0x00ffffffu) / 16777216.0;
+}
+float read_grain_gr(float2 p) {
+    float r = 0.0;
+    [branch] if (read_mode < 0.5) {
+        r = noise_tex.Load(int3(int2(uint(p.x) % 256, uint(p.y) % 256), 0)).r;
+    } else if (read_mode < 1.5) {
+        // マスの中心（+0.5）を格子点にしたバイリニア。端は 256 で折り返す（点 と同じ周期）
+        float2 q = p - 0.5;
+        float2 fl = floor(q);
+        float2 f = q - fl;
+        int2 c = (int2)fl;
+        uint x0 = (uint)(c.x + 1024) % 256u;
+        uint y0 = (uint)(c.y + 1024) % 256u;
+        uint x1 = (x0 + 1u) % 256u;
+        uint y1 = (y0 + 1u) % 256u;
+        float a = noise_tex.Load(int3(int2(x0, y0), 0)).r;
+        float b = noise_tex.Load(int3(int2(x1, y0), 0)).r;
+        float e = noise_tex.Load(int3(int2(x0, y1), 0)).r;
+        float d = noise_tex.Load(int3(int2(x1, y1), 0)).r;
+        float bl = lerp(lerp(a, b, f.x), lerp(e, d, f.x), f.y);
+        // 4 点の重みの 2 乗和でばらつきが縮むので割り戻す（マスの中心では 1 で 点 と同じ値）
+        float2 w2 = (1.0 - f) * (1.0 - f) + f * f;
+        r = saturate(0.5 + (bl - 0.5) * rsqrt(max(w2.x * w2.y, 0.0625)));
+    } else {
+        r = hash_cell_gr((int2)floor(p));
+    }
+    return r;
+}
 float4 grain(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float4 col = src.Load(int3(pos.xy, 0));
     // x と y に同じ値を足すと、重ねがけの回ごとにノイズが対角へ平行移動し、
@@ -212,19 +256,19 @@ float4 grain(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float2 nuv_r = nuv;
     float2 nuv_g = nuv + float2(85.37, 127.91);
     float2 nuv_b = nuv + float2(213.45, 67.23);
-    float noise_r = noise_tex.Load(int3(int2(uint(nuv_r.x) % 256, uint(nuv_r.y) % 256), 0)).r;
-    float noise_g = noise_tex.Load(int3(int2(uint(nuv_g.x) % 256, uint(nuv_g.y) % 256), 0)).r;
-    float noise_b = noise_tex.Load(int3(int2(uint(nuv_b.x) % 256, uint(nuv_b.y) % 256), 0)).r;
+    float noise_r = read_grain_gr(nuv_r);
+    float noise_g = read_grain_gr(nuv_g);
+    float noise_b = read_grain_gr(nuv_b);
     if (softness >= 0.01) {
         noise_r = (
-            noise_tex.Load(int3(int2(uint((nuv_r + float2(-s, -s)).x) % 256, uint((nuv_r + float2(-s, -s)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv_r + float2( s, -s)).x) % 256, uint((nuv_r + float2( s, -s)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv_r + float2(-s,  s)).x) % 256, uint((nuv_r + float2(-s,  s)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv_r + float2( s,  s)).x) % 256, uint((nuv_r + float2( s,  s)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv_r + float2(-s,  0)).x) % 256, uint((nuv_r + float2(-s,  0)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv_r + float2( s,  0)).x) % 256, uint((nuv_r + float2( s,  0)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv_r + float2( 0, -s)).x) % 256, uint((nuv_r + float2( 0, -s)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv_r + float2( 0,  s)).x) % 256, uint((nuv_r + float2( 0,  s)).y) % 256), 0)).r +
+            read_grain_gr(nuv_r + float2(-s, -s)) +
+            read_grain_gr(nuv_r + float2( s, -s)) +
+            read_grain_gr(nuv_r + float2(-s,  s)) +
+            read_grain_gr(nuv_r + float2( s,  s)) +
+            read_grain_gr(nuv_r + float2(-s,  0)) +
+            read_grain_gr(nuv_r + float2( s,  0)) +
+            read_grain_gr(nuv_r + float2( 0, -s)) +
+            read_grain_gr(nuv_r + float2( 0,  s)) +
             noise_r
         ) / 9.0;
     }
@@ -301,10 +345,11 @@ obj.copybuffer("tempbuffer", "object")
 for i = 1, loop do
   -- offset を固定すると毎回同じ粒を重ねるだけでコントラストが上がる。
   -- シェーダー内で 256 倍されるので、回ごとに 0.137 (=約35マス) ずらして別の粒にする。
+  -- v1.30: grain_read（0 点 / 1 補間 / 2 ハッシュ）はスロット 8
   obj.pixelshader("grain", "tempbuffer", {"tempbuffer", "random"}, {
     intensity / 100, grain_size, softness / 100,
     is_color and 1 or 0, is_lum and 1 or 0, luminance_balance / 100,
-    blend_mode, offset + (i - 1) * 0.137,
+    blend_mode, offset + (i - 1) * 0.137, grain_read,
   })
 end
 
@@ -2486,7 +2531,7 @@ else
 end
 
 @リキッドディストーション
---information:リキッドディストーション@Filters_H v1.12 by HexBrowns
+--information:リキッドディストーション@Filters_H v1.20 by HexBrowns
 --label:HexScript
 --filter
 --track@amount:強さ,0,100,25,0.1
@@ -2495,6 +2540,11 @@ end
 --track@detail:詳細,1,8,4,0.1
 --select@blend_mode:合成=0,標準=0,透過クランプ=1
 --value@seed:シード,0
+--select@noise_type:ノイズの種類=0,値ノイズ=0,ブロック=1,勾配ノイズ=2
+-- v1.20: ノイズの種類を選べるようにした（初期値の 値ノイズ は v1.12 と同じ絵）。
+--   ブロック … 格子のマスごとに 1 つの値（補間なし）。画像が四角く段々にずれる（v1.00 の段の見た目をわざと選べる形）
+--   勾配ノイズ … 格子点に向きを置く Perlin 型。格子点で 0 になり、うねりが丸くそろう
+-- 検証器: AI/scripts/Filters_H/verify_noise_modes.py
 -- v1.10: 歪みの模様が毎フレーム別物に入れ替わっていた（ちらつき）のを、速度どおりに流れるよう直した。
 -- ノイズの読み取り位置をシードだけで決め（v1.00 はフレームごとの乱数でずらしていた）、
 -- ノイズを補間付きの値ノイズにした（v1.00 は乱数バッファを点で読んでいて段が出た）。
@@ -2520,6 +2570,7 @@ cbuffer constant0 : register(b0) {
     float noise_offset;
     float blend_mode;
     float2 pad;
+    float noise_type;
 };
 // 格子点ごとの整数ハッシュ（0〜1）と、それを smoothstep で補間した値ノイズ（v1.10）。
 // 組み込みの乱数バッファ（"random"）を点で読む v1.00 は、読み取り位置が整数を越えるたびに
@@ -2545,11 +2596,41 @@ float value_noise_lq(float2 p) {
     float d = hash_cell_lq(c + int2(1, 1));
     return lerp(lerp(a, b, u.x), lerp(e, d, u.x), u.y);
 }
+// v1.20 ブロック: マスの値をそのまま使う（補間なし）
+float block_noise_lq(float2 p) {
+    return hash_cell_lq((int2)floor(p));
+}
+// v1.20 勾配ノイズ: 格子点の向き（ハッシュから角度）と、そこからの距離の内積を 5 次の重みで補間する。
+// 値は ±√0.5 に収まるので √2 倍して 0〜1 に写す（fbm の |v| < 1 は値ノイズと同じに保つ）
+float grad_corner_lq(int2 c, float2 f) {
+    float ang = hash_cell_lq(c) * 6.28318530718;
+    return dot(float2(cos(ang), sin(ang)), f);
+}
+float grad_noise_lq(float2 p) {
+    float2 i = floor(p);
+    float2 f = p - i;
+    float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    int2 c = (int2)i;
+    float a = grad_corner_lq(c, f);
+    float b = grad_corner_lq(c + int2(1, 0), f - float2(1.0, 0.0));
+    float e = grad_corner_lq(c + int2(0, 1), f - float2(0.0, 1.0));
+    float d = grad_corner_lq(c + int2(1, 1), f - float2(1.0, 1.0));
+    float g = lerp(lerp(a, b, u.x), lerp(e, d, u.x), u.y);
+    return saturate(0.5 + g * 0.70710678);
+}
 float fbm(float2 p, float d) {
     float v = 0.0, a = 0.5;
     for (int i = 0; i < 8; ++i) {
         if (i >= (int)d) break;
-        v += a * (value_noise_lq(p) * 2.0 - 1.0);
+        float nz = 0.0;
+        [branch] if (noise_type < 0.5) {
+            nz = value_noise_lq(p);
+        } else if (noise_type < 1.5) {
+            nz = block_noise_lq(p);
+        } else {
+            nz = grad_noise_lq(p);
+        }
+        v += a * (nz * 2.0 - 1.0);
         p *= 2.0;
         a *= 0.5;
     }
@@ -2620,12 +2701,13 @@ if pad_x > 0 or pad_y > 0 then
 end
 
 -- v1.12: 端へ寄せた uv は端の色で読む（"clamp"。省くと範囲外の透明と半々に混ざる）
+-- v1.20: noise_type（0 値ノイズ / 1 ブロック / 2 勾配ノイズ）は pad の後ろのスロット 10
 obj.pixelshader("ps_liquid", "object", {"object"}, {
-  amount / 100, scale, time, detail, W, H, offset, blend_mode, pad_x, pad_y,
+  amount / 100, scale, time, detail, W, H, offset, blend_mode, pad_x, pad_y, noise_type,
 }, "copy", "clamp")
 
 @シマー
---information:シマー@Filters_H v1.22 by HexBrowns
+--information:シマー@Filters_H v1.30 by HexBrowns
 --label:HexScript
 --filter
 --track@amount:強さ,0.001,10.000,0.1,0.001
@@ -2633,6 +2715,12 @@ obj.pixelshader("ps_liquid", "object", {"object"}, {
 --track@speed:速度,0,100,25,0.1
 --track@angle:角度,-180,180,0,0.1
 --value@seed:シード,0
+--select@noise_type:ノイズの種類=0,値ノイズ=0,ブロック=1,勾配ノイズ=2
+-- v1.30: ノイズの種類を選べるようにした（初期値の 値ノイズ は v1.22 と同じ絵）。
+--   ブロック … 格子のマスごとに 1 つの値（補間なし）。揺れが四角いマスごとに段々になる
+--   勾配ノイズ … 格子点に向きを置く Perlin 型。うねりが丸くそろう
+-- 正本: @リキッドディストーション の block_noise_lq / grad_noise_lq（同じ式の複製。変更時は両方を直す）
+-- 検証器: AI/scripts/Filters_H/verify_noise_modes.py
 -- v1.10: 変位の単位を画素に直した。v1.00 は ±0.05 に clamp した値をさらに img_size で割っており、
 -- 強さ・スケールを最大にしても 0.05px しか動かなかった（＝何も起きない）。
 -- いまは 強さ 1.0 で ±10px、上限は短辺の 5%（強さ最大でも 1080p なら ±54px）。
@@ -2658,6 +2746,7 @@ cbuffer constant0 : register(b0) {
     float2 img_size;
     float noise_offset;
     float2 pad;
+    float noise_type;
 };
 // 格子点ごとの整数ハッシュ（0〜1）と、それを smoothstep で補間した値ノイズ（v1.10）。
 // 組み込みの乱数バッファ（"random"）を点で読む v1.00 は、読み取り位置が整数を越えるたびに
@@ -2683,13 +2772,42 @@ float value_noise_sh(float2 p) {
     float d = hash_cell_sh(c + int2(1, 1));
     return lerp(lerp(a, b, u.x), lerp(e, d, u.x), u.y);
 }
+// v1.30 ブロック / 勾配ノイズ（正本は @リキッドディストーション の block_noise_lq / grad_noise_lq）
+float block_noise_sh(float2 p) {
+    return hash_cell_sh((int2)floor(p));
+}
+float grad_corner_sh(int2 c, float2 f) {
+    float ang = hash_cell_sh(c) * 6.28318530718;
+    return dot(float2(cos(ang), sin(ang)), f);
+}
+float grad_noise_sh(float2 p) {
+    float2 i = floor(p);
+    float2 f = p - i;
+    float2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    int2 c = (int2)i;
+    float a = grad_corner_sh(c, f);
+    float b = grad_corner_sh(c + int2(1, 0), f - float2(1.0, 0.0));
+    float e = grad_corner_sh(c + int2(0, 1), f - float2(0.0, 1.0));
+    float d = grad_corner_sh(c + int2(1, 1), f - float2(1.0, 1.0));
+    float g = lerp(lerp(a, b, u.x), lerp(e, d, u.x), u.y);
+    return saturate(0.5 + g * 0.70710678);
+}
 float4 ps_shimmer(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     // v1.21: img_size は元の画像の大きさ、pad は広げた余白（px）。バッファは img_size + 2 * pad。
     // 模様と上限は元の画像で決める（広げても元の画像の上の揺れ方は同じ。pad 0 なら v1.20 と同じ式）
     float2 buf = max(img_size + 2.0 * pad, float2(1,1));
     float2 p = (pos.xy - pad) / max(img_size, float2(1,1));
     float wave = sin(dot(p, dir) * scale * 20.0 + time * 6.28318);
-    float n = value_noise_sh(p * scale * 80.0 + float2(time, noise_offset * 10.0)) * 2.0 - 1.0;
+    float2 np_sh = p * scale * 80.0 + float2(time, noise_offset * 10.0);
+    float nz = 0.0;
+    [branch] if (noise_type < 0.5) {
+        nz = value_noise_sh(np_sh);
+    } else if (noise_type < 1.5) {
+        nz = block_noise_sh(np_sh);
+    } else {
+        nz = grad_noise_sh(np_sh);
+    }
+    float n = nz * 2.0 - 1.0;
     // disp は**画素**。強さ 1.0 で ±10px になるようにし、上限は短辺の 5% に収める。
     // v1.00 は uv 相当の ±0.05 に clamp してから img_size で割っていたため、
     // どの設定でも 0.05px しか動かなかった。
@@ -2757,8 +2875,9 @@ end
 -- スロット3にダミーを詰めないと dir/img_size/noise_offset が1つずつずれる。
 -- pad（float2）は noise_offset の後ろのスロット 9-10（同じ 16 バイトに収まる）。
 -- v1.22: 端の半画素は端の色で読む（"clamp"。省くと範囲外の透明と混ざる）
+-- v1.30: noise_type（0 値ノイズ / 1 ブロック / 2 勾配ノイズ）は pad の後ろのスロット 11
 obj.pixelshader("ps_shimmer", "object", {"object"}, {
-  amount, scale, time, 0, dx, dy, W, H, offset, pad_x, pad_y,
+  amount, scale, time, 0, dx, dy, W, H, offset, pad_x, pad_y, noise_type,
 }, "copy", "clamp")
 
 @フォグヘイズ
@@ -3668,7 +3787,7 @@ obj.pixelshader("ps_barrel_premium", "object", "object", {
 }, "copy", "clamp")
 
 @ノイズオーバーレイ
---information:ノイズオーバーレイ@Filters_H v1.00 by HexBrowns
+--information:ノイズオーバーレイ@Filters_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@intensity:強度,0,100,20,0.1
@@ -3678,6 +3797,11 @@ obj.pixelshader("ps_barrel_premium", "object", "object", {
 --check@animated:アニメーション,true
 --select@blend_mode:合成=0,加算=0,オーバーレイ=1,乗算=2
 --value@seed:シード,0
+--select@grain_read:粒の読み方=0,点=0,補間=1,ハッシュ=2
+-- v1.10: 粒の読み方を選べるようにした（初期値の 点 は v1.00 と同じ絵）。中身は @グレイン v1.30 と同じ
+--   点 … 組み込みの乱数（256x256）を点で読む / 補間 … 4 点のバイリニアで丸い粒 / ハッシュ … 整数ハッシュで模様が繰り返さない
+-- 正本: @グレイン の read_grain_gr（同じ式の複製。変更時は両方を直す）
+-- 検証器: AI/scripts/Filters_H/verify_noise_modes.py
 --[[pixelshader@ps_noise_overlay:
 Texture2D src : register(t0);
 Texture2D noise_tex : register(t1);
@@ -3689,18 +3813,53 @@ cbuffer constant0 : register(b0) {
     float color_mode;
     float blend_mode;
     float noise_offset;
+    float read_mode;
 };
+float hash_cell_no(int2 c) {
+    uint h = ((uint)c.x * 1597334677u) ^ ((uint)c.y * 3812015801u);
+    h = h ^ (h >> 16);
+    h = h * 2246822519u;
+    h = h ^ (h >> 13);
+    h = h * 3266489917u;
+    h = h ^ (h >> 16);
+    return (float)(h & 0x00ffffffu) / 16777216.0;
+}
+float read_noise_no(float2 p) {
+    float r = 0.0;
+    [branch] if (read_mode < 0.5) {
+        r = noise_tex.Load(int3(int2(uint(p.x) % 256, uint(p.y) % 256), 0)).r;
+    } else if (read_mode < 1.5) {
+        float2 q = p - 0.5;
+        float2 fl = floor(q);
+        float2 f = q - fl;
+        int2 c = (int2)fl;
+        uint x0 = (uint)(c.x + 1024) % 256u;
+        uint y0 = (uint)(c.y + 1024) % 256u;
+        uint x1 = (x0 + 1u) % 256u;
+        uint y1 = (y0 + 1u) % 256u;
+        float a = noise_tex.Load(int3(int2(x0, y0), 0)).r;
+        float b = noise_tex.Load(int3(int2(x1, y0), 0)).r;
+        float e = noise_tex.Load(int3(int2(x0, y1), 0)).r;
+        float d = noise_tex.Load(int3(int2(x1, y1), 0)).r;
+        float bl = lerp(lerp(a, b, f.x), lerp(e, d, f.x), f.y);
+        float2 w2 = (1.0 - f) * (1.0 - f) + f * f;
+        r = saturate(0.5 + (bl - 0.5) * rsqrt(max(w2.x * w2.y, 0.0625)));
+    } else {
+        r = hash_cell_no((int2)floor(p));
+    }
+    return r;
+}
 float4 ps_noise_overlay(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float4 c = src.Sample(smp, uv);
     float2 nuv = pos.xy * scale + noise_offset * 256.0;
     float s = softness * 8.0;
-    float base_noise = noise_tex.Load(int3(int2(uint(nuv.x) % 256, uint(nuv.y) % 256), 0)).r;
+    float base_noise = read_noise_no(nuv);
     if (softness >= 0.01) {
         base_noise = (
-            noise_tex.Load(int3(int2(uint((nuv + float2(-s, 0)).x) % 256, uint((nuv + float2(-s, 0)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv + float2( s, 0)).x) % 256, uint((nuv + float2( s, 0)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv + float2(0, -s)).x) % 256, uint((nuv + float2(0, -s)).y) % 256), 0)).r +
-            noise_tex.Load(int3(int2(uint((nuv + float2(0,  s)).x) % 256, uint((nuv + float2(0,  s)).y) % 256), 0)).r +
+            read_noise_no(nuv + float2(-s, 0)) +
+            read_noise_no(nuv + float2( s, 0)) +
+            read_noise_no(nuv + float2(0, -s)) +
+            read_noise_no(nuv + float2(0,  s)) +
             base_noise
         ) * 0.2;
     }
@@ -3709,8 +3868,8 @@ float4 ps_noise_overlay(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Ta
     if (color_mode > 0.5) {
         float2 nuv_g = nuv + float2(23.7, 9.9);
         float2 nuv_b = nuv + float2(37.5, 15.2);
-        float noise_g = noise_tex.Load(int3(int2(uint(nuv_g.x) % 256, uint(nuv_g.y) % 256), 0)).r;
-        float noise_b = noise_tex.Load(int3(int2(uint(nuv_b.x) % 256, uint(nuv_b.y) % 256), 0)).r;
+        float noise_g = read_noise_no(nuv_g);
+        float noise_b = read_noise_no(nuv_b);
         noise_rgb = float3(noise_val, (noise_g - 0.5) * 2.0 * intensity, (noise_b - 0.5) * 2.0 * intensity);
     }
     float3 rgb = c.a > 0.001 ? c.rgb / c.a : c.rgb;
@@ -3738,8 +3897,9 @@ local is_color = noise.as_bool(color_mode, false)
 local is_anim = noise.as_bool(animated, true)
 local offset = noise.noise_offset(seed, obj.frame, is_anim)
 
+-- v1.10: grain_read（0 点 / 1 補間 / 2 ハッシュ）はスロット 6
 obj.pixelshader("ps_noise_overlay", "object", {"object", "random"}, {
-  intensity / 100, scale, softness / 100, is_color and 1 or 0, blend_mode, offset,
+  intensity / 100, scale, softness / 100, is_color and 1 or 0, blend_mode, offset, grain_read,
 })
 
 @バイブランス
@@ -8355,10 +8515,11 @@ if data == nil or dw ~= W or dh ~= H then return end
 if mod.render(id, data, W, H) == 1 then obj.putpixeldata("object", data, W, H, "rgba") end
 
 @色ノイズ
---information:色ノイズ@Filters_H v1.00 by HexBrowns
+--information:色ノイズ@Filters_H v1.10 by HexBrowns
 --label:HexScript
 --filter
 --select@color_space:色空間=4,HSL=4,Oklch=7
+--select@distribution:分布=0,一様=0,正規分布=1,二値=2
 --group:量,true
 --track@amount_h:色相,0,1000,0,0.01
 --track@amount_s:彩度,0,1000,0,0.01
@@ -8377,7 +8538,10 @@ if mod.render(id, data, W, H) == 1 then obj.putpixeldata("object", data, W, H, "
 --      輝度 を Oklab の L に足す。sRGB に無い色は明るさと色相を保ったまま C を下げて収める（共有部品 AI/tools/assets/colorspace.hlsl）
 --   2. 量がすべて 0 なら何もしない（原作は HSL へ往復するので、1 を超える値を切り詰める）
 --   3. 項目名を日本語にした。ほかのスクリプトから値を渡す欄（原作の _0）は持たない
--- 検証器: AI/scripts/Filters_H/verify_colorspace_ext.py / 仕様: AI/specifications/20261013_色空間拡張_spec.md
+--   4. v1.10: 乱数の分布を選べるようにした（初期値の 一様 は v1.00・原作と同じ絵）
+--      正規分布 … 同じ乱数 4 つを Box-Muller で 4 つの正規乱数にし、標準偏差を 一様 と同じ 量/√12 にする（大半は小さく、時々大きく外れる）
+--      二値 … ±量/2 のどちらか（一様 の乱数が 0.5 未満なら −、以上なら +）
+-- 検証器: AI/scripts/Filters_H/verify_colorspace_ext.py・verify_noise_modes.py / 仕様: AI/specifications/20261013_色空間拡張_spec.md
 --[[pixelshader@ps_color_noise:
 /*
 The following function is a modified version of pcg4d function
@@ -8414,6 +8578,7 @@ cbuffer params : register(b0) {
     float4 amount;
     float2 seed;
     float color_space;
+    float distribution;
 }
 
 // ==== colorspace.hlsl ここから（AI/tools/sync_colorspace.py が書き写す。直すのは正本） ====
@@ -8878,7 +9043,18 @@ ps_color_noise(float4 pos : SV_Position) : SV_Target {
     float4 src = tex.Load(int3(pos.xy, 0));
     src.rgb *= rcp(max(src.a, eps));
 
-    const float4 r = (hash4d(pos.xy, seed) - 0.5) * amount;
+    const float4 h = hash4d(pos.xy, seed);
+    float4 r = (h - 0.5) * amount;
+    // v1.10（HexBrowns）: 分布。1 正規分布（Box-Muller、標準偏差 量/√12）/ 2 二値（±量/2）
+    [branch] if (distribution > 1.5) {
+        r = float4(h.x < 0.5 ? -0.5 : 0.5, h.y < 0.5 ? -0.5 : 0.5,
+                   h.z < 0.5 ? -0.5 : 0.5, h.w < 0.5 ? -0.5 : 0.5) * amount;
+    } else if (distribution > 0.5) {
+        const float2 rad = sqrt(-2.0 * log(max(h.xz, 1.0e-7)));
+        const float2 ang = h.yw * 6.28318530718;
+        r = float4(rad.x * cos(ang.x), rad.x * sin(ang.x), rad.y * cos(ang.y), rad.y * sin(ang.y))
+            * 0.28867513 * amount;
+    }
     [branch] if (color_space > 6.5) {
         // Oklch（HexBrowns）。色相は周、彩度は C（量 1 で ±0.2）、輝度は Oklab の L に足す
         float4 sc = saturate(src);
@@ -8911,5 +9087,5 @@ if amount_h < eps and amount_s < eps and amount_l < eps and amount_a < eps then 
 -- 原作と同じ: 負のシードはそのまま（全オブジェクトで同じ）、正のシードはレイヤーを足す。乱数の種の 2 つ目は画素数
 local sd = seed < 0 and -seed or obj.layer + seed
 obj.pixelshader("ps_color_noise", "object", "object", {
-  amount_h * 0.01, amount_s * 0.01, amount_l * 0.01, amount_a * 0.01, sd, W * H, color_space,
+  amount_h * 0.01, amount_s * 0.01, amount_l * 0.01, amount_a * 0.01, sd, W * H, color_space, distribution,
 })
