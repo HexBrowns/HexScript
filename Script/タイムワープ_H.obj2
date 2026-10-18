@@ -1,4 +1,4 @@
---information:タイムワープ_H v1.00 by HexBrowns
+--information:タイムワープ_H v1.10 by HexBrowns
 --label:HexScript
 --object
 
@@ -39,6 +39,9 @@ After Effects の「タイムワープ」に当たるカスタムオブジェク
   （窓 5x5、各段 3 回）。動きの解像度で計算の細かさを落とせる（1/2 で 4 倍速い）。
   前後で色が合わない所（隠れていた物が出てくる所など）は、破綻を混合で隠す で混合に切り替える
 - フレーム番号は 0 始まり（obj.load("movie.frame")）。前のフレームを最後に読み込むので、オブジェクトの大きさは動画の大きさ
+- v1.10: 前後のフレームと求めた動きをオブジェクトごとのキャッシュに残し、同じ組（スローで続く数枚、モーションブラーの
+  参照フレーム）では読み込みと動きの計算を飛ばす。順に再生して次の組に進んだときは、前の組の後のフレームを使い、読むのは 1 枚。
+  何を残したかは global に覚え、キャッシュが枠を超えて消えていたら（戻した大きさが違えば）求め直す。絵は v1.00 と同じ
 
 机上検証: AI/scripts/タイムワープ_H/verify_timewarp.py
 ]]
@@ -253,13 +256,48 @@ if METHOD == 0 or a < 1e-3 or f1 == f0 then
   return
 end
 
-local A, B = "cache:twp/a", "cache:twp/b"
-obj.load("movie.frame", file, f1)
-obj.copybuffer(B, "object")
-obj.load("movie.frame", file, f0)
-obj.copybuffer(A, "object")
+-- 前後のフレームと求めた動きは、オブジェクトごとのキャッシュに残し、同じ組なら使い回す（v1.10）。
+-- 何を残したかは global に文字列で覚える。キャッシュは枠を超えると黙って消えるので、戻したときの大きさで確かめる
+local G = global
+local ID = tostring(obj.id) .. "_" .. tostring(obj.scene_id or 0)
+local PRE = "cache:twp/" .. ID .. "/"
+local A, B, FL = PRE .. "a", PRE .. "b", PRE .. "flow"
+local GK = "twp_" .. ID
+
+local function fields(s)
+  local t = {}
+  for v in string.gmatch(s or "", "[^\t]+") do t[#t + 1] = v end
+  return t
+end
+
+-- src をオブジェクトに戻し、覚えた大きさと同じなら true
+local function restore(src, w, h)
+  return obj.copybuffer("object", src) == true and obj.w == w and obj.h == h
+end
+
+local ab_ok = false
+local rec = G and fields(G[GK .. "_ab"]) or {}
+local rw, rh = tonumber(rec[4]), tonumber(rec[5])
+if rec[1] == file and rw and rh then
+  if tonumber(rec[2]) == f0 and tonumber(rec[3]) == f1 then
+    ab_ok = restore(B, rw, rh) and restore(A, rw, rh)
+  elseif tonumber(rec[3]) == f0 and restore(B, rw, rh) then
+    -- 順に再生しているとき: 前の組の後のフレームが、今の組の前のフレーム。読むのは 1 枚で済む
+    obj.copybuffer(A, "object")
+    obj.load("movie.frame", file, f1)
+    obj.copybuffer(B, "object")
+    ab_ok = restore(A, rw, rh)
+  end
+end
+if not ab_ok then
+  obj.load("movie.frame", file, f1)
+  obj.copybuffer(B, "object")
+  obj.load("movie.frame", file, f0)
+  obj.copybuffer(A, "object")
+end
 local W, H = obj.w, obj.h
 if W <= 0 or H <= 0 then return end
+if G then G[GK .. "_ab"] = table.concat({file, f0, f1, W, H}, "\t") end
 
 if METHOD == 1 then
   obj.pixelshader("ps_twp_mix", "object", {A, B}, {W, H, a}, "copy", "clamp")
@@ -275,6 +313,13 @@ while #levels < 6 do
   if math.min(w, h) < 64 then break end
   levels[#levels + 1] = {math.ceil(w / 2), math.ceil(h / 2)}
 end
+local sm = math.max(num(flow_smooth, 2), 0)
+local fw, fh = levels[1][1], levels[1][2]
+
+-- 動きは前後のフレームの組と、動きの解像度・滑らかさだけで決まる（割合 a には依存しない）
+local fkey = table.concat({"v110", file, f0, f1, W, H, S, sm}, "\t")
+local flow_ok = G ~= nil and G[GK .. "_flow"] == fkey and restore(FL, fw, fh) and restore(A, W, H)
+if not flow_ok then
 
 -- 明るさの縮小階層（r = 前、g = 後）
 local function lum_name(k) return "cache:twp/l" .. k end
@@ -305,8 +350,6 @@ for k = #levels, 1, -1 do
   end
 end
 
-local sm = math.max(num(flow_smooth, 2), 0)
-local fw, fh = levels[1][1], levels[1][2]
 if sm > 0 then
   obj.clearbuffer(other, fw, fh)
   obj.pixelshader("ps_twp_gauss", other, {cur}, {fw, fh, 1, 0, sm}, "copy", "clamp")
@@ -315,8 +358,14 @@ if sm > 0 then
   obj.pixelshader("ps_twp_gauss", other, {cur}, {fw, fh, 0, 1, sm}, "copy", "clamp")
   cur, other = other, cur
 end
+obj.copybuffer(FL, cur)
+if G then G[GK .. "_flow"] = fkey end
+-- 確かめる途中で動きをオブジェクトに戻していることがあるので、前のフレームに戻す（出力の大きさ = 動画の大きさ）
+obj.copybuffer("object", A)
 
-obj.pixelshader("ps_twp_warp", "object", {A, B, cur}, {
+end -- not flow_ok
+
+obj.pixelshader("ps_twp_warp", "object", {A, B, FL}, {
   W, H, fw, fh,
   a, S, (hide_break == 1) and 1 or 0, (show_flow == 1) and 1 or 0,
 }, "copy", "clamp")

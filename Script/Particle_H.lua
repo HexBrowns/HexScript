@@ -14,7 +14,8 @@ local abs, max, min, pi, huge = math.abs, math.max, math.min, math.pi, math.huge
 local RAD = pi / 180
 
 local M = {}
-M.VERSION = "0.19.0"      -- v0.19.0: ノイズ場の元のノイズ（勾配ノイズ・ブロック）、積分法（陽的オイラー・RK4）と刻みの倍率を足した（既定は今までの計算）
+M.VERSION = "0.19.1"      -- v0.19.1: 終了時に消えるを、寿命を縮める作りから「終わりまでに消え終わらない粒子は生まない」に直した
+                          -- v0.19.0:ノイズ場の元のノイズ（勾配ノイズ・ブロック）、積分法（陽的オイラー・RK4）と刻みの倍率を足した（既定は今までの計算）
                           -- v0.18.0: 色の変化・軌跡（帯）の補間に色空間と色相経路、出た所の色の近い色選びに色差を足した（既定は今までの計算）
 -- 焼き付けのシグネチャに入れる版。同じ設定で動き（位置と回転）が変わるか、ファイルの形が変わる版でだけ上げる。
 -- 機能を足しただけの版で M.VERSION を入れると、既定のまま動きが同じでも焼き付けが全部「設定と違う」になり、
@@ -3050,7 +3051,8 @@ M.zoom_alpha = zoom_alpha
 --[[
 cfg（呼び手が作る）:
   now       シミュレーション時刻（秒）
-  t_end     シミュレーション時刻での終わり（終了時に消える）
+  t_end     シミュレーション時刻での終わり
+  t_vanish  終了時に消えるの終わり（シミュレーション時刻。無ければ t_end。ループでは今の時刻からオブジェクトの残りの時間だけ先）
   sk        M.seed_key(...)
   sync      同時発生数（整数）
   rate      M.rate_table / M.rate_const
@@ -3059,7 +3061,8 @@ cfg（呼び手が作る）:
                   name: speed dir spread zdir zspread life accel gx gy gz rx0 ry0 rz0 vrx vry vrz zoom0 zoom1 alpha0 alpha1
   rot_random  0=指定どおり / 1=Z軸だけランダム / 2=XYZ ランダム
   revrot      逆回転
-  vanish_at_end
+  vanish_at_end  終了時に消える: 生まれてから消えるまで（子粒子を出すなら、子が消えるまで）が終わりに収まる粒子だけを生む。
+                 寿命は縮めない。止まったら残すの粒子も寿命で消す（残さない）
   obj_time(t) シミュレーション時刻 → オブジェクトの時刻（回転の「放射時角度増減」と「オブジェクト基準の拡大率・透過率」に使う）
   emit / rot / zoal / indiv   拡張の設定（無ければ nil）
 ]]
@@ -3101,7 +3104,10 @@ function M.simulate(cfg)
   -- 下限の時刻が 0 以下なら最初から数える（count(0) は時刻 0 の一斉に出す分を含むので、それを飛ばさない）
   -- 子粒子は親が消えた後も子の生存時間だけ残るので、その分の親も見る。止まったら残すは、窓より前の 残す数 個も見る
   local CD = cfg.child
-  local KP = P and P.keep
+  -- 終了時に消える（v0.19.1）: 誕生時刻 ＋ 寿命 ＋ 子の寿命 が VT を越える粒子は生まない。止まったら残すは効かせない
+  local VT = cfg.vanish_at_end and (cfg.t_vanish or cfg.t_end) or nil
+  local VTAIL = CD and CD.life or 0
+  local KP = P and not VT and P.keep or nil
   local LOOPE = cfg.loop_e
   -- 子粒子に動きの拡張を掛ける（v0.15.0）: 親と同じ風・ノイズ場・力場・跳ね返りで、子も積分する。集結点・分散と停止・
   -- 時間の窓・止まったら残す・挙動不審・速度倍率・速度の関数・履歴は子には掛けない。状態は子の番号ごとに取っておく
@@ -3148,7 +3154,7 @@ function M.simulate(cfg)
       local L = track("life", b)
       if indiv and indiv.life ~= 0 then L = vary(L, indiv.life, rnd(ik, CH.life, skp)) end
       L = max(L, 0.001)
-      if cfg.vanish_at_end then L = min(L, -b + cfg.t_end) end
+      if VT and b + L + VTAIL > VT + 1e-9 then return nil end
       local px, py, pz, odir, ozd, avx, avy, avz = emit_pos(emit, (emit and emit.same_pos) and ew or k, b, skp)
       if px == nil then return nil end
       local dir = (odir or track("dir", b)) + (rnd(k, CH.dir, skp) * 2 - 1) * track("spread", b)
@@ -3297,10 +3303,11 @@ function M.simulate(cfg)
           local L = (TC_life or track("life", b))
           if indiv and indiv.life ~= 0 then L = vary(L, indiv.life, rnd(ik, CH.life, sk)) end
           L = max(L, 0.001)
-          if cfg.vanish_at_end then L = min(L, cfg.t_end - b) end
+          -- 終了時に消える: 終わりまでに（子も）消え終わらない粒子は生まない
+          local born = not VT or b + L + VTAIL <= VT + 1e-9
           -- 寿命を過ぎた粒子も、子粒子を出すか止まって残るなら計算する（年齢は寿命で止める）
           local over = age >= L
-          if (not over or CD or KP) and (not emit_win or in_window(emit_win, cfg.obj_time(b))) then
+          if born and (not over or CD or KP) and (not emit_win or in_window(emit_win, cfg.obj_time(b))) then
             if n >= cap then
               overflow = overflow + 1
             else

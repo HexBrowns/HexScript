@@ -1,5 +1,5 @@
 @本体
---information:本体@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:本体@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --group:出力
 --track@speed:出力速度,0,10000,200,0.01
@@ -597,7 +597,7 @@ local motion_parts = {}
 for _, p_ in ipairs(sig_parts) do
   if bake_keep_look or not LOOK_NAMES[p_:match("^([^=]+)")] then motion_parts[#motion_parts + 1] = p_ end
 end
-sig_motion = table.concat(motion_parts, ",") .. sig_rest .. "|" .. ser(e_rot) .. ser(X.child) .. ser(X.gather) .. ser(e_grid) ..
+sig_motion = table.concat(motion_parts, ",") .. sig_rest .. (on(vanish) and "|va1" or "") .. "|" .. ser(e_rot) .. ser(X.child) .. ser(X.gather) .. ser(e_grid) ..
   (e_trail and ser({ e_trail.mode, e_trail.n, e_trail.dt }) or "") .. (e_audio and ser({ e_audio.spread }) or "")
 end
 _G.Particle_H_cache = _G.Particle_H_cache or {}
@@ -716,6 +716,10 @@ local scfg = {
   need_tb = (e_filt and (e_filt.base == 3 or e_filt.base == 4)) or (e_color and (e_color.mode == 6 or e_color.mode == 7)) or nil,
   need_fb = (e_filt and e_filt.base == 4) or (e_color and e_color.mode == 7) or nil, colsrc = (e_color and e_color.mode == 5) and e_color.levels or nil,
 }
+-- 終了時に消える（v0.19.1）: 最後のフレーム（総時間の 1 フレーム手前）で粒子が残らないよう、そこまでに消え終わる粒子だけを生む。
+-- ループでは時刻を周期で巻くので、終わりは今の時刻からオブジェクトの残りの時間だけ先
+scfg.t_vanish = total + start - 1 / fps
+if loop_e and not X.time.tp_on and not reverse then scfg.t_vanish = now + (total - 1 / fps - obj.time) end
 -- 焼き付けを書くときは、跳ね返った年齢・分散した年齢も書く（読んだ後に拡大率・透過率・色を計算し直すため）
 if bake_path and e_bake.mode == 1 then scfg.need_tb, scfg.need_td = true, true end
 if BR and not bake_keep_look then P.relook(BR, scfg) end
@@ -1189,7 +1193,7 @@ if on(diag) then
 end
 
 @出力位置
---information:出力位置@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:出力位置@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@shape:出力の形=1,点=0,線=1,線を走る=2,箱=3,球=4,他レイヤーを追う=5,他レイヤーの形=6,関数=7,自分の画像を並べる=8,文字の並び=9,渡された粒子=10
 --track@npts:アンカー数,2,16,2,1
@@ -1292,7 +1296,7 @@ box.emit = {
 }
 
 @回転
---information:回転@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:回転@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --group:揺れ
 --track@swing_speed:揺れ速度,0,36000,60,0.01
@@ -1340,7 +1344,7 @@ box.rot = {
 }
 
 @拡大率と透過率
---information:拡大率と透過率@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:拡大率と透過率@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --track@zoom0:始拡大率,0,5000,100,0.01
 --track@zoom1:終拡大率,0,5000,100,0.01
@@ -1404,7 +1408,7 @@ box.zoal = {
 }
 
 @個別微調整
---information:個別微調整@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:個別微調整@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --group:ばらつき(正の値は元の値の%・負の値は幅)
 --track@i_speed:速度,-10000,10000,0,0.01
@@ -1438,7 +1442,7 @@ box.indiv = {
 }
 
 @風
---information:風@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:風@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --track@wx:風力X,-10000,10000,100,0.01
 --track@wy:風力Y,-10000,10000,0,0.01
@@ -1469,7 +1473,7 @@ box.wind = {
 }
 
 @ノイズ場
---information:ノイズ場@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:ノイズ場@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --track@nstr:強さ,0,100000,300,0.01
 --track@nscale:大きさ,1,10000,200,0.01
@@ -1497,7 +1501,7 @@ box.noise = {
 }
 
 @集結点
---information:集結点@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:集結点@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@cmode:選び方=0,ランダム=0,一番近い点=1,順に巡る=2
 --track@cnum:点の数,1,5,1,1
@@ -1546,7 +1550,7 @@ box.att = {
 }
 
 @跳ね返り
---information:跳ね返り@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:跳ね返り@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --group:面
 --select@bx:X方向の面=0,両面=0,小さい側だけ=1,大きい側だけ=2,なし=3
@@ -1638,7 +1642,7 @@ box.bnc = {
 }
 
 @挙動
---information:挙動@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:挙動@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --group:位置のずれ
 --track@jx:X方向,0,10000,0,0.01
@@ -1690,7 +1694,7 @@ box.beh = {
 }
 
 @分散と停止
---information:分散と停止@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:分散と停止@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --group:分散
 --track@dt:分散タイム,0,600,1,0.001,なし
@@ -1735,7 +1739,7 @@ box.disp = {
 }
 
 @円運動
---information:円運動@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:円運動@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@ocenter:中心=0,出力位置=0,指定=1,範囲からランダム=2
 --value@opos:中心の座標,{0,0,0}
@@ -1771,7 +1775,7 @@ box.orbit = {
 }
 
 @時間の付け替え
---information:時間の付け替え@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:時間の付け替え@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --check@tp_on:進行時間を使う,0
 --track@tp:進行時間,-9999,9999,0,0.001
@@ -1816,7 +1820,7 @@ box.time = {
 }
 
 @素材
---information:素材@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:素材@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@kind:素材=0,元の画像=0,切り抜き=1,図形=2,画像フォルダ=3,テキスト=4,動画=5
 --group:切り抜きの設定
@@ -1956,7 +1960,7 @@ _G.Particle_H_ext[obj.id] = box
 box.mat = m
 
 @フィルター
---information:フィルター@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:フィルター@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --string@fname:効果名,ぼかし
 --string@fitem:変化させる項目,範囲
@@ -1990,7 +1994,7 @@ box.filt = {
 }
 
 @色の変化
---information:色の変化@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:色の変化@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@cmode:色の決め方=0,寿命で変える=0,ランダム=1,同時発生の組でランダム=2,速さで変える=3,奥行きで変える=4,出た所の色=5,跳ね返ってから=6,跳ね返るまで=7
 --track@cnum:色の数,1,4,2,1
@@ -2079,7 +2083,7 @@ box.color = {
 }
 
 @軌跡
---information:軌跡@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:軌跡@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@tmode:軌跡の形=0,粒子を並べる=0,帯=1,速度で伸ばす=2
 --track@tnum:尻尾の数,1,32,8,1
@@ -2122,7 +2126,7 @@ box.trail = {
 }
 
 @ファンネル
---information:ファンネル@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:ファンネル@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --track@fnum:数,0,50,3,1
 --track@frad:半径,0,10000,60,0.01
@@ -2154,7 +2158,7 @@ box.fan = {
 }
 
 @メッシュ
---information:メッシュ@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:メッシュ@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@mrule:結び方=0,生まれた順の隣=0,近い粒子=1,三角形で塗る=2
 --track@mdist:結ぶ距離,1,10000,150,0.01
@@ -2197,7 +2201,7 @@ box.mesh = {
 }
 
 @格子
---information:格子@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:格子@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@gmode:格子の形=0,直交=0,極座標=1
 --track@gsx:間隔X,0,10000,20,0.01,なし
@@ -2230,7 +2234,7 @@ box.grid = {
 }
 
 @立体物
---information:立体物@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:立体物@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@stype:立体の形=0,六面体=0,球=1,錐体=2,双錐体=3,曲面=4,厚み=5,モデル=6
 --track@ssize:大きさ,0,4000,0,0.01,素材の大きさ
@@ -2265,7 +2269,7 @@ box.solid = {
 }
 
 @ガラス化
---information:ガラス化@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:ガラス化@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --track@gref:屈折,-1000,1000,40,0.01
 --track@gwid:縁の幅,1,500,16,0.01
@@ -2283,7 +2287,7 @@ box.glass = {
 }
 
 @音
---information:音@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:音@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@asrc:音=0,編集中の音=0,音声ファイル=1
 --file@afile:音声ファイル
@@ -2329,7 +2333,7 @@ box.audio = {
 }
 
 @カスタム描画
---information:カスタム描画@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:カスタム描画@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --file@cfile:関数ファイル
 --track@cvar:種類の数,1,64,4,1
@@ -2360,7 +2364,7 @@ box.custom = {
 }
 
 @力場
---information:力場@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:力場@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@ftype:力の種類=0,渦=0,引力・斥力=1,衝撃波=2,双極=3,浮力=4,画像の明るさ=5
 --value@fpos:中心,{0,0,0,300,0,0}
@@ -2438,7 +2442,7 @@ end
 box.field = { origin = obj.originframe, list = list }
 
 @見た目の調整
---information:見た目の調整@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:見た目の調整@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --group:速さ
 --track@sref:基準の速さ,1,100000,300,0.01
@@ -2479,7 +2483,7 @@ box.look = {
 }
 
 @パス
---information:パス@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:パス@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --track@pnum:アンカー数,2,16,3,1
 --value@ppos:道,{-600,0,0,0,-200,0,600,0,0}
@@ -2520,7 +2524,7 @@ box.path = {
 }
 
 @形へ集まる
---information:形へ集まる@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:形へ集まる@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@gsrc:行き先=0,他レイヤーの形=0,出た所=1,文字の並び=2,アンカー=3
 --track@glayer:対象レイヤー,1,1000,1,1
@@ -2583,7 +2587,7 @@ box.gather = {
 }
 
 @子粒子
---information:子粒子@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:子粒子@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@cevent:出す時=0,消えるとき=0,最初に跳ね返ったとき=1,分散したとき=2,動いている間=3
 --track@cnum:出す数,1,100,8,1
@@ -2612,7 +2616,7 @@ box.child = {
 }
 
 @影
---information:影@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:影@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@smode:落とし方=0,ずらす=0,床に写す=1
 --track@sdx:ずらすX,-10000,10000,20,0.01
@@ -2642,7 +2646,7 @@ box.shadow = {
 }
 
 @受け取って描く
---information:受け取って描く@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:受け取って描く@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --string@rname:受け取る名前,
 --track@rzoom:拡大率,0,5000,100,0.01
@@ -2697,7 +2701,7 @@ end
 obj.setoption("draw_state", true)
 
 @光源
---information:光源@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:光源@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@lkind:光の種類=0,平行光=0,点光源=1
 --track@lx:光の向きX,-10,10,0.5,0.01
@@ -2731,7 +2735,7 @@ box.light = {
 }
 
 @粒子どうし
---information:粒子どうし@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:粒子どうし@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --track@ir:届く距離,1,2000,40,0.01
 --track@irep:反発,0,100000,500,0.01
@@ -2769,7 +2773,7 @@ box.inter = {
 }
 
 @焼き付け
---information:焼き付け@拡張パーティクル_H v0.19.0 by HexBrowns
+--information:焼き付け@拡張パーティクル_H v0.19.1 by HexBrowns
 --label:HexScript
 --select@bmode:焼き付け=0,使わない=0,書き出す=1,読み込む=2
 --folder@bdir:置くフォルダ
