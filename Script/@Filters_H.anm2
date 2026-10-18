@@ -8356,7 +8356,7 @@ obj.pixelshader("ps_sk_final", "object", {"object", "cache:sk/v"}, {
 }, "copy", (full_w > 0) and "clamp" or "dot")
 
 @タイムディスプレイスメント
---information:タイムディスプレイスメント@Filters_H v1.00 by HexBrowns
+--information:タイムディスプレイスメント@Filters_H v1.01 by HexBrowns
 --label:HexScript
 --filter
 --select@source:素材=0,今の絵の履歴=0,動画ファイル=1
@@ -8419,6 +8419,12 @@ end
 -- 状態の鍵（色付き残像・自動レベル補正と同じ。シーン・描画の起点・オブジェクト・効果・個別オブジェクトの番号）
 local id = table.concat({ obj.scene_id or 0, obj.getinfo("origin_scene_id") or 0, obj.id or 0,
                           obj.effect_id or 0, obj.index or 0 }, "/")
+-- v1.01: シーンチェンジ・モーションブラーの参照フレームの描画（本体 2.1.14〜）は別の鍵（別の履歴）にする。
+-- 参照フレームは今より前のフレームを毎フレーム描き直すので、同じ履歴に積むと「前へ戻った」で毎回捨てていた
+local ok_ref, is_ref = pcall(obj.getinfo, "reference_frame")
+if ok_ref and is_ref == true then
+  id = id .. "/ref"
+end
 local use_movie = (source == 1)
 local shift = max_shift
 local blend = (method == 1) and 1 or 0

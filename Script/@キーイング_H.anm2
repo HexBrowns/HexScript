@@ -505,7 +505,7 @@ obj.pixelshader("ps_trackmatte", "tempbuffer", { "tempbuffer", "object" }, {
 obj.copybuffer("object", "tempbuffer")
 
 @動体抽出
---information:動体抽出@キーイング_H v1.10 by HexBrowns
+--information:動体抽出@キーイング_H v1.11 by HexBrowns
 --label:HexScript
 --filter
 --group:比較
@@ -1345,6 +1345,12 @@ else
   -- 履歴: 今のフレームを詰めて読み戻し、リングの f の枠へ。f − 間隔 の枠が同じ番号・同じ設定のときだけ比較元にする
   prepare("cache:md/a", "cache:md/pk")
   local key = table.concat({ obj.scene_id or 0, obj.getinfo("origin_scene_id") or 0, obj.id or 0, obj.index or 0 }, "/")
+  -- v1.11: シーンチェンジ・モーションブラーの参照フレームの描画（本体 2.1.14〜）は別のリングにする。
+  -- 参照フレームは今より前のフレームを描き直すので、同じリングに書くと比較元の枠を上書きしていた
+  local ok_ref, is_ref = pcall(obj.getinfo, "reference_frame")
+  if ok_ref and is_ref == true then
+    key = key .. "/ref"
+  end
   local sig = table.concat({ lw, lh, pw, color, div, pre_blur }, ",")
   local now = obj.getinfo("clock") or 0
   local st = G.states[key]
