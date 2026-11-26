@@ -3605,7 +3605,13 @@ function M.simulate(cfg)
               local mode = cfg.rot_random or 1
               local rx0 = mode == 2 and rnd(k, CH.rx0, sk) * 360 or (TC_rx0 or track("rx0", b))
               local ry0 = mode == 2 and rnd(k, CH.ry0, sk) * 360 or (TC_ry0 or track("ry0", b))
-              local rz0 = mode >= 1 and rnd(k, CH.rz0, sk) * 360 or (TC_rz0 or track("rz0", b))
+              local rz_w = (rot and rot.rz_width) or 360
+              local rz0
+              if mode >= 1 and rz_w < 360 then
+                rz0 = track("rz0", b) + (rnd(k, CH.rz0, sk) - 0.5) * rz_w
+              else
+                rz0 = mode >= 1 and rnd(k, CH.rz0, sk) * 360 or (TC_rz0 or track("rz0", b))
+              end
               local vrx, vry, vrz = (TC_vrx or track("vrx", b)), (TC_vry or track("vry", b)), (TC_vrz or track("vrz", b))
               if indiv then
                 vrx = vary(vrx, indiv.vrx, rnd(ik, CH.vrx, sk))

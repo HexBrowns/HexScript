@@ -1,23 +1,34 @@
---information:個別遅延_H v1.11 by HexBrowns
+--information:個別遅延_H v1.36.0 by HexBrowns
 --label:HexScript
 --filter
---track@delay:遅延,-1000,1000,100,0.01
+--track@delay:遅延(ms),-1000,1000,100,0.01
+--select@delay_mode:遅延の指定=0,1段ごと=0,最初と最後の差=1
 --track@random:ランダム,0,200,0,0.01
 --track@shake_amt:時間ブレ,0,1000,0
 --select@order:順番=0,番号順=0,右から=1,上から=2,中央から左右へ=3,中央から上下へ=4,中央から外へ=5
 --check@reverse:逆順,0
+--check@skip_space:空白を数えない,0
 --select@dist_mode:配り方=0,等間隔=0,ベジェ=1
 --value@dist_bezier:配り方のベジェ,{0.42,0,0.58,1}
 --hide@dist_bezier:dist_mode~=1
 --check@hide_last:最後の中間点で非表示,0
+--string@extra_at:追加遅延の番号,
+--string@extra_sec:追加遅延(秒),
+--group:遅らせる動きの設定
+--check@do_coord:座標,1
+--check@do_rot:回転,1
+--check@do_scale:拡大率,1
+--check@do_alpha:透明度,1
+--group
 --group:詳細設定,false
 --check@DN:遅延の時間補正,1
+--hide@DN:delay_mode==1
 --value@seed:シード,0
 --value@mag:倍率[移動/回転],{100,100}
 --value@correct:終了補正(秒)[in/out],{0,0}
---track@interval:時間ブレ周期,0,1000,100,1
+--value@interval:時間ブレ周期,100
 --check@RotW:グループ回転,0
---track@parent:親レイヤー,0,1000,0,1
+--value@parent:親レイヤー,0
 --check@fullrand:番号を無視,0
 --value@Order2:順番のずらし,0
 --select@put_pos:座標を出力=0,しない=0,XYZ=1,XY=2
@@ -25,9 +36,18 @@
 --group
 
 --[[
-個別遅延_H v1.11
+個別遅延_H v1.36.0
 
+v1.36.0: 動かさない値の「時間ブレ周期」「親レイヤー」を、トラックバーから変数項目（--value@）に替えた（項目名・並び・既定値・範囲は同じ。時間ブレ周期 0〜1000、親レイヤー 0〜1000 の整数に切り詰める）。保存済みの値は、数の形（100・0 など）なら引き継がれる見込み。中間点をつけていた値（数,数,…,移動方法 の形）は構文エラーになるか初期値に戻る。UI 定義の型が変わるので、AviUtl2 の再起動が要る。実機未確認。
+v1.35: グループ遅延_H と同じ項目を足した。(1)「遅延の指定」: 1段ごと（今までの動き。「遅延の時間補正」に従う）／最初と最後の差（遅延(ms) を、動く順で最初と最後のオブジェクトの遅れの差にする。オブジェクトの数に依らない。このとき「遅延の時間補正」は使わないので隠れる）。順番が 右から・上から などの位置で決めるものでは、中央から最も遠いオブジェクトの遅れが遅延(ms) になる。(2)「遅らせる動きの設定」: 座標・回転・拡大率・透明度。OFF にした動きは遅らせず、そのオブジェクトの今の値のままにする（座標は標準描画の X/Y/Z と フィルタ効果の「座標」、回転は 回転、拡大率は 拡大率と縦横比、透明度は 透明度）。グループ遅延_H の「グループ制御の動き」は、グループ制御の動きを読まない個別遅延_H では要らないので足していない。初期値（1段ごと・4 つとも ON）は v1.34 と同じ動きで、項目名と選択肢のラベルは変えていない。UI 定義を足したので、AviUtl2 の再起動が要る。実機未確認。
+v1.34: 「追加遅延の番号」に 空白 の言葉を書けるようにした（「空白」「行頭,空白」「3,空白」のように番号や他の言葉と混ぜてよい）。空白＝半角・全角の空白とタブが続く並び（続けば 1 つにまとめる）の後ろの最初の文字。その位置を通り過ぎるたびに追加遅延（秒）が 1 回分足される。本文の最初の空白（その前に文字が無い並び）と、末尾の空白（後ろに文字が無い並び）は位置にしない。空白を数えない と一緒に使える（空白を除いた番号で数える）。設定項目は増やしていない（再起動は要らない）。実機未確認。
+v1.33: 不具合を 2 件直した。(1) 「追加遅延の番号」「追加遅延(秒)」の 2 欄を --value@ から --string@ に替えた（項目名・並び・既定値は同じ）。--value@ は値を Lua の式として読むので、「17, 2」のように 2 つ以上書くと構文エラーになる、または 1 つ目だけが数として残り 2 つ目以降が捨てられていた。--string@ は書いた文字をそのまま受けるので、「3,6」「3、6」「3 6」のどれも読める。保存済みのプロジェクトの旧い値（数や空の文字）も同じ動きで読める。(2) フィルタ効果オブジェクト（テキストの 1 つ下のレイヤーに置いた 座標・回転・透明度・個別遅延_H）でも本文を読む。このオブジェクト自身には「テキスト」の効果が無く本文が読めなかった（「空白を数えない」と 行頭・読点などの言葉が効かず、警告が出ていた）。読めなければ、描画対象のレイヤー、続けて上のレイヤーへ 32 レイヤーまでさかのぼり、最初のメディアオブジェクトのテキストを読む（そのメディアオブジェクトがテキストでなければ、その上のテキストは借りない）。どこでも読めなければ今までと同じ警告を 1 回出す。設定項目の型が変わるので、AviUtl2 の再起動が要る。実機未確認。
+v1.32: 「追加遅延の番号」に 行頭・読点・句点・句読点 の言葉を書けるようにした（「行頭」「行頭,読点」「3,句点」のように番号と混ぜてよい）。行頭＝2 行目以降の行の最初の文字、読点＝「、」，の後ろ、句点＝「。」．の後ろ（続く記号と閉じ括弧はまとめて 1 つ）、句読点＝そのどちらも。その位置を通り過ぎるたびに追加遅延（秒）が 1 回分足される（秒は書いた言葉・番号の順に組になる）。本文はテキストから読み、文字数が個別オブジェクトの数と合わなければ警告を 1 回出して番号だけで動かす。順番を問わず本文の並びで数え、逆順では位置より前の文字が受ける。空白を数えない と一緒に使える。設定項目は増やしていない（再起動は要らない）。実機未確認。
+v1.31: 「空白を数えない」を足した（逆順の次）。テキストを 1 文字ずつの個別オブジェクトにすると、半角・全角の空白とタブも 1 つ分の番号を使い、空白の後ろの文字の動き出しが 1 つ分遅れていた。ON にすると空白を除いた番号と数で動かす（空白のオブジェクトは何も描かないので動かさない）。初期値は OFF で、今までの作品の動きは変わらない。実機未確認。
+v1.30: 「追加遅延の番号」「追加遅延(秒)」を足した（動く順が ○ 番目以降のオブジェクトを、さらに ○ 秒遅らせる。番号は「3,6」のように複数書け、書いた番号を超えるたびに追加分が重なる。空欄で無効）。項目名「遅延」を「遅延(ms)」に変えた（単位はミリ秒で、動きは変わらない。保存済みの値は初期値に戻る）。実機未確認。
 原作: Script/@DelayMove.anm2 の「Delay個別」（AviUtl2 移植版。作者・ライセンスの表記なし）。
+v1.20: 標準描画の値が読めるか・最後の中間点の時刻を、先頭の個別オブジェクトで1回だけ調べて残りで使い回す（getvalue の呼び出しを減らす。結果は変わらない）。実機未確認。
+v1.12: フィルタ効果の 座標・回転・拡大率・透明度 の動きも遅らせる（標準描画に加えて。同じ効果が複数あれば全部）。実機未確認。
 v1.11: 親レイヤーが空きの番号のとき・フィルタオブジェクトに掛けたとき、例外にせず動かさない（警告を 1 回出す）。
 v1.10: 配り方（等間隔 / ベジェ）を足した。順番の位置をベジェで写して、遅れに緩急を付ける（After Effects の Lazy に当たる）。
 個別オブジェクトを中間点などで動かしたとき、個別オブジェクトごとに動きを遅らせる。
@@ -57,9 +77,298 @@ v1.10: 配り方（等間隔 / ベジェ）を足した。順番の位置をベ�
 ]]
 
 local check0 = (reverse == 1)
+
+-- v1.36.0: 時間ブレ周期・親レイヤーは変数項目（--value@）。数でなければ既定値にし、旧トラックの範囲（0〜1000・整数）に切り詰める
+local function clamp_int(v, def, lo, hi)
+  v = tonumber(v)
+  if v == nil or v ~= v then v = def end
+  v = math.floor(v + 0.5)
+  if v < lo then v = lo elseif v > hi then v = hi end
+  return v
+end
+interval = clamp_int(interval, 100, 0, 1000)
+parent = clamp_int(parent, 0, 0, 1000)
+
+-- v1.35: 遅らせる動き（座標・回転・拡大率・透明度）。項目が無い（nil）ときは ON と同じ
+local function motion_on(v) return v == nil or v == 1 or v == true end
+local DO_COORD, DO_ROT, DO_SCALE, DO_ALPHA = motion_on(do_coord), motion_on(do_rot), motion_on(do_scale), motion_on(do_alpha)
+
+-- v1.31: 空白を数えない。個別オブジェクトの番号 obj.index と数 obj.num は空白（半角・全角・タブ）も 1 つ分に数える（改行は数えない）。
+-- ON のときは、テキスト本文から空白の位置を調べ、空白を除いた番号 IDX と数 NUM に振り直す。空白のオブジェクトはここで終える。
+-- 本文の読み方: \\ は \ に、\n は改行（数えない）、<…> の制御文字は文字に数えない。文字数が obj.num と合わないときは空白も数える（警告を 1 回出す）
+-- 位置の表は「1=空白、0=空白以外」を並べた文字列で、global に本文と組にして残す（global は文字列だけを持つ）
+-- v1.32: 本文を 1 文字ずつに分ける（個別オブジェクトの番号 obj.index と同じ数え方）。
+-- chars[k] = k 番目の文字（UTF-8 の 1 文字）、lstart[k] = その文字が改行の後の先頭の文字か
+local function scan_text(text)
+  local chars, lstart = {}, {}
+  local i, len, newline = 1, #text, false
+  while i <= len do
+    local b = text:byte(i)
+    local step, count = 1, true
+    if b == 0x5C then                          -- \
+      local nx = text:byte(i + 1)
+      if nx == 0x5C then step = 2
+      elseif nx == 0x6E then step = 2; count = false; newline = true
+      end
+    elseif b == 0x3C then                      -- <…>
+      local close = text:find(">", i + 1, true)
+      if close then step = close + 1 - i; count = false end
+    elseif b == 0x0A or b == 0x0D then
+      count = false; newline = true
+    else
+      step = (b >= 0xF0 and 4) or (b >= 0xE0 and 3) or (b >= 0xC0 and 2) or 1
+    end
+    if count then
+      local n = #chars + 1
+      chars[n] = (b == 0x5C) and "\\" or text:sub(i, i + step - 1)
+      lstart[n] = newline
+      newline = false
+    end
+    i = i + step
+  end
+  return chars, lstart
+end
+
+local function is_blank_char(ch) return ch == " " or ch == "\t" or ch == "　" end
+
+local function blank_map(text)
+  local chars = scan_text(text)
+  local out = {}
+  for k = 1, #chars do out[k] = is_blank_char(chars[k]) and "1" or "0" end
+  return table.concat(out)
+end
+
+-- v1.32: 追加遅延の「行頭」「読点」「句点」「句読点」を置く位置。位置 p は、止めた後の最初の個別オブジェクトの番号（0 始まり）。
+-- 番号 p 以降（逆順では p より前）の個別オブジェクトが追加遅延を受ける。空白を数えない が効いているときは、空白を除いた番号で数える。
+-- 読点・句点は続く同じ種類の記号と閉じ括弧（」』）など）をまとめて 1 つに数え、その後ろに置く。数字の間の . と , は句読点にしない
+local READ_MARK = { ["、"] = true, ["，"] = true, [","] = true }
+local PERIOD_MARK = { ["。"] = true, ["．"] = true, ["."] = true }
+local CLOSE_MARK = { ["」"] = true, ["』"] = true, ["）"] = true, [")"] = true, ["】"] = true, ["〕"] = true,
+                     ["］"] = true, ["｝"] = true, ["}"] = true, ["〉"] = true, ["》"] = true, ["”"] = true, ["’"] = true }
+-- v1.34: 空白は、空白（半角・全角・タブ）が続く並びを 1 つにまとめ、その後ろの最初の文字の位置に置く。
+-- 並びの前に文字が無い（本文の最初の空白）ときと、後ろに文字が無い（末尾の空白）ときは位置にしない
+-- 戻り値: "行頭|読点|句点|句読点|空白" の各位置を「,」でつないだ文字列、文字数（obj.num と突き合わせる）
+local function compute_marks(text, skip_blank)
+  local chars, lstart = scan_text(text)
+  local n = #chars
+  local idx, nb = {}, 0
+  for k = 1, n do
+    idx[k] = skip_blank and nb or (k - 1)
+    if not (skip_blank and is_blank_char(chars[k])) then nb = nb + 1 end
+  end
+  local total = nb
+  idx[n + 1] = total
+  local lines, reads, periods, both = {}, {}, {}, {}
+  for k = 1, n do
+    if lstart[k] then lines[#lines + 1] = idx[k] end
+  end
+  local function is_digit(c) return c ~= nil and c:match("^%d$") ~= nil end
+  local function run(set_a, set_b, out)
+    local k = 1
+    while k <= n do
+      local ch = chars[k]
+      local hit = set_a[ch] or (set_b ~= nil and set_b[ch])
+      if hit and (ch == "." or ch == ",") and is_digit(chars[k - 1]) and is_digit(chars[k + 1]) then hit = false end
+      if hit then
+        local j = k
+        while j < n do
+          local nx = chars[j + 1]
+          if set_a[nx] or (set_b ~= nil and set_b[nx]) or CLOSE_MARK[nx] then j = j + 1 else break end
+        end
+        out[#out + 1] = idx[j + 1]
+        k = j + 1
+      else
+        k = k + 1
+      end
+    end
+  end
+  run(READ_MARK, nil, reads)
+  run(PERIOD_MARK, nil, periods)
+  run(READ_MARK, PERIOD_MARK, both)
+  local blanks = {}
+  do
+    local k, seen = 1, false
+    while k <= n do
+      if is_blank_char(chars[k]) then
+        local j = k
+        while j < n and is_blank_char(chars[j + 1]) do j = j + 1 end
+        if seen then blanks[#blanks + 1] = idx[j + 1] end
+        k = j + 1
+      else
+        seen = true
+        k = k + 1
+      end
+    end
+  end
+  local function pack(list)
+    local keep = {}
+    for _, p in ipairs(list) do
+      if p >= 1 and p <= total - 1 then keep[#keep + 1] = p end
+    end
+    return table.concat(keep, ",")
+  end
+  return pack(lines) .. "|" .. pack(reads) .. "|" .. pack(periods) .. "|" .. pack(both) .. "|" .. pack(blanks), n
+end
+
+-- v1.33: 本文（テキスト）を読む。テキストに直接追加したときは、自分の「テキスト」効果から読める。
+-- フィルタ効果オブジェクト（テキストの下のレイヤーに置いた 座標・個別遅延_H など）には「テキスト」の効果が無いので、
+-- 描画対象のレイヤー obj.layer、続けて効果のレイヤー obj.effect_layer の 1 つ上から上へ BODY_WALK レイヤーまで、
+-- obj.getvalue(レイヤー, "テキスト", "テキスト")（lua.txt の obj.getvalue(layer,effect,item)）で読む。
+-- 標準描画を持つレイヤー（obj.getvalue("layerN.x") が数を返す＝メディアオブジェクト）に当たったら、そこで止める
+-- （直前のメディアオブジェクトがテキストでなければ、その上のテキストは借りない）。フィルタ・グループ制御・空きレイヤーは飛ばす。
+-- 読めたレイヤーは global に残し（次のフレーム・次の個別オブジェクトはそこから読む）、読めなかったら同じ時刻では探し直さない。
+-- obj.getvalue は対象が無いと「戻り値なし」を返すので、変数に受けて型を見る
+local BODY_WALK = 32
+local function read_body()
+  local gvv = obj.getvalue
+  local function text_of(layer)
+    local v
+    if layer == nil then v = gvv("テキスト", "テキスト") else v = gvv(layer, "テキスト", "テキスト") end
+    if type(v) == "string" then return v end
+    return nil
+  end
+  local tx = text_of(nil)
+  if tx ~= nil then return tx end
+  local eff = tonumber(obj.effect_layer) or obj.layer
+  local scene = obj.scene_id or 0
+  local ck = "IndividualDelay_H:bodylayer:" .. scene .. ":" .. eff
+  local fk = "IndividualDelay_H:bodyfail:" .. scene .. ":" .. eff
+  local stamp = string.format("%.6f", obj.time)
+  if global[fk] == stamp then return nil end
+  local cached = tonumber(global[ck])
+  if cached ~= nil then
+    tx = text_of(cached)
+    if tx ~= nil then return tx end
+  end
+  if obj.layer ~= eff then
+    tx = text_of(obj.layer)
+    if tx ~= nil then global[ck] = tostring(obj.layer); return tx end
+  end
+  local function is_media(layer) return type((gvv("layer" .. layer .. ".x"))) == "number" end   -- 戻り値なしを括弧で nil にする
+  local own_media = (obj.layer == eff) and is_media(eff)
+  if not own_media then
+    for L = eff - 1, math.max(1, eff - BODY_WALK), -1 do
+      tx = text_of(L)
+      if tx ~= nil then global[ck] = tostring(L); return tx end
+      if is_media(L) then break end
+    end
+  end
+  global[fk] = stamp
+  return nil
+end
+
+local IDX, NUM = obj.index, obj.num
+local remapped = false
+if skip_space == 1 and obj.getoption("multi_object") and obj.num > 0 then
+  local tx = read_body()
+  local map = nil
+  if type(tx) == "string" then
+    local gk = "IndividualDelay_H:blank:" .. (obj.scene_id or 0) .. ":" .. obj.layer
+    local cached = global[gk]
+    local sep = cached and cached:find("\0", 1, true)
+    if sep and cached:sub(1, sep - 1) == tx then
+      map = cached:sub(sep + 1)
+    else
+      map = blank_map(tx)
+      global[gk] = tx .. "\0" .. map
+    end
+  end
+  if map ~= nil and #map == obj.num then
+    if map:sub(obj.index + 1, obj.index + 1) == "1" then return end
+    local _, before = map:sub(1, obj.index):gsub("0", "")
+    local _, total = map:gsub("0", "")
+    IDX, NUM = before, total
+    remapped = true
+  else
+    local wk = "IndividualDelay_H:blankwarn:" .. (obj.scene_id or 0) .. ":" .. obj.layer
+    if global[wk] == nil then
+      global[wk] = "1"
+      print("@warn", "[個別遅延_H] 空白を数えない: テキストを読めないか、文字数が個別オブジェクトの数と合わないので、空白も数えて動かします")
+    end
+  end
+end
 local delayed_time = nil      -- 遅れた時刻（範囲に収める前）。最後の中間点で非表示 の判定に使う
 
-local function Delay_id(delaytime,adjin,adjout,index,magp,magr,layer,rotation,mode)
+-- v1.12: フィルタ効果（座標・回転・拡大率・透明度）の値も、遅らせた時刻で読んで差し替える。
+-- 座標・回転は差（遅らせた値 − 今の値）を足し、拡大率・透明度は比を掛ける。同じ効果が複数あれば全部。
+-- obj.getvalue(効果, 項目, 時刻) は対象が無いと「戻り値なし」なので、いったん変数に受けてから tonumber する
+local function eff_values(P, name, items, defaults, t)
+  local out = {}
+  local function rd(ename, item)
+    local v
+    if P then v = obj.getvalue(P, ename, item, t) else v = obj.getvalue(ename, item, t) end
+    return tonumber(v)
+  end
+  for i = 0, 15 do
+    local ename = name .. ":" .. i
+    local first = rd(ename, items[1])
+    if first == nil and i == 0 then
+      ename = name
+      first = rd(ename, items[1])
+    end
+    if first == nil then break end
+    local vals = { first }
+    for j = 2, #items do vals[j] = rd(ename, items[j]) or defaults[j] end
+    out[#out + 1] = vals
+    if ename == name then break end
+  end
+  return out
+end
+
+-- 戻り値: 見つけた効果の数
+local function apply_effects(P, id, now, magp, magr)
+  local found = 0
+  local xyz = { "X", "Y", "Z" }
+  local zero = { 0, 0, 0 }
+  local a, b
+  -- v1.35: OFF にした動き（遅らせる動きの設定）のフィルタ効果は読まない
+  if DO_COORD then
+    a = eff_values(P, "座標", xyz, zero, now)
+    b = eff_values(P, "座標", xyz, zero, id)
+    found = found + #a
+    for i = 1, math.min(#a, #b) do
+      obj.ox = obj.ox + (b[i][1] - a[i][1]) * magp
+      obj.oy = obj.oy + (b[i][2] - a[i][2]) * magp
+      obj.oz = obj.oz + (b[i][3] - a[i][3]) * magp
+    end
+  end
+  if DO_ROT then
+    a = eff_values(P, "回転", xyz, zero, now)
+    b = eff_values(P, "回転", xyz, zero, id)
+    found = found + #a
+    for i = 1, math.min(#a, #b) do
+      obj.rx = obj.rx + (b[i][1] - a[i][1]) * magr
+      obj.ry = obj.ry + (b[i][2] - a[i][2]) * magr
+      obj.rz = obj.rz + (b[i][3] - a[i][3]) * magr
+    end
+  end
+  if DO_SCALE then
+    a = eff_values(P, "拡大率", { "拡大率" }, { 100 }, now)
+    b = eff_values(P, "拡大率", { "拡大率" }, { 100 }, id)
+    found = found + #a
+    if #a > 0 then
+      local fn, fp = 1, 1
+      for i = 1, math.min(#a, #b) do fn = fn * a[i][1] / 100; fp = fp * b[i][1] / 100 end
+      if fn ~= 0 then obj.zoom = obj.zoom * fp / fn else obj.zoom = obj.zoom * fp end
+    end
+  end
+  if DO_ALPHA then
+    a = eff_values(P, "透明度", { "透明度" }, { 0 }, now)
+    b = eff_values(P, "透明度", { "透明度" }, { 0 }, id)
+    found = found + #a
+    if #a > 0 then
+      local fn, fp = 1, 1
+      for i = 1, math.min(#a, #b) do
+        fn = fn * math.min(math.max(1 - a[i][1] / 100, 0), 1)
+        fp = fp * math.min(math.max(1 - b[i][1] / 100, 0), 1)
+      end
+      if fn ~= 0 then obj.alpha = obj.alpha * fp / fn else obj.alpha = obj.alpha * fp end
+    end
+  end
+  return found
+end
+
+local function Delay_id(delaytime,adjin,adjout,index,magp,magr,layer,rotation,mode,extra)
  local delay  = delaytime/1000
  local adjin  = adjin  or 1
  local adjout = adjout or 1
@@ -70,7 +379,7 @@ local function Delay_id(delaytime,adjin,adjout,index,magp,magr,layer,rotation,mo
  if(L~=obj.layer)then mode="nomal" end
 
  L = "layer"..L.."."
- if not index then index=obj.index+1 end
+ if not index then index=IDX+1 end
  if not adjout then adjout=adjin end
 
   local function IO(induration, outduration,time,total)
@@ -84,7 +393,7 @@ local function Delay_id(delaytime,adjin,adjout,index,magp,magr,layer,rotation,mo
     return (start*ending^2)
   end
 
- local id = index*delay*IO(adjin,adjout)
+ local id = (index*delay+(extra or 0))*IO(adjin,adjout)
        delayed_time = obj.time-id
        id = math.min(obj.totaltime,math.max(0,obj.time-id))
        -- 計算が NaN になったとき（原作の補正の 0 除算）は、範囲に収めた時刻で判定する
@@ -99,23 +408,42 @@ end
  -- v1.11: 読む先の値が無いときは動かさない（原作はここで nil の計算の例外になる）。
  -- 親レイヤーにオブジェクトが無い（空きの番号）・フィルタオブジェクト（標準描画の値を持たない）のとき。強化デバッグ edg_1
  -- （表に nil を入れると詰まって見落とすので 1 つずつ見る。値を 0 個返すこともあるので、変数に受けてから型を見る）
- local readable = true
- for _, k in ipairs({ "x", "y", "z", "rx", "ry", "rz", "zoom", "alpha", "aspect" }) do
-   local v = gv(L..k, id)
-   if type(v) ~= "number" then readable = false break end
+ -- v1.20: 読めるかは個別オブジェクトのどれでも同じ答えなので、先頭（IDX==0）で調べて同じフレームの残りは使い回す
+ local rkey = "IndividualDelay_H:readable:" .. obj.layer .. ":" .. L .. ":" .. mode
+ local rstamp = string.format("%.6f", obj.time)
+ local readable
+ local cached = global[rkey]
+ if cached ~= nil and IDX ~= 0 then
+   local st, r = cached:match("^(%S-)|(%d)$")
+   if st == rstamp then readable = (r == "1") end
  end
- if readable and mode=="counter" then
-   for _, k in ipairs({ "rx", "ry", "rz", L.."zoom", L.."alpha" }) do
-     local v = gv(k)
+ if readable == nil then
+   readable = true
+   for _, k in ipairs({ "x", "y", "z", "rx", "ry", "rz", "zoom", "alpha", "aspect" }) do
+     local v = gv(L..k, id)
      if type(v) ~= "number" then readable = false break end
    end
+   if readable and mode=="counter" then
+     for _, k in ipairs({ "rx", "ry", "rz", L.."zoom", L.."alpha" }) do
+       local v = gv(k)
+       if type(v) ~= "number" then readable = false break end
+     end
+   end
+   global[rkey] = rstamp .. "|" .. (readable and "1" or "0")
  end
+ -- フィルタ効果の値を読む先: 親レイヤーが別のレイヤーならそのレイヤー、自分なら指定なし
+ local EP = nil
+ if L ~= "layer"..obj.layer.."." then EP = tonumber(L:match("%d+")) end
  if not readable then
-   delayed_time = nil
-   local wk = "IndividualDelay_H:missing:" .. L
-   if global[wk] == nil then
-     global[wk] = "1"
-     print("@warn", "[個別遅延_H] " .. L:sub(1, -2) .. " の値を読めないので動かしません（親レイヤーが空き・フィルタオブジェクトなど）")
+   -- 標準描画の値が読めなくても、座標などのフィルタ効果があればそれを遅らせる
+   local n = apply_effects(EP, id, obj.time, magp, magr)
+   if n == 0 then
+     delayed_time = nil
+     local wk = "IndividualDelay_H:missing:" .. L
+     if global[wk] == nil then
+       global[wk] = "1"
+       print("@warn", "[個別遅延_H] " .. L:sub(1, -2) .. " の値を読めないので動かしません（親レイヤーが空き・フィルタオブジェクトなど）")
+     end
    end
    return
  end
@@ -133,16 +461,25 @@ do
    x,y,z=obj.ox-obj.x, obj.oy-obj.y, obj.oz-obj.z
  end
 
- obj.ox=x+gv(L.."x",id)*magp
- obj.oy=y+gv(L.."y",id)*magp
- obj.oz=z+gv(L.."z",id)*magp
- obj.rx=rx+gv(L.."rx",id)*magr
- obj.ry=ry+gv(L.."ry",id)*magr
- obj.rz=rz+gv(L.."rz",id)*magr
- obj.zoom  = zoom*gv(L.."zoom",id)/100
- obj.alpha = alpha*gv(L.."alpha",id)
- obj.aspect= gv(L.."aspect",id)
-  if(rotation==1)then
+ -- v1.35: OFF にした動き（遅らせる動きの設定）は、遅らせずに今の値のままにする（縦横比は拡大率に含める）
+ if DO_COORD then
+   obj.ox=x+gv(L.."x",id)*magp
+   obj.oy=y+gv(L.."y",id)*magp
+   obj.oz=z+gv(L.."z",id)*magp
+ end
+ if DO_ROT then
+   obj.rx=rx+gv(L.."rx",id)*magr
+   obj.ry=ry+gv(L.."ry",id)*magr
+   obj.rz=rz+gv(L.."rz",id)*magr
+ end
+ if DO_SCALE then
+   obj.zoom  = zoom*gv(L.."zoom",id)/100
+   obj.aspect= gv(L.."aspect",id)
+ end
+ if DO_ALPHA then
+   obj.alpha = alpha*gv(L.."alpha",id)
+ end
+  if(rotation==1 and DO_COORD)then
    --回転
    local ROT = function(x,y,z,rx0,ry0,rz0)
    local sin,cos,rad=math.sin,math.cos,math.rad
@@ -155,10 +492,15 @@ do
     X,Y,Z=Rx(X,Y,Z,rx0)
     return X,Y,Z
    end
-   obj.ox,obj.oy,obj.oz = ROT(obj.ox,obj.oy,obj.oz, math.rad(rx+gv(L.."rx",id)*magr) , math.rad(ry+gv(L.."ry",id)*magr) ,math.rad(rz+gv(L.."rz",id)*magr))
+   -- 回転を遅らせないときは、今の回転（obj.rx など）で回す
+   local arx, ary, arz = obj.rx, obj.ry, obj.rz
+   if DO_ROT then arx, ary, arz = rx+gv(L.."rx",id)*magr, ry+gv(L.."ry",id)*magr, rz+gv(L.."rz",id)*magr end
+   obj.ox,obj.oy,obj.oz = ROT(obj.ox,obj.oy,obj.oz, math.rad(arx) , math.rad(ary) ,math.rad(arz))
   end
 
  end
+
+ apply_effects(EP, id, obj.time, magp, magr)
 
 end
 
@@ -208,18 +550,18 @@ local Correct_in  = correct[1]
 local Correct_out = correct[2]
 local Random      = random/100
 local Timeshake   = shake_amt/10
-local Index       = obj.index
+local Index       = IDX
 if fullrand==1 then Index=Index+1 end
 local zoom = obj.getvalue("zoom")/100
 if obj.getoption("multi_object") then
  if(check0)then
-  Index = obj.num-Index
+  Index = NUM-Index
  end
  if(DN==1)then
    if(Order2==0 or Order2=="debug")then
-    Index = Index/(obj.num-1) *10
+    Index = Index/(NUM-1) *10
    else
-    Index = Index/(obj.num) *10
+    Index = Index/(NUM) *10
    end
   end
 else
@@ -256,18 +598,136 @@ local Order1        = order
 local Order2        = Order2 or 0
 if Order2=="debug" then Order2=0 dbg=2 end
 local Pattern     = Index
+-- 追加遅延（v1.30）: 動く順の番号（1 始まり）。開始番号以降のオブジェクトを追加で遅らせる
+-- 追加遅延の番号（「3,6」のように複数書ける。全角の数字・，・、・空白も可）を数の表にする
+-- 秒数（signed=true）だけ負の値（マイナス記号。全角の－・−も可）を読む。番号は正の数だけ
+-- v1.32: words=true のときは番号の間に 行頭・読点・句点・句読点 も書ける（戻り値の表には "L" "R" "P" "B" で入る。書いた順のまま）
+-- v1.34: 空白 も書ける（"S"）
+local EXTRA_WORDS = { { "句読点", "B" }, { "行頭", "L" }, { "読点", "R" }, { "句点", "P" }, { "空白", "S" } }
+-- v1.33: 欄は --string@ なので文字列で届く。保存済みのプロジェクトの旧い値が数（0 や 2.4）で届いたときも、1 つの数として読む
+local function parse_extra(s, signed, words)
+  if type(s) == "number" then
+    if s ~= s then return {} end
+    return { signed and s or math.abs(s) }
+  end
+  s = tostring(s or "")
+  s = s:gsub("，", ","):gsub("、", ","):gsub("　", " "):gsub("．", ".")
+  if signed then s = s:gsub("－", "-"):gsub("−", "-") end
+  for dgt = 0, 9 do
+    s = s:gsub(string.char(0xEF, 0xBC, 0x90 + dgt), tostring(dgt))
+  end
+  local list = {}
+  local numpat = signed and "^%-?%d+%.?%d*" or "^%d+%.?%d*"
+  local i, len = 1, #s
+  while i <= len do
+    local hit = false
+    if words then
+      for _, w in ipairs(EXTRA_WORDS) do
+        if s:sub(i, i + #w[1] - 1) == w[1] then
+          list[#list + 1] = w[2]
+          i = i + #w[1]
+          hit = true
+          break
+        end
+      end
+    end
+    if not hit then
+      local numtxt = s:match(numpat, i)
+      if numtxt then
+        list[#list + 1] = tonumber(numtxt)
+        i = i + #numtxt
+      else
+        i = i + 1
+      end
+    end
+  end
+  return list
+end
+local Rank        = 1
+-- 行頭・句読点の位置の表（本文を読む）。nil: まだ読んでいない / false: 使えない（本文が読めない・文字数が合わない・単体）
+local MARKS = nil
+local function get_marks()
+  if MARKS ~= nil then return MARKS end
+  MARKS = false
+  if not (obj.getoption("multi_object") and obj.num > 0) then return false end
+  local tx = read_body()
+  local packed = nil
+  if type(tx) == "string" then
+    local head = tx .. "\0" .. (remapped and "1" or "0") .. "S\0"   -- v1.34: 表の形（空白の欄を足した）の印
+    local gk = "IndividualDelay_H:marks:" .. (obj.scene_id or 0) .. ":" .. obj.layer
+    local cached = global[gk]
+    if cached ~= nil and cached:sub(1, #head) == head then
+      packed = cached:sub(#head + 1)
+    else
+      local n
+      packed, n = compute_marks(tx, remapped)
+      if n ~= obj.num then packed = "bad" end
+      global[gk] = head .. packed
+    end
+  end
+  if packed == nil or packed == "bad" then
+    local wk = "IndividualDelay_H:markwarn:" .. (obj.scene_id or 0) .. ":" .. obj.layer
+    if global[wk] == nil then
+      global[wk] = "1"
+      print("@warn", "[個別遅延_H] 追加遅延の 行頭・読点・句点・空白: テキストを読めないか、文字数が個別オブジェクトの数と合わないので、番号だけで動かします")
+    end
+    return false
+  end
+  local fields = {}
+  for f in (packed .. "|"):gmatch("([^|]*)|") do
+    local nums = {}
+    for numtxt in f:gmatch("%d+") do nums[#nums + 1] = tonumber(numtxt) end
+    fields[#fields + 1] = nums
+  end
+  MARKS = { L = fields[1] or {}, R = fields[2] or {}, P = fields[3] or {}, B = fields[4] or {}, S = fields[5] or {} }
+  return MARKS
+end
+-- 自分が通り過ぎた位置の数。順に動くときは番号 p 以降、逆順では p より前が通り過ぎる
+local function marks_passed(kind)
+  local m = get_marks()
+  if not m then return 0 end
+  local c = 0
+  for _, p in ipairs(m[kind]) do
+    if (check0 and p > IDX) or (not check0 and p <= IDX) then c = c + 1 end
+  end
+  return c
+end
+-- 番号の i 番目には秒数の i 番目を組にする。秒数が足りない番号は最後の秒数を使う。
+-- 行頭などの言葉は、位置を 1 つ通り過ぎるたびに 1 回分の秒数を足す（組にする秒数は言葉 1 つにつき 1 つ）
+local function extra_delay()
+  local secs = parse_extra(extra_sec, true)
+  local total = 0
+  for i, v in ipairs(parse_extra(extra_at, false, true)) do
+    local sec = secs[i] or secs[#secs] or 0
+    if type(v) == "number" then
+      if v > 0 and Rank >= v then total = total + sec end
+    else
+      total = total + sec * marks_passed(v)
+    end
+  end
+  return total
+end
+-- v1.35: 遅延の指定。最初と最後の差 のとき、遅延(ms) を「動く順で最初と最後のオブジェクトの遅れの差」にする。
+-- 順番の位置の幅 DSPAN（番号順では最初と最後の順位の差。位置で決める順番では 10＝中央から最も遠い順位 1 の 10 倍）で割って、
+-- 数が何個でも遅延(ms) が差になるようにする。1段ごと（初期値）は今までと同じ。個別オブジェクトが 1 つなら割らない
+local DSPAN = nil
+local function mode_delay(span)
+  if delay_mode == 1 and span ~= nil and span > 0 then return Delaytime / span end
+  return Delaytime
+end
 -- 配り方（v1.10）: 番号順では、最初と最後の個別オブジェクトの順位（上の Index と同じ式）の間で写す
-if Order1==0 and obj.getoption("multi_object") and obj.num > 1 then
+if Order1==0 and obj.getoption("multi_object") and NUM > 1 then
   local function index_of(i)
     local v = i
     if fullrand==1 then v = v + 1 end
-    if check0 then v = obj.num - v end
+    if check0 then v = NUM - v end
     if DN==1 then
-      if (Order2==0) then v = v/(obj.num-1)*10 else v = v/(obj.num)*10 end
+      if (Order2==0) then v = v/(NUM-1)*10 else v = v/(NUM)*10 end
     end
     return v
   end
-  local a, b = index_of(0), index_of(obj.num - 1)
+  local a, b = index_of(0), index_of(NUM - 1)
+  DSPAN = math.abs(b - a)
   if a > b then a, b = b, a end
   Pattern = distribute(Pattern, a, b)
 end
@@ -278,7 +738,7 @@ if fullrand==1 then
   if Order1==0 then
    Order2=Order2-Index
   else
-   Order2=Order2+Index/(obj.num/5)
+   Order2=Order2+Index/(NUM/5)
   end
 end
 
@@ -293,28 +753,31 @@ if Delaytime==0 then
 end
 
 if random>0 then
- Pattern = Pattern +  obj.rand(1,1000,obj.index,seed)*Random * Delaytime/100
+ Pattern = Pattern +  obj.rand(1,1000,IDX,seed)*Random * Delaytime/100
 end
 
 if shake_amt>0 then
- Pattern = Pattern + shake(interval,-1000,1000,obj.index,seed)/1000*Timeshake
+ Pattern = Pattern + shake(interval,-1000,1000,IDX,seed)/1000*Timeshake
 end
 
 
 if Order1==0 then
+  if obj.getoption("multi_object") then Rank = check0 and (NUM - IDX) or (IDX + 1) end
   Delay_id(
-  Delaytime,
-  Correct_in*obj.num/Index ,             -- in補正
-  Correct_out*obj.num/Index,             -- out補正
+  mode_delay(DSPAN),
+  Correct_in*NUM/Index ,             -- in補正
+  Correct_out*NUM/Index,             -- out補正
   Pattern + Order2,                      -- 行動パターン(index)
   magp,magr,
   parent,
-  RotW
+  RotW,
+  nil,
+  extra_delay()
   )
 
 else
 
- if obj.index==0 then XX,YY=X,Y end
+ if IDX==0 then XX,YY=X,Y end
 
  local CR=1
  if obj.getoption("multi_object") then
@@ -344,28 +807,31 @@ else
    end
   end
   -- 配り方（v1.10）: 位置の順位は 0〜1 なので、そのまま写す
+  Rank = math.floor(Pattern*(NUM-1)+0.5)+1
   Pattern=distribute(Pattern, 0, 1)*10
  end
 
 
- if obj.index==obj.num-1 then XX,YY=nil,nil end
+ if IDX==NUM-1 then XX,YY=nil,nil end
 
   if random>0 then
-   Pattern = Pattern + obj.rand(000,1000,obj.index,seed)*Random * Delaytime/100
+   Pattern = Pattern + obj.rand(000,1000,IDX,seed)*Random * Delaytime/100
   end
 
   if shake_amt>0 then
-    Pattern = Pattern + shake(interval,-1000,1000,obj.index,seed)/1000*Timeshake
+    Pattern = Pattern + shake(interval,-1000,1000,IDX,seed)/1000*Timeshake
   end
 
  Delay_id(
- Delaytime/CR,
+ mode_delay(obj.getoption("multi_object") and 10 or nil)/CR,
  Correct_in,              -- in補正
  Correct_out,             -- out補正
  Pattern + Order2,        -- 行動パターン(index)
  magp,magr,
  parent,
- RotW
+ RotW,
+ nil,
+ extra_delay()
  )
 end
 
@@ -373,7 +839,7 @@ end
 if DM==nil then DM={} end
 local layer="layer"..obj.layer
 
-if obj.index==0 then
+if IDX==0 then
  DM[layer] = {} end
 
 if (put_pos>0) and (put_pos<=2) then
@@ -421,13 +887,13 @@ local blue = HSV(202,math.min(500,65*(-PTND/10)), 65)
 
   if dbg==2 then
    obj.setfont("Bell Gothic Std Black",math.min(w/4,20),0,0xffffff)
-   obj.load("id."..obj.index)
+   obj.load("id."..IDX)
    obj.draw(-w/2+obj.w/2,-h/2+obj.h/1.5,0,0.6,1)
    obj.load(string.format("%.2f",PTNN*Delaytime/1000))
    obj.effect("単色化","color",0xff3325,"輝度を保持する",0,"強さ",100*(1-PTNN/10))
    obj.draw(0,0,0,0.8,0.9)
 
-   if obj.index==obj.num-1 then
+   if IDX==NUM-1 then
     obj.load("ORDER="..Order1.."")
     obj.draw(0,-15,0,0.4,1)
     obj.load(math.floor(obj.time*10)/10)
@@ -450,7 +916,19 @@ obj.setoption("drawtarget","framebuffer")
 
 -- 遅れた時刻が最後の中間点に届いた個別オブジェクトを消す（その先は終点まで動かない）
 if hide_last == 1 and delayed_time ~= nil then
-  local tk = last_key_time(parent)
+  -- v1.20: 最後の中間点の時刻も個別オブジェクトによらないので、先頭で調べて同じフレームの残りは使い回す
+  local kkey = "IndividualDelay_H:lastkey:" .. obj.layer .. ":" .. tostring(parent)
+  local kstamp = string.format("%.6f", obj.time)
+  local tk, hit = nil, false
+  local kc = global[kkey]
+  if kc ~= nil and IDX ~= 0 then
+    local st, v = kc:match("^(%S-)|(%S-)$")
+    if st == kstamp then hit = true; tk = tonumber(v) end
+  end
+  if not hit then
+    tk = last_key_time(parent)
+    global[kkey] = kstamp .. "|" .. (tk and string.format("%.9f", tk) or "none")
+  end
   if tk ~= nil and delayed_time >= tk - 1e-6 then
     obj.alpha = 0
   end

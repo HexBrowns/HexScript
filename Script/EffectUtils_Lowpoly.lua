@@ -918,6 +918,495 @@ function EffectUtils_Lowpoly.append_tri_list4(consts, recs, idx, batch_n)
   return math_min(m, batch_n)
 end
 
+-- 多角形分割（ローポリ背景 v3.50 の @多角形分割） -----------------------------------------
+--
+-- 1. poly_points : 場所によって細かさが変わる点群（可変半径のポアソン円盤。外周は半径に沿って並べる）
+-- 2. delaunay    : 既存の関数で三角形に分ける
+-- 3. build_polygons : 隣り合う三角形を、凸のまま辺数の上限まで結合して多角形にする
+--                     （描画は元の三角形のまま。多角形の中の対角線にはエッジを引かない）
+-- 4. build_poly_records / append_tri_list_poly : 三角形ごとの色・エッジの印を cbuffer へ詰める
+-- 既存の関数は変えていない。検証器: AI/scripts/ローポリ/verify_polymesh.py
+
+local POLY_BATCH = 256        -- ps_lpbg_poly の tri[768]（1 三角形 = 3 float4）
+local POLY_RHO = 0.9          -- 点どうしの最小距離 = POLY_RHO × その場所のセルサイズ
+local POLY_AREA_K = 0.66      -- 点の数 ≒ POLY_AREA_K × 面積 / セルサイズ² + 外周（実測で合わせた。一様 40 で見積り 1022・実測 978）
+
+local function smoothstep01(t)
+  t = clamp(t, 0, 1)
+  return t * t * (3 - 2 * t)
+end
+
+--- 密度の場 f(x, y)。0 = 粗い（セルサイズそのまま）、1 = 細かい（セルサイズ ÷ 細かさの比）。
+--- mode: 0 一様 / 1 中心が細かい / 2 周囲が細かい / 3 左 / 4 右 / 5 上 / 6 下 が細かい / 7 ランダムな斑（size 画素ごと）
+function EffectUtils_Lowpoly.density_field(mode, w, h, size, seed)
+  mode = math_floor(tonumber(mode) or 0)
+  seed = math_floor(tonumber(seed) or 0)
+  w = math_max(w, 1)
+  h = math_max(h, 1)
+  if mode == 1 or mode == 2 then
+    local cx, cy = w * 0.5, h * 0.5
+    local rmax = math_max(math_sqrt(cx * cx + cy * cy), 1)
+    return function(x, y)
+      local dx, dy = x - cx, y - cy
+      local f = smoothstep01(math_sqrt(dx * dx + dy * dy) / rmax)   -- 周囲ほど 1
+      if mode == 1 then f = 1 - f end
+      return f
+    end
+  elseif mode >= 3 and mode <= 6 then
+    return function(x, y)
+      local t
+      if mode == 3 then
+        t = 1 - x / w
+      elseif mode == 4 then
+        t = x / w
+      elseif mode == 5 then
+        t = 1 - y / h
+      else
+        t = y / h
+      end
+      return smoothstep01(t)
+    end
+  elseif mode == 7 then
+    size = math_max(tonumber(size) or 600, 10)
+    local sd = seed + 4100
+    return function(x, y)
+      local gx, gy = x / size, y / size
+      local ix, iy = math_floor(gx), math_floor(gy)
+      local fx, fy = smoothstep01(gx - ix), smoothstep01(gy - iy)
+      local a = hash21(ix, iy, sd)
+      local b = hash21(ix + 1, iy, sd)
+      local c = hash21(ix, iy + 1, sd)
+      local d = hash21(ix + 1, iy + 1, sd)
+      local v = (a + (b - a) * fx) * (1 - fy) + (c + (d - c) * fx) * fy
+      return smoothstep01((v - 0.5) * 1.8 + 0.5)    -- 値ノイズは 0.5 付近に偏るので広げる
+    end
+  end
+  return function() return 0 end
+end
+
+--- 密度つきの点群を作る。点は y → x の順に並べて返す（delaunay が速くなる並び）。
+--- 戻り値: points（{x, y, ix, iy}）、実際に使った最も粗いセルサイズ（点数上限で引き上がることがある）
+function EffectUtils_Lowpoly.poly_points(w, h, coarse, ratio, mode, size, seed)
+  seed = math_floor(tonumber(seed) or 0)
+  coarse = math_max(tonumber(coarse) or 100, 4)
+  mode = math_floor(tonumber(mode) or 0)
+  ratio = (mode == 0) and 1 or clamp(tonumber(ratio) or 1, 1, 8)
+  local field = EffectUtils_Lowpoly.density_field(mode, w, h, size, seed)
+  local function cell_at(x, y)
+    return coarse * ratio ^ (-field(x, y))
+  end
+
+  -- 点数の見積り。上限を超えるなら粗い側のセルを引き上げる（密度の比は保つ）
+  local nxs = 48
+  local nys = math_max(1, math_floor(nxs * h / w + 0.5))
+  local ax, ay = w / nxs, h / nys
+  for _ = 1, 4 do
+    local est = 0
+    for j = 0, nys - 1 do
+      for i = 0, nxs - 1 do
+        local c = cell_at((i + 0.5) * ax, (j + 0.5) * ay)
+        est = est + ax * ay / (c * c)
+      end
+    end
+    est = est * POLY_AREA_K + 2 * (w + h) / (POLY_RHO * coarse)
+    if est <= MAX_POINTS then break end
+    coarse = coarse * math_sqrt(est / MAX_POINTS) * 1.02
+  end
+
+  local pts = {}
+  local g = POLY_RHO * coarse / 2
+  local cols = math_floor(w / g) + 1
+  local stride = cols + 2
+  local grid = {}
+  local function add(x, y, r)
+    pts[#pts + 1] = { x = x, y = y, r = r }
+    local key = math_floor(y / g) * stride + math_floor(x / g)
+    local lst = grid[key]
+    if not lst then
+      lst = {}
+      grid[key] = lst
+    end
+    lst[#lst + 1] = #pts
+  end
+
+  -- 外周: 始点の角から終点の手前まで、その場所の間隔で並べる（終点の角は次の辺の始点）
+  local function add_edge(x0, y0, x1, y1)
+    local len = math_sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0))
+    local ux, uy = (x1 - x0) / len, (y1 - y0) / len
+    local list = {}
+    local t = 0
+    local step = 1
+    while t < len - 1e-6 do
+      local x, y = x0 + ux * t, y0 + uy * t
+      step = POLY_RHO * cell_at(x, y)
+      list[#list + 1] = { t = t, x = x, y = y, step = step }
+      t = t + step
+    end
+    local n = #list
+    if n >= 2 and len - list[n].t < 0.6 * list[n].step then
+      list[n] = nil
+    end
+    for i = 1, #list do
+      add(list[i].x, list[i].y, POLY_RHO * cell_at(list[i].x, list[i].y))
+    end
+  end
+  add_edge(0, 0, w, 0)
+  add_edge(w, 0, w, h)
+  add_edge(w, h, 0, h)
+  add_edge(0, h, 0, 0)
+
+  -- 内側: 細かい側の半分の歩幅の揺らした格子を候補にし、乱数の順に、近すぎなければ採る
+  local fine = coarse / ratio
+  local s = math_max(fine * 0.5, math_sqrt(w * h / 120000), 1)
+  local cands = {}
+  local ncx, ncy = math_floor(w / s), math_floor(h / s)
+  for iy = 0, ncy do
+    for ix = 0, ncx do
+      local x = (ix + hash21(ix, iy, seed + 31)) * s
+      local y = (iy + hash21(ix, iy, seed + 32)) * s
+      if x > 0 and x < w and y > 0 and y < h then
+        local c = cell_at(x, y)
+        local p = 4 * (s / c) * (s / c)            -- 1 セルあたり約 4 個の候補
+        if p >= 1 or hash21(ix, iy, seed + 33) < p then
+          cands[#cands + 1] = { x = x, y = y, c = c, k = hash21(ix, iy, seed + 34) }
+        end
+      end
+    end
+  end
+  table.sort(cands, function(u, v) return u.k < v.k end)
+
+  local cap = math_floor(MAX_POINTS * 1.3)
+  for ci = 1, #cands do
+    local cd = cands[ci]
+    local r = POLY_RHO * cd.c
+    local gx, gy = math_floor(cd.x / g), math_floor(cd.y / g)
+    local ok = true
+    for yy = gy - 2, gy + 2 do
+      for xx = gx - 2, gx + 2 do
+        local lst = grid[yy * stride + xx]
+        if lst then
+          for k = 1, #lst do
+            local q = pts[lst[k]]
+            local thr = 0.5 * (r + q.r)
+            local dx, dy = cd.x - q.x, cd.y - q.y
+            if dx * dx + dy * dy < thr * thr then
+              ok = false
+              break
+            end
+          end
+        end
+        if not ok then break end
+      end
+      if not ok then break end
+    end
+    if ok then
+      add(cd.x, cd.y, r)
+      if #pts >= cap then break end
+    end
+  end
+
+  table.sort(pts, function(u, v)
+    if u.y ~= v.y then return u.y < v.y end
+    return u.x < v.x
+  end)
+  local out = {}
+  for i = 1, #pts do
+    out[i] = { x = pts[i].x, y = pts[i].y, ix = i, iy = 0, c = pts[i].r / POLY_RHO }   -- c = その場所のセルサイズ
+  end
+  return out, coarse
+end
+
+-- 密度つきのメッシュ（ローポリ化 v3.50 の @通常）。poly_points の点群に、ジッター格子（build_points）と同じ意味の揺らぎと
+-- メッシュのアニメ（揺らぎのベクトルを位相で回す）を掛けて Delaunay にかける。外周の点は動かさない。
+-- 揺らぎの大きさは 0.25 × その場所のセルサイズ × 揺らぎ%（近い点どうしは 0.9 × セルサイズ離れているので、重なって潰れない）。
+local density_base_cache = {}
+local density_cache = {}
+
+--- 戻り値: points, tris（get_mesh と同じ形）、実際に使った最も粗いセルサイズ
+function EffectUtils_Lowpoly.get_density_mesh(w, h, cell, ratio, mode, size, seed, jitter, phase)
+  seed = math_floor(tonumber(seed) or 0)
+  phase = phase or 0
+  mode = math_floor(tonumber(mode) or 0)
+  local bkey = string.format("%d,%d,%.3f,%.3f,%d,%.3f,%d", w, h, cell or 0, ratio or 1, mode, size or 0, seed)
+  local key = string.format("%s,%.3f,%.6f", bkey, jitter or 0, phase)
+  for i = 1, #density_cache do
+    if density_cache[i].key == key then
+      local e = density_cache[i]
+      if i > 1 then
+        table.remove(density_cache, i)
+        table.insert(density_cache, 1, e)
+      end
+      return e.points, e.tris, e.used
+    end
+  end
+
+  local base, used
+  for i = 1, #density_base_cache do
+    if density_base_cache[i].key == bkey then
+      base, used = density_base_cache[i].points, density_base_cache[i].used
+      break
+    end
+  end
+  if not base then
+    base, used = EffectUtils_Lowpoly.poly_points(w, h, cell, ratio, mode, size, seed)
+    table.insert(density_base_cache, 1, { key = bkey, points = base, used = used })
+    while #density_base_cache > 2 do
+      table.remove(density_base_cache)
+    end
+  end
+
+  local jit = clamp(tonumber(jitter) or 0, 0, 100) / 100
+  local cos_p, sin_p = math_cos(phase), math_sin(phase)
+  local points = {}
+  for i = 1, #base do
+    local p = base[i]
+    local x, y = p.x, p.y
+    if jit > 0 and x > 0 and x < w and y > 0 and y < h then
+      local ox = (hash21(i, 1, seed + 61) - 0.5) * 2
+      local oy = (hash21(i, 2, seed + 62) - 0.5) * 2
+      local amp = 0.25 * p.c * jit
+      x = x + (ox * cos_p - oy * sin_p) * amp
+      y = y + (ox * sin_p + oy * cos_p) * amp
+    end
+    points[i] = { x = clamp(x, 0, w), y = clamp(y, 0, h), ix = p.ix, iy = p.iy }
+  end
+  local tris = EffectUtils_Lowpoly.delaunay(points)
+  table.insert(density_cache, 1, { key = key, points = points, tris = tris, used = used })
+  while #density_cache > MESH_CACHE_MAX do
+    table.remove(density_cache)
+  end
+  return points, tris, used
+end
+
+--- 隣り合う三角形を結合して多角形にする。
+--- 辺ごとに乱数で並べ、merge_rate（0..100）% の確率で、結合後も凸（微小な凹みは許す）で、
+--- 角の数（ほぼ一直線の頂点は数えない）が max_sides 以下のときだけ結合する。
+--- 戻り値: { points, tris（面積 0 を除いたもの）, tri_poly[i]（三角形 i の多角形の番号）, tri_mask[i]（エッジを引く辺の印。
+--- 1 = 頂点 1→2、2 = 2→3、4 = 3→1。辺の向こうが別の多角形か外のときに立つ）, polys[番号] = { verts, tris }, live（生きている番号の列） }
+function EffectUtils_Lowpoly.build_polygons(points, tris_in, merge_rate, max_sides, seed)
+  seed = math_floor(tonumber(seed) or 0)
+  merge_rate = clamp(tonumber(merge_rate) or 0, 0, 100)
+  max_sides = math_floor(tonumber(max_sides) or 3)
+
+  local tris = {}
+  for i = 1, #tris_in do
+    local t = tris_in[i]
+    local a, b, c = points[t[1]], points[t[2]], points[t[3]]
+    if math_abs(orient(a.x, a.y, b.x, b.y, c.x, c.y)) > 1e-6 then
+      tris[#tris + 1] = t
+    end
+  end
+
+  local K = 100000
+  local dir = {}
+  for i = 1, #tris do
+    local t = tris[i]
+    dir[t[1] * K + t[2]] = i
+    dir[t[2] * K + t[3]] = i
+    dir[t[3] * K + t[1]] = i
+  end
+
+  local polys, poly_of = {}, {}
+  for i = 1, #tris do
+    local t = tris[i]
+    polys[i] = { verts = { t[1], t[2], t[3] }, tris = { i } }
+    poly_of[i] = i
+  end
+
+  if merge_rate > 0 then
+    local edges = {}
+    for i = 1, #tris do
+      local t = tris[i]
+      for e = 1, 3 do
+        local a, b = t[e], t[e % 3 + 1]
+        if a < b and dir[b * K + a] then
+          edges[#edges + 1] = { a, b, hash21(a, b, seed + 900) }
+        end
+      end
+    end
+    table.sort(edges, function(u, v)
+      if u[3] ~= v[3] then return u[3] < v[3] end
+      if u[1] ~= v[1] then return u[1] < v[1] end
+      return u[2] < v[2]
+    end)
+
+    for ei = 1, #edges do
+      local a, b = edges[ei][1], edges[ei][2]
+      if hash21(a, b, seed + 901) * 100 < merge_rate then
+        local ti, tj = dir[a * K + b], dir[b * K + a]
+        local p, q = poly_of[ti], poly_of[tj]
+        if p ~= q then
+          local pv, qv = polys[p].verts, polys[q].verts
+          local pn, qn = #pv, #qv
+          -- P は a→b、Q は b→a の向きでこの辺を持つ。P を b から a まで、続けて Q の内側の頂点を並べると結合後の輪になる
+          local ia, qb
+          for i = 1, pn do
+            if pv[i] == a and pv[i % pn + 1] == b then ia = i break end
+          end
+          for i = 1, qn do
+            if qv[i] == b and qv[i % qn + 1] == a then qb = i break end
+          end
+          if ia and qb then
+            local ib = ia % pn + 1
+            local qa = qb % qn + 1
+            local merged = {}
+            for k = 0, pn - 1 do
+              merged[#merged + 1] = pv[(ib - 1 + k) % pn + 1]
+            end
+            for k = 1, qn - 2 do
+              merged[#merged + 1] = qv[(qa - 1 + k) % qn + 1]
+            end
+            local m = #merged
+            local good = m <= 16
+            if good then
+              local seen = {}
+              for i = 1, m do
+                if seen[merged[i]] then good = false break end
+                seen[merged[i]] = true
+              end
+            end
+            local corners = 0
+            if good then
+              for i = 1, m do
+                local v0 = points[merged[(i - 2) % m + 1]]
+                local v1 = points[merged[i]]
+                local v2 = points[merged[i % m + 1]]
+                local ex, ey = v1.x - v0.x, v1.y - v0.y
+                local fx, fy = v2.x - v1.x, v2.y - v1.y
+                local l = math_sqrt(ex * ex + ey * ey) * math_sqrt(fx * fx + fy * fy)
+                if l < 1e-9 then good = false break end
+                local sn = (ex * fy - ey * fx) / l
+                if sn < -0.01 then good = false break end
+                if sn > 0.01 then corners = corners + 1 end
+              end
+            end
+            if good and corners <= max_sides then
+              local keep, drop = math_min(p, q), math_max(p, q)
+              local kt, dt = polys[keep].tris, polys[drop].tris
+              for k = 1, #dt do
+                kt[#kt + 1] = dt[k]
+                poly_of[dt[k]] = keep
+              end
+              polys[keep].verts = merged
+              polys[drop] = nil
+            end
+          end
+        end
+      end
+    end
+  end
+
+  local tri_mask = {}
+  for i = 1, #tris do
+    local t = tris[i]
+    local pid = poly_of[i]
+    local mask = 0
+    for e = 1, 3 do
+      local u, v = t[e], t[e % 3 + 1]
+      local nb = dir[v * K + u]
+      if (not nb) or poly_of[nb] ~= pid then
+        mask = mask + 2 ^ (e - 1)
+      end
+    end
+    tri_mask[i] = mask
+  end
+
+  local live = {}
+  for i = 1, #tris do
+    if polys[i] then live[#live + 1] = i end
+  end
+  return { points = points, tris = tris, tri_poly = poly_of, tri_mask = tri_mask, polys = polys, live = live }
+end
+
+local poly_cache = {}
+
+--- 点群 → 三角形分割 → 多角形の結合を、パラメータをキーにメモ化して返す（色・塗りは含まない）。
+function EffectUtils_Lowpoly.get_poly_mesh(w, h, cell, ratio, mode, size, seed, merge_rate, max_sides)
+  local key = string.format("%d,%d,%.3f,%.3f,%d,%.3f,%d,%.3f,%d",
+    w, h, cell or 0, ratio or 1, math_floor(mode or 0), size or 0, math_floor(seed or 0), merge_rate or 0, math_floor(max_sides or 3))
+  for i = 1, #poly_cache do
+    if poly_cache[i].key == key then
+      local e = poly_cache[i]
+      if i > 1 then
+        table.remove(poly_cache, i)
+        table.insert(poly_cache, 1, e)
+      end
+      return e.mesh
+    end
+  end
+  local points = EffectUtils_Lowpoly.poly_points(w, h, cell, ratio, mode, size, seed)
+  local tris = EffectUtils_Lowpoly.delaunay(points)
+  local mesh = EffectUtils_Lowpoly.build_polygons(points, tris, merge_rate, max_sides, seed)
+  table.insert(poly_cache, 1, { key = key, mesh = mesh })
+  while #poly_cache > MESH_CACHE_MAX do
+    table.remove(poly_cache)
+  end
+  return mesh
+end
+
+--- 多角形の頂点の平均（グラデーションの位置に使う）。
+function EffectUtils_Lowpoly.poly_center(points, verts)
+  local sx, sy = 0, 0
+  for i = 1, #verts do
+    sx = sx + points[verts[i]].x
+    sy = sy + points[verts[i]].y
+  end
+  local n = math_max(#verts, 1)
+  return sx / n, sy / n
+end
+
+--- 三角形ごとのレコード。pay[多角形の番号] = { r, g, b, a }（a が 0 なら塗らない）。
+--- outline が true なら、塗らない面にもエッジだけを描く印（eo）を立てる。
+function EffectUtils_Lowpoly.build_poly_records(mesh, pay, outline)
+  local recs = {}
+  local points = mesh.points
+  for i = 1, #mesh.tris do
+    local t = mesh.tris[i]
+    local p0, p1, p2 = points[t[1]], points[t[2]], points[t[3]]
+    local pl = pay[mesh.tri_poly[i]]
+    recs[i] = {
+      x0 = p0.x, y0 = p0.y,
+      x1 = p1.x, y1 = p1.y,
+      x2 = p2.x, y2 = p2.y,
+      p0 = pl[1], p1 = pl[2], p2 = pl[3], p3 = pl[4],
+      m = mesh.tri_mask[i],
+      eo = (pl[4] <= 0 and outline) and 1 or 0,
+    }
+  end
+  return recs
+end
+
+--- consts の末尾に 1 バッチ分を追加する（1 三角形 = 3 float4: x0,y0,x1,y1 / x2,y2,r,g / b,a,辺の印,枠だけの印）。
+--- batch_n に満たない分は 0 で埋める。返り値は詰めた三角形数。
+function EffectUtils_Lowpoly.append_tri_list_poly(consts, recs, idx, batch_n)
+  local k = #consts
+  local m = #idx
+  for i = 1, batch_n do
+    local r = (i <= m) and recs[idx[i]] or nil
+    if r then
+      consts[k + 1] = r.x0
+      consts[k + 2] = r.y0
+      consts[k + 3] = r.x1
+      consts[k + 4] = r.y1
+      consts[k + 5] = r.x2
+      consts[k + 6] = r.y2
+      consts[k + 7] = r.p0
+      consts[k + 8] = r.p1
+      consts[k + 9] = r.p2
+      consts[k + 10] = r.p3
+      consts[k + 11] = r.m
+      consts[k + 12] = r.eo
+    else
+      for j = 1, 12 do
+        consts[k + j] = 0
+      end
+    end
+    k = k + 12
+  end
+  return math_min(m, batch_n)
+end
+
+EffectUtils_Lowpoly.POLY_BATCH = POLY_BATCH
 EffectUtils_Lowpoly.GOURAUD_BATCH = GOURAUD_BATCH
 EffectUtils_Lowpoly.MAX_POINTS = MAX_POINTS
 EffectUtils_Lowpoly.BATCH_SIZE = BATCH_SIZE

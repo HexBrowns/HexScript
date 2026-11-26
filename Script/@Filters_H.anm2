@@ -3,6 +3,19 @@ MIT No Attribution (MIT-0)
 Copyright (c) 2026 HexBrowns
 
 AviUtl2 Filter Effects - Unified multi-section script
+
+履歴（動かさない値のトラックバーを変数項目に替えた）
+  フィルムバーン v1.22.0 / 古いフィルム v1.01.0:
+    シードを --track@ から --value@ に替えた（シードにフレームを混ぜる動的な乱数）。
+  暗所視 v1.02.1 / ホログラム箔 v1.01.1 / 多面体ガラス v1.01.1 / レンズの汚れ v1.02.1 / 色ノイズ v1.11.1:
+    v1.02.0 / v1.01.0 / v1.01.0 / v1.02.0 / v1.11.0 で --value@ に替えたシードを --track@ に戻した（暗所視は、ノイズの動きが 止める の固定の模様と フレームごと の動くノイズの両方があるので、固定の側に合わせてトラックバーにした）。
+    シードは時間で変わらない固定の模様の種なので、コマ単位の切り替えや移動方法（中間点・イージング）で動かせるトラックバーにする（2026-11-12 の基準）。
+    項目名・並び・既定値・範囲は変数化の前と同じ（色ノイズの既定は -1。負のシードは全オブジェクトで同じ乱数、0 以上はレイヤー番号を足す）。
+  アナモルフィックフレア v1.11.0: サンプル数を --value@ に、パス数を数字ラベルのリスト（1 / 2 / 3）に替えた。
+    項目名・並び・既定値・範囲は同じ。数でない値は既定値、範囲外は旧トラックの範囲の整数に切り詰める。
+    保存値は数の形（0・16 など）なら引き継がれる見込み。パス数は保存値の文字（2 など）が選択肢のラベルに一致すれば引き継がれる。
+    中間点をつけていた値（数,数,…,移動方法 の形）は構文エラーになるか初期値に戻る。
+    UI 定義の型が変わるので AviUtl2 の再起動が要る。実機未確認。
 ]]
 
 @グリッチ
@@ -356,7 +369,7 @@ end
 obj.copybuffer("object", "tempbuffer")
 
 @ハレーション
---information:ハレーション@Filters_H v1.50 by HexBrowns
+--information:ハレーション@Filters_H v2.0.0 by HexBrowns
 --label:HexScript
 --filter
 --track@threshold:しきい値,0,100,70,0.1
@@ -367,7 +380,39 @@ obj.copybuffer("object", "tempbuffer")
 --select@color_space:色空間=3,HSV=3,Oklch=7
 --color@tint:色合い,0xFF8866
 --select@blend_mode:合成=0,加算=0,オーバーレイ=1,スクリーン=2
---select@blur_engine:ぼかし方式=0,標準=0,高品質(Basic_S)=1
+--select@blur_engine:ぼかし方式=0,標準=0,高品質(Basic_S)=1,高品質(光学系ボケ)=2
+--check@preview_mode:プレビューモード,1
+--track@knee:しきい値の幅,0,50,10,0.1
+--track@core_tint:芯の色合い,0,100,40,0.1
+--check@linear:リニアで合成,1
+-- v2.0.0: 作り替えた（既存の作品の見た目は変わる。項目名と選択肢は v1.61 のまま。新しい 3 項目は末尾）。
+--   フィルタオブジェクトで明るい文字の周りに縁のはっきりした平らな板が出ていた不具合を直した。原因は合成で
+--   ハローを α で割り戻していた（halo.rgb / halo.a）ことで、α が 0.001 を超える範囲の全体に同じ色が全量足されていた。
+--   A 合成を乗算済みのまま行う（加算 = 下地 + ハロー、スクリーン = 1-(1-下地)(1-ハロー)、オーバーレイは
+--     ハローの α で下地とオーバーレイの結果を混ぜる）。形の外へにじむ光も乗算済みのまま（rgb <= a）。
+--   C しきい値をソフトニーにした（しきい値の幅。Unity のブルームの式）。発光は連続に始まり、ハローの α も
+--     発光が 0 の所で連続に 0 へ行く。白（輝度 1）の発光は v1 と同じ 1 になるように、輝度 1 での重みで割る。
+--   B ぼかしをブルームの段の和にした。コアから縮小した 5 段（等倍換算の σ がおよそ 拡散 x 0.1 / 0.25 / 0.5 / 1 / 2）を
+--     前の段をぼかした絵から順に作り、小さい段から 1 つ上の段へ重み（1 / .8 / .6 / .45 / .3 を和 1 に）で足して 1 枚にする。
+--     ぼかしの範囲は σ の 2 倍（ホストの「ぼかし」の範囲 R を σ ≒ R/2 とみる。机上の近似の中間）。
+--     段の縮小率は、その段でのぼかしの範囲が 4 画素を下回らない 2 の冪。形の外へ広げる量は 拡散 x 4（最大の段の σ の 2 倍）。
+--   D リニアで合成（既定オン）: 発光をリニアにしてからぼかし、合成も下地をリニアにして足して sRGB に戻す。
+--     色相シフト・彩度は sRGB の段階で掛け、色合いは sRGB の色をリニアにして掛ける。
+--   E 段ごとの色: 段 i の寄与に lerp(白, 色合い, t_i) を掛ける。t_i は最小の段で 芯の色合い/100、最大の段で 1。
+--   プレビューモード: 段をすべてさらに 2 倍縮小する（画素 1/4・ぼかしの範囲 1/2）。
+--   cache は 元・段 0〜3・足し合わせ の 6 枚。検証器: AI/scripts/Filters_H/verify_halation_v2.py
+--   （v1.61 までの検証器は v1.61 を固定したコミットから読む。verify_halation_speed.py ほか）
+-- v1.61: ぼかし方式に「高品質(光学系ボケ)」を末尾へ足した（小数ぼかし@光学系ボケ。引数は 小数ぼかし@Basic_S と同じ 範囲・分布・サイズ固定）。
+--   「高品質(Basic_S)」を選んで Basic_S が入っていないときの落ち先を、標準の前に光学系ボケへ入れた（Basic_S → 光学系ボケ → 標準）。
+--   「高品質(光学系ボケ)」を選んで光学系ボケが使えないときは標準へ落ちる。使えると確かめた結果の覚え（v1.51）は効果ごとに持つ。
+--   光学系ボケの「プレビューモード」には、この効果のプレビューモードの状態を渡す（編集画面のプレビューで切ると光学系ボケも通常の品質で描く。出力は常に通常）。
+--   既存の保存値（標準・高品質(Basic_S)）の動きは v1.60 と同じ。
+-- v1.60: プレビューモードを足した（既定オン）。AviUtl2 の編集画面のプレビューにだけ効き、出力（WIP 出力を含む）は常に通常の品質で描く
+--   （obj.getoption("gui") が true のときだけ。出力中は false）。小ぼかし・大ぼかしを縮小して掛ける上限を 2 倍から 4 倍にし、
+--   高品質（小数ぼかし@Basic_S）でも縮小する。さらにコアの小ぼかし（ぼかしの呼び出し 1 回ぶん）を省く。
+--   個別オブジェクトのように同じ効果が何十個も重なる場面で、編集画面を軽くするための許容（ユーザーの指示）。
+--   見た目の差は、地色に重ねた 8bit の平均で 2 階調以下・縁の段のずれは通常の許容の 2 倍まで（verify_halation_speed.py の 5）。
+-- v1.51: 高品質ぼかしが使えるかの確かめ（obj.effect を 1 回）を、使えると分かったら覚えて省いた。絵は v1.50 と同じ。
 -- v1.50（強化デバッグ 7.5）: 速くした。v1.40 は 6 回のぼかしをすべて元の大きさ（広げた大きさ）で掛け、バッファの写しが
 -- 12 回あった（FHD の既定で効果ぶん約 21ms、16384x960 で約 171ms。実機 2026-10-13）。v1.50 は
 --   コア（しきい値を超えた部分 + ごく小さいぼかし）は元の大きさのまま。小ぼかし・大ぼかしは、コアを 2 倍まで縮小した
@@ -388,17 +433,17 @@ obj.copybuffer("object", "tempbuffer")
 --[[pixelshader@ps_halation_pure:
 Texture2D src : register(t0);
 SamplerState smp : register(s0);
+// v2.0.0: 並びを直した（ベクトルを先に置いて穴を作らない。色合いは段の足し合わせ ps_halation_up で掛ける）
 cbuffer constant0 : register(b0) {
+    float2 cb_step;   // v1.50: 入力の画素 / 出力の画素（縮小しないなら 1）
+    float2 cb_src;    // v1.50: 入力の大きさ
     float threshold;
+    float knee;       // v2.0.0: しきい値の幅（0〜0.5）
     float intensity;
     float hue_shift;
     float saturation;
-    float tint_r;
-    float tint_g;
-    float tint_b;
     float color_space;
-    float2 cb_step;   // v1.50: 入力の画素 / 出力の画素（縮小しないなら 1）
-    float2 cb_src;    // v1.50: 入力の大きさ
+    float linear_on;  // v2.0.0: 1 なら発光をリニアにして出す
     float cb_taps;    // v1.50: 1 行・1 列あたりに読む画素の数（縮小しないなら 1）
 };
 // ==== colorspace.hlsl ここから（AI/tools/sync_colorspace.py が書き写す。直すのは正本） ====
@@ -846,27 +891,43 @@ float3 hsv2rgb(float3 c) {
     float3 p = abs(frac(c.xxx + K.xyz) * 6.0 - K.www);
     return c.z * lerp(K.xxx, saturate(p - K.xxx), c.y);
 }
-// 1 画素ぶんのハローの元。v1.50 で v1.40 の ps_halation_pure の本体をそのまま移した（文は 1 つも変えていない。
-// 入力の画素 c を引数で受け取る。verify_colorspace_ext.py がこの本体と直す前の本文を文ごとに比べる）
+// 1 画素ぶんのハローの元（乗算済み）。v2.0.0 で作り替えた。
+//   しきい値はソフトニー（Unity のブルームの式）: soft = clamp(lum - th + knee, 0, 2 knee)^2 / (4 knee)、
+//   重み w = max(soft, lum - th) / lum。発光 = rgb x w / (輝度 1 での重み)。白の発光は v1 と同じ 1（色相シフト・彩度の前）。
+//   色相シフト・彩度（HSV / Oklch の分岐）は v1 と同じ処理を sRGB の段階で掛ける。色合いはここでは掛けない（段ごとに掛ける）。
+//   α = c.a x saturate(発光の最大のチャンネル x 強度)。発光が 0 の所で連続に 0 になり、rgb <= a を保つ
+//   （リニアの値は sRGB の値以下なので、リニアにしても保たれる。強度で 1 を超える分だけ rgb > a になりうる → 合成で切る）
 float4 halation_pure_px(float4 c) {
     if (c.a <= 0.001) return float4(0,0,0,0);
-    float3 rgb = c.rgb / c.a;
+    float3 rgb = max(c.rgb / c.a, 0.0);
     float lum = luminance(rgb);
-    if (lum < threshold) return float4(0,0,0,0);
-    float3 halo = (rgb - threshold) / max(1.0 - threshold, 0.001);
+    float kn = max(knee, 0.0);
+    float soft = clamp(lum - threshold + kn, 0.0, 2.0 * kn);
+    soft = soft * soft / (4.0 * kn + 1e-5);
+    float w = max(max(soft, lum - threshold), 0.0) / max(lum, 1e-5);
+    // 輝度 1 での重み（同じ式）。しきい値 100・幅 0 なら 0 で、発光も 0
+    float soft1 = clamp(1.0 - threshold + kn, 0.0, 2.0 * kn);
+    soft1 = soft1 * soft1 / (4.0 * kn + 1e-5);
+    float w1 = max(max(soft1, 1.0 - threshold), 0.0);
+    if (w <= 0.0 || w1 <= 1e-5) return float4(0,0,0,0);
+    float3 halo = rgb * (w / w1);
     [branch] if (color_space > 6.5) {
-        // v1.40: Oklch。しきい値より暗いチャンネルは負になるので 0 に寄せてから（HSV では彩度が 1 に張り付く所）
+        // v1.40: Oklch。明るさと色相の向きを保ったまま色相を回し、C を倍にする
         float3 lch = cs_to_space(max(halo, 0.0), 7.0);
         lch.x = frac(lch.x + hue_shift + 1.0);
         lch.y = max(lch.y * saturation, 0.0);
-        halo = cs_from_space(lch, 7.0) * float3(tint_r, tint_g, tint_b);
+        halo = cs_from_space(lch, 7.0);
     } else {
         float3 hsv = rgb2hsv(halo);
         hsv.x = frac(hsv.x + hue_shift);
         hsv.y = saturate(hsv.y * saturation);
-        halo = hsv2rgb(hsv) * float3(tint_r, tint_g, tint_b);
+        halo = hsv2rgb(hsv);
     }
-    return float4(halo * intensity * c.a, c.a);
+    halo = max(halo, 0.0);
+    float amt = saturate(max(halo.r, max(halo.g, halo.b)) * intensity);
+    float3 light = halo;
+    if (linear_on > 0.5) light = cs_to_linear(min(halo, 1.0));
+    return float4(light * intensity * c.a, amt * c.a);
 }
 // v1.50: 出力の 1 画素は入力の [floor(pos) x cb_step, + cb_step) を覆い、覆う割合で重みを付けて平均する
 // （縮小しないとき cb_step = 1・cb_taps = 1 で、v1.40 と同じく 1 画素をそのまま読む）。
@@ -923,54 +984,97 @@ float4 ps_halation_down(float4 pos : SV_Position) : SV_Target {
     return acc / (cb_step.x * cb_step.y);
 }
 ]]
---[[pixelshader@ps_halation_blend:
-Texture2D src : register(t0);
-Texture2D core_tex : register(t1);
-Texture2D blur_a_tex : register(t2);
-Texture2D blur_b_tex : register(t3);
+-- v2.0.0: 段の足し合わせ（upsample-add）。出力の格子は細かい段の解像度で、範囲は粗い段（それまでの和）を覆う大きさ。
+--   出力 = 細かい段 x fine_mul + 粗い段をバイリニアで拡大 x coarse_mul（rgb は 重み x 段の色、a は 重み。rgb <= a を保つ）。
+--   どのバッファも元の画像と同じ中心で、出力の uv を 0.5 + (uv - 0.5) x scale で読む。sampler は "clamp"（端の色で埋める）で、
+--   細かい段が出力より狭いときは、その外を 0 にする（標準のぼかしは段ごとに広がるので、粗い段ほど広い）
+--[[pixelshader@ps_halation_up:
+Texture2D fine_tex : register(t0);
+Texture2D coarse_tex : register(t1);
 SamplerState smp : register(s0);
 cbuffer constant0 : register(b0) {
+    float4 fine_mul;
+    float4 coarse_mul;
+    float2 fine_scale;
+    float2 coarse_scale;
+};
+float4 ps_halation_up(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float2 d = uv - 0.5;
+    float2 fu = 0.5 + d * fine_scale;
+    float inside = step(0.0, fu.x) * step(fu.x, 1.0) * step(0.0, fu.y) * step(fu.y, 1.0);
+    float4 f = fine_tex.Sample(smp, fu) * inside;
+    float4 c = coarse_tex.Sample(smp, 0.5 + d * coarse_scale);
+    return f * fine_mul + c * coarse_mul;
+}
+]]
+--[[pixelshader@ps_halation_blend:
+Texture2D src : register(t0);
+Texture2D halo_tex : register(t1);
+SamplerState smp : register(s0);
+// v2.0.0: ハローは段の和の 1 枚（乗算済み。リニアで合成するときはリニアの光）
+cbuffer constant0 : register(b0) {
+    float2 halo_scale;   // ハローは画像と同じ中心で、元の画像の uv を 0.5 + (uv - 0.5) x scale で読む
     float blend_mode;
     float spill;
-    float2 core_scale;    // v1.50: 各バッファは画像と同じ中心で、元の画像の uv を 0.5 + (uv - 0.5) x scale で読む
-    float2 blur_a_scale;
-    float2 blur_b_scale;
+    float linear_on;
 };
-float4 ps_halation_blend(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+// sRGB とリニアの変換（AI/tools/assets/colorspace.hlsl の cs_to_linear / cs_to_srgb と同じ式。この節の写し）
+float hal_lin1(float c) {
+    return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4);
+}
+float hal_srgb1(float c) {
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(abs(c), 1.0 / 2.4) - 0.055;
+}
+float3 hal_to_linear(float3 c) {
+    return float3(hal_lin1(c.r), hal_lin1(c.g), hal_lin1(c.b));
+}
+float3 hal_to_srgb(float3 c) {
+    float3 s = saturate(c);
+    return float3(hal_srgb1(s.r), hal_srgb1(s.g), hal_srgb1(s.b));
+}
+float4 ps_halation_blend(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
     float4 base = src.Sample(smp, uv);
-    // v1.50: ハロー = 大ぼかし x 0.7 + 小ぼかし x 0.85 + コア（v1.40 は tempbuffer へ加算で描いてから読んでいた。同じ和）。
-    // 小ぼかし・大ぼかしは縮小した画像なので、ここでバイリニアで戻す
-    float2 d = uv - 0.5;
-    float4 halo = blur_b_tex.Sample(smp, 0.5 + d * blur_b_scale) * 0.7;
-    halo += blur_a_tex.Sample(smp, 0.5 + d * blur_a_scale) * 0.85;
-    halo += core_tex.Sample(smp, 0.5 + d * core_scale);
-    float3 halorgb = halo.rgb;
-    if (halo.a > 0.001) halorgb = halo.rgb / halo.a;
-    // 形の内側（v1.30 と同じ式）。透明な画素は元の画素のまま
+    float4 halo = halo_tex.Sample(smp, 0.5 + (uv - 0.5) * halo_scale);
+    halo = max(halo, 0.0);
+    float ha = saturate(halo.a);
+    // ハローのストレートの sRGB の色（オーバーレイと形の外の色にだけ使う。どちらも α を掛けて戻すので、α が 0 へ向かうと寄与も 0 へ連続に行く）。
+    // リニアのときは光の量を sRGB にしてから α で割る（α は sRGB の発光の量なので、こうすると sRGB で合成したときと同じ明るさの色になり、
+    // 形の外の弱い光が暗い色になって下地を暗くすることが無い）
+    float3 hl = halo.rgb;
+    if (linear_on > 0.5) hl = hal_to_srgb(halo.rgb);
+    float3 hs = halo.a > 0.0001 ? saturate(hl / halo.a) : float3(0.0, 0.0, 0.0);
+    // 形の内側。v2.0.0: ハローは乗算済みのまま足す（v1 は α で割り戻して、α のある範囲の全体に同じ色を足していた）
     float4 inner = base;
     if (base.a > 0.001) {
-        float3 bgrgb = base.rgb / base.a;
-        float3 out_rgb = bgrgb;
+        float3 bg = saturate(base.rgb / base.a);
+        float3 out_rgb = bg;
         if (blend_mode < 0.5) {
-            out_rgb = saturate(bgrgb + halorgb);
+            if (linear_on > 0.5) {
+                out_rgb = hal_to_srgb(hal_to_linear(bg) + halo.rgb);
+            } else {
+                out_rgb = saturate(bg + halo.rgb);
+            }
         } else if (blend_mode < 1.5) {
-            float3 overlay = halorgb * 0.5 + 0.5;
-            out_rgb.r = bgrgb.r < 0.5 ? 2.0 * bgrgb.r * overlay.r : 1.0 - 2.0 * (1.0 - bgrgb.r) * (1.0 - overlay.r);
-            out_rgb.g = bgrgb.g < 0.5 ? 2.0 * bgrgb.g * overlay.g : 1.0 - 2.0 * (1.0 - bgrgb.g) * (1.0 - overlay.g);
-            out_rgb.b = bgrgb.b < 0.5 ? 2.0 * bgrgb.b * overlay.b : 1.0 - 2.0 * (1.0 - bgrgb.b) * (1.0 - overlay.b);
+            float3 overlay = hs * 0.5 + 0.5;
+            float3 ov = bg;
+            ov.r = bg.r < 0.5 ? 2.0 * bg.r * overlay.r : 1.0 - 2.0 * (1.0 - bg.r) * (1.0 - overlay.r);
+            ov.g = bg.g < 0.5 ? 2.0 * bg.g * overlay.g : 1.0 - 2.0 * (1.0 - bg.g) * (1.0 - overlay.g);
+            ov.b = bg.b < 0.5 ? 2.0 * bg.b * overlay.b : 1.0 - 2.0 * (1.0 - bg.b) * (1.0 - overlay.b);
+            out_rgb = lerp(bg, ov, ha);
         } else {
-            float3 screened = saturate(1.0 - (1.0 - bgrgb) * (1.0 - halorgb));
-            out_rgb = screened;
+            if (linear_on > 0.5) {
+                out_rgb = hal_to_srgb(1.0 - (1.0 - hal_to_linear(bg)) * (1.0 - saturate(halo.rgb)));
+            } else {
+                out_rgb = saturate(1.0 - (1.0 - bg) * (1.0 - saturate(halo.rgb)));
+            }
         }
-        inner = float4(saturate(out_rgb * base.a), base.a);
+        inner = float4(saturate(out_rgb) * base.a, base.a);
     }
     if (spill < 0.5) return inner;
-    // v1.31: 形の外（α の足りない分）へハローを光として出す。色はハローの色、α はハローの α。
-    // 加算もスクリーンも、下地が無ければ光の色そのものになる。乗算済みで rgb <= a を保つ
-    float glow_a = saturate(halo.a);
-    float3 glow = saturate(halorgb) * glow_a;
+    // v1.31: 形の外（α の足りない分）へハローを光として出す。色はハローの色、α はハローの α。乗算済みで rgb <= a を保つ
+    float3 glow = hs * ha;
     float rest = 1.0 - inner.a;
-    return float4(inner.rgb + glow * rest, inner.a + glow_a * rest);
+    return float4(inner.rgb + glow * rest, inner.a + ha * rest);
 }
 ]]
 
@@ -983,19 +1087,40 @@ if intensity <= 0 then return end
 -- Basic_S(小数ぼかし)の利用可否を最初に1回だけ判定する（未導入/エラー時は標準の「ぼかし」に自動フォールバック）
 -- ※「サイズ固定」を明示的にONにしないとぼかし範囲分バッファが拡張され、
 --   このフィルタ内で使っているcache退避＋再合成のサイズ前提が崩れてしまうため必須。
-local use_hq_blur = false
-if blur_engine == 1 then
-  use_hq_blur = pcall(obj.effect, "小数ぼかし@Basic_S", "範囲", 0, "分布", 2, "サイズ固定", 1)
+-- v1.51: 使えると分かったら Lua の状態に覚えて、次からは確かめの obj.effect を呼ばない（個別オブジェクトの文字ごとに
+--   毎フレーム 1 回ずつ余分に効果を呼んでいた。使えなかったときは覚えず、毎回確かめる）
+local preview = (preview_mode == 1 or preview_mode == true) and obj.getoption("gui") == true
+-- v1.61: 高品質は 小数ぼかし@Basic_S と 小数ぼかし@光学系ボケ（HQ_OPTICS）。Basic_S を選んだときは Basic_S → 光学系ボケ → 標準の順に試し、
+--   光学系ボケを選んだときは 光学系ボケ → 標準。使えると分かった効果は、効果の名前ごとに Lua の状態へ覚える
+local HQ_BASIC, HQ_OPTICS = "小数ぼかし@Basic_S", "小数ぼかし@光学系ボケ"
+local hq_name = nil
+if blur_engine == 1 or blur_engine == 2 then
+  if type(HexH_halation_hq_names) ~= "table" then HexH_halation_hq_names = {} end
+  local cand = (blur_engine == 1) and { HQ_BASIC, HQ_OPTICS } or { HQ_OPTICS }
+  for _, nm in ipairs(cand) do
+    if HexH_halation_hq_names[nm] or pcall(obj.effect, nm, "範囲", 0, "分布", 2, "サイズ固定", 1) then
+      HexH_halation_hq_names[nm] = true
+      hq_name = nm
+      break
+    end
+  end
 end
+local use_hq_blur = hq_name ~= nil
+-- v2.0.0: 光学系ボケの「プレビューモード」には常に 0 を渡す（この効果のプレビューモードで段の解像度をすでに 1/4 にしているので、
+--   光学系ボケの側でさらに間引かない）
 local function apply_blur(range)
-  if use_hq_blur then
-    obj.effect("小数ぼかし@Basic_S", "範囲", range, "分布", 2, "サイズ固定", 1)
+  if hq_name == HQ_OPTICS then
+    obj.effect(HQ_OPTICS, "範囲", range, "分布", 2, "サイズ固定", 1, "プレビューモード", 0)
+  elseif hq_name == HQ_BASIC then
+    obj.effect(HQ_BASIC, "範囲", range, "分布", 2, "サイズ固定", 1)
   else
     obj.effect("ぼかし", "範囲", range)
   end
 end
 
 local th = threshold / 100
+local kn = math.max(knee, 0) / 100
+local lin_on = (linear == 1 or linear == true) and 1 or 0
 local tr, tg, tb = color.color_from_hex(tint)
 
 -- v1.31: ハローが形の外へにじむぶん、領域を広げる（オブジェクトの外枠で光が切れないように）
@@ -1022,34 +1147,52 @@ end
 local spill = (not is_filter and blend_mode ~= 1) and 1 or 0
 local sp = math.max(spread, 1)
 
--- ぼかしの範囲（等倍の画素）と回数。v1.40 と同じ値
---   コア: しきい値の境界はそのままだと 1px 単位の硬い段差になり、外側をどれだけぼかしても
---   「貼り付けたような浮いた境目」に見えてしまう。ごく小さいぼかしで段差自体を無くす
---   小ぼかし（締まったコア発光）: 高品質時は 1 回、標準時は角を目立たなくするため 2 回に分けてぼかす
---   大ぼかし（広がる柔らかい発光）: 高品質時は 1 回、標準時は 3 回に分けて大きくぼかし多角形状の角を平均化する
-local r_core = sp * 0.12
-local r_a, n_a = sp * 0.25, 2
-local r_b, n_b = sp * 0.4, 3
-if use_hq_blur then
-  r_a, n_a = sp * 0.5, 1
-  r_b, n_b = sp * 1.2, 1
+-- v2.0.0: ブルームの段。等倍換算の σ（拡散に掛ける）と、段を足し合わせる重み（和を 1 にして使う）
+local SIGMA = { 0.1, 0.25, 0.5, 1.0, 2.0 }
+local WEIGHT = { 1.0, 0.8, 0.6, 0.45, 0.3 }
+local NLV = #SIGMA
+-- ぼかしの範囲 R は σ の 2 倍とみる（ホストの「ぼかし」の σ ≒ R / 2。机上の近似の箱 R/√3・ガウス R/2・三角の中間）
+local RANGE_PER_SIGMA = 2
+-- 段の縮小率は、その段で掛けるぼかしの範囲が縮小した画像で MIN_R 画素を下回らない 2 の冪（前の段より小さくしない）
+local MIN_R = 4
+-- 形の外へ広げる量（等倍の画素）は 拡散 x REACH_K。最大の段の σ（拡散 x 2）の 2 倍で、その先の光は 1/255 に届かない
+local REACH_K = 4
+-- プレビューモード（2026-11-25 の定義。編集画面のプレビューだけ）: 抜き出しの後の段をすべて縦横 1/2（画素 1/4）から始める。
+--   ぼかしの範囲は等倍の画素で同じなので、縮小した画像では半分になる。合成は元の解像度の元の画像に足すので、文字の輪郭は保たれる
+local KPRE = preview and 2 or 1
+
+-- 段 i で掛けるぼかしの範囲（等倍の画素）。前の段の絵をぼかして次の段を作るので、σ の分散の差の分だけ掛ける
+local R_INC, P_LV = {}, {}
+do
+  local prev_s, prev_p = 0, 1
+  for i = 1, NLV do
+    local s = sp * SIGMA[i]
+    R_INC[i] = RANGE_PER_SIGMA * math.sqrt(math.max(s * s - prev_s * prev_s, 0))
+    local p = prev_p
+    while R_INC[i] / (p * 2) >= MIN_R do p = p * 2 end
+    P_LV[i] = p
+    prev_s, prev_p = s, p
+  end
 end
 
--- v1.50: 小ぼかし・大ぼかしの縮小率（等倍の何画素を 1 画素にするか）。1 回のぼかしの範囲が、縮小した画像で
--- min_r 画素を下回らない分だけ縮める（SCALE_MAX 倍まで）。範囲が min_r 以下なら縮めない（v1.40 と同じ大きさ）。
---   合成は形の内側でハローの色を α で割ったストレートの色のまま足す（v1.30 からの式）ので、ハローの α が 0.001 を
---   超える所でハローの色が段になって現れる。縮小すると α の裾がわずかに伸び、この段の位置と裾の色の混ざり方が変わる。
---   裾を決めるのは大ぼかしなので、大ぼかしは小ぼかしより控えめに縮め（min_r 8 と 4）、どちらも 2 倍までにした
---   （机上の写しで、v1.40 との差が地色に重ねて 256 階調の 8 以内・段のずれが 1.6 画素以内。verify_halation_speed.py）。
---   高品質（小数ぼかし@Basic_S）は 1 回で大きくぼかすので縮めない（v1.40 と同じ大きさ。ハローの和の取り方だけ変えた）
-local SCALE_MAX = 2
-local function ratio_for(r, min_r)
-  if use_hq_blur or r <= min_r then return 1 end
-  local k = r / math.max(min_r, math.ceil(r / SCALE_MAX))
-  if k < 1.25 then return 1 end
-  return k
+-- 段ごとの色と重み（E）。t は最小の段で 芯の色合い / 100、最大の段で 1。リニアで合成するなら色合いの色をリニアにする
+local LV_MUL = {}
+do
+  local function srgb_lin(c)
+    if c <= 0.04045 then return c / 12.92 end
+    return ((c + 0.055) / 1.055) ^ 2.4
+  end
+  local wsum = 0
+  for i = 1, NLV do wsum = wsum + WEIGHT[i] end
+  local ct = math.max(math.min(core_tint / 100, 1), 0)
+  for i = 1, NLV do
+    local t = ct + (1 - ct) * (i - 1) / (NLV - 1)
+    local r, g, b = 1 + (tr - 1) * t, 1 + (tg - 1) * t, 1 + (tb - 1) * t
+    if lin_on == 1 then r, g, b = srgb_lin(r), srgb_lin(g), srgb_lin(b) end
+    local wt = WEIGHT[i] / wsum
+    LV_MUL[i] = { r * wt, g * wt, b * wt, wt }
+  end
 end
-local K_a, K_b = ratio_for(r_a, 4), ratio_for(r_b, 8)
 
 -- 標準の「ぼかし」が 1 回で各辺を広げる量の見積もり（高品質は「サイズ固定」で広げない）
 local function grow(r)
@@ -1057,32 +1200,98 @@ local function grow(r)
   return math.floor(r + 0.5)
 end
 
--- 作業の大きさの見積もり。w, h はぼかす前の画像（広げた後）、k0 はコアの縮小率（枠に収まらないときだけ 1 より大きい）。
--- cache は 元（w x h）・コア・小ぼかし・大ぼかし の 4 枚（tempbuffer は使わない）。戻り値は 合計ドット数, コアの幅, 高さ
-local function plan(w, h, k0)
-  local cw, ch = math.max(1, math.ceil(w / k0)), math.max(1, math.ceil(h / k0))
-  local g0 = grow(r_core * cw / w)
-  local Cw, Ch = cw + 2 * g0, ch + 2 * g0
-  local kc = w / cw
-  local function small(K, r, n)
-    local step = K / kc
-    local sw, sh = Cw, Ch
-    if step > 1 then
-      sw, sh = math.max(1, math.ceil(Cw / step)), math.max(1, math.ceil(Ch / step))
-    end
-    local g = n * grow(r / (kc * Cw / sw))
-    return (sw + 2 * g) * (sh + 2 * g)
-  end
-  return w * h + Cw * Ch + small(K_a, r_a, n_a) + small(K_b, r_b, n_b), cw, ch
+-- 縮小で 1 行・1 列あたりに読む画素の数。縮小率が整数なら覆う画素はちょうどその数（ps_halation_pure の読み方）
+local function taps_for(sx, sy)
+  if sx == 1 and sy == 1 then return 1 end
+  local m = math.max(sx, sy)
+  if sx == math.floor(sx) and sy == math.floor(sy) then return m end
+  return math.ceil(m) + 1
 end
 
--- コアの縮小率。枠（EffectUtils_Budget.BUDGET）に収まるまで 5% ずつ上げる。CORE_SCALE_MAX でも収まらなければ nil
+-- 段を作って足し合わせる。w, h はぼかす前（広げた後）の画像、k0 は枠に収めるための追加の縮小率（収まるなら 1）。
+-- dry なら描かずに大きさだけ見積もる。戻り値は cache の合計ドット数（元・段 0〜3・足し合わせの最大）と、足し合わせの 1 枚の
+-- 大きさ（w, h と、1 画素が覆う等倍の画素 kx, ky）。dry でなければ object に足し合わせの 1 枚が残る
+local function run_levels(w, h, k0, dry)
+  local total = w * h
+  local F = P_LV[1] * KPRE * k0
+  local cw, ch = math.max(1, math.ceil(w / F)), math.max(1, math.ceil(h / F))
+  local sx, sy = w / cw, h / ch
+  if not dry then
+    -- [1] 段 0: しきい値を超えた部分を抜き出しながら縮小する（元の画像は cache:halation/src）
+    obj.clearbuffer("object", cw, ch)
+    obj.pixelshader("ps_halation_pure", "object", "cache:halation/src", {
+      sx, sy, w, h, th, kn, intensity / 100, hue_shift / 360, saturation / 100, color_space, lin_on, taps_for(sx, sy),
+    })
+  end
+  local cur_w, cur_h, kx, ky = cw, ch, sx, sy
+  local lv = {}
+  for i = 1, NLV do
+    if i > 1 then
+      -- [2] 前の段（ぼかした後）を縮小して次の段にする
+      local step = P_LV[i] / P_LV[i - 1]
+      if step > 1 then
+        local nw, nh = math.max(1, math.ceil(cur_w / step)), math.max(1, math.ceil(cur_h / step))
+        local stx, sty = cur_w / nw, cur_h / nh
+        if not dry then
+          obj.clearbuffer("object", nw, nh)
+          obj.pixelshader("ps_halation_down", "object", lv[i - 1].name, { stx, sty, cur_w, cur_h, taps_for(stx, sty) })
+        end
+        cur_w, cur_h, kx, ky = nw, nh, kx * stx, ky * sty
+      end
+    end
+    local r = R_INC[i] / kx
+    if dry then
+      local g = grow(r)
+      cur_w, cur_h = cur_w + 2 * g, cur_h + 2 * g
+    else
+      if r > 0.01 then apply_blur(r) end
+      cur_w, cur_h = obj.w, obj.h
+    end
+    lv[i] = { name = "cache:halation/l" .. (i - 1), w = cur_w, h = cur_h, kx = kx, ky = ky }
+    if i < NLV then
+      total = total + cur_w * cur_h
+      if not dry then obj.copybuffer(lv[i].name, "object") end
+    end
+  end
+  -- [3] 小さい段から 1 つ上の段へ足す（upsample-add）。出力は細かい段の解像度で、範囲は粗い段を覆う大きさ
+  local top = lv[NLV]
+  local acc = { w = top.w, h = top.h, kx = top.kx, ky = top.ky }
+  local acc_max = top.w * top.h
+  if not dry then obj.copybuffer("cache:halation/acc", "object") end
+  local cmul = LV_MUL[NLV]
+  for i = NLV - 1, 1, -1 do
+    local f = lv[i]
+    local gx = math.max(0, math.ceil((acc.w * acc.kx / f.kx - f.w) / 2))
+    local gy = math.max(0, math.ceil((acc.h * acc.ky / f.ky - f.h) / 2))
+    local uw, uh = f.w + 2 * gx, f.h + 2 * gy
+    if not dry then
+      local m = LV_MUL[i]
+      obj.clearbuffer("object", uw, uh)
+      obj.pixelshader("ps_halation_up", "object", { f.name, "cache:halation/acc" }, {
+        m[1], m[2], m[3], m[4], cmul[1], cmul[2], cmul[3], cmul[4],
+        uw / f.w, uh / f.h, uw * f.kx / (acc.w * acc.kx), uh * f.ky / (acc.h * acc.ky),
+      }, "copy", "clamp")
+    end
+    acc = { w = uw, h = uh, kx = f.kx, ky = f.ky }
+    cmul = { 1, 1, 1, 1 }
+    if i > 1 then
+      acc_max = math.max(acc_max, uw * uh)
+      if not dry then obj.copybuffer("cache:halation/acc", "object") end
+    end
+  end
+  return total + acc_max, acc
+end
+
+local function plan(w, h, k0)
+  return (run_levels(w, h, k0, true))
+end
+
+-- 追加の縮小率。枠（EffectUtils_Budget.BUDGET）に収まるまで 5% ずつ上げる。CORE_SCALE_MAX でも収まらなければ nil
 local CORE_SCALE_MAX = 4
 local function plan_core(w, h)
   local k0 = 1
   while true do
-    local total, cw, ch = plan(w, h, k0)
-    if total <= budget.BUDGET then return k0, cw, ch end
+    if plan(w, h, k0) <= budget.BUDGET then return k0 end
     if k0 >= CORE_SCALE_MAX then return nil end
     k0 = math.min(k0 * 1.05, CORE_SCALE_MAX)
   end
@@ -1096,11 +1305,10 @@ if not plan_core(W0, H0) then
 end
 
 if spill == 1 then
-  -- ハローの届く距離は、コアの小ぼかしと大ぼかしの範囲の和（標準 0.12 + 0.4 × 3、高品質 0.12 + 1.2。どちらも 1.32 倍）
-  local reach = math.ceil(sp * 1.32) + PAD_MARGIN
-  -- plan_pad（複製）は CACHE_BUDGET（1500 万）と比べるので、コアを縮めずに済む EffectUtils_Budget.BUDGET（1400 万）に読み替える
+  local reach = math.ceil(sp * REACH_K) + PAD_MARGIN
+  -- plan_pad（複製）は CACHE_BUDGET（1500 万）と比べるので、追加の縮小をせずに済む EffectUtils_Budget.BUDGET（1400 万）に読み替える
   local function cost(px, py)
-    return (plan(W0 + 2 * px, H0 + 2 * py, 1)) + (CACHE_BUDGET - budget.BUDGET)
+    return plan(W0 + 2 * px, H0 + 2 * py, 1) + (CACHE_BUDGET - budget.BUDGET)
   end
   local pad_x, pad_y = plan_pad(reach, reach, W0, H0, cost)
   if pad_x > 0 or pad_y > 0 then
@@ -1109,62 +1317,19 @@ if spill == 1 then
 end
 
 local ow, oh = obj.w, obj.h
-local k0, cw, ch = plan_core(ow, oh)
+local k0 = plan_core(ow, oh)
 if not k0 then
   -- 広げたぶんで収まらなくなった（plan_pad が枠を見ているので起きないはずの安全弁）
   budget.refuse("ハレーション@Filters_H", ow, oh)
   return
 end
 
-local function taps_for(sx, sy)
-  if sx == 1 and sy == 1 then return 1 end
-  return math.ceil(math.max(sx, sy)) + 1
-end
-
--- [1] コア: しきい値を超えた部分を抜き出す（枠に収まらない大きさでは縮小しながら）→ ごく小さいぼかし。
---     元の画像は cache に退避する（ぼかしは object にしか掛けられないため）
 obj.copybuffer("cache:halation/src", "object")
-local sx0, sy0 = ow / cw, oh / ch
-if cw ~= ow or ch ~= oh then
-  obj.clearbuffer("object", cw, ch)
-end
-obj.pixelshader("ps_halation_pure", "object", "cache:halation/src", {
-  th, intensity / 100, hue_shift / 360, saturation / 100, tr, tg, tb, color_space,
-  sx0, sy0, ow, oh, taps_for(sx0, sy0),
-})
-apply_blur(r_core / sx0)
-local Cw, Ch = obj.w, obj.h
-obj.copybuffer("cache:halation/core", "object")
-
--- [2] 小ぼかし・大ぼかし: コアを縮小してからぼかす（ぼかしの範囲は等倍で v1.40 と同じ）。
---     戻り値は合成で読むときの uv の倍率（バッファが覆う等倍の幅に対する元の画像の幅の比）
-local function blurred(K, r, n, name)
-  local kx, ky = sx0, sy0   -- 1 画素が覆う等倍の画素
-  local step = K / sx0
-  if step > 1 then
-    local sw, sh = math.max(1, math.ceil(Cw / step)), math.max(1, math.ceil(Ch / step))
-    local stx, sty = Cw / sw, Ch / sh
-    obj.clearbuffer("object", sw, sh)
-    obj.pixelshader("ps_halation_down", "object", "cache:halation/core", { stx, sty, Cw, Ch, taps_for(stx, sty) })
-    kx, ky = sx0 * stx, sy0 * sty
-  else
-    obj.copybuffer("object", "cache:halation/core")
-  end
-  for _ = 1, n do
-    apply_blur(r / kx)
-  end
-  obj.copybuffer(name, "object")
-  return ow / (obj.w * kx), oh / (obj.h * ky)
-end
-local asx, asy = blurred(K_a, r_a, n_a, "cache:halation/blur_a")
-local bsx, bsy = blurred(K_b, r_b, n_b, "cache:halation/blur_b")
-
--- [3] コア + 小ぼかし x 0.85 + 大ぼかし x 0.7 をハローにして合成する（ハローの和は合成のシェーダーで取る）。
---     どのバッファも元の画像と同じ中心なので、uv を中心から倍率で伸ばして読む（ぼかしで膨らんだ分は外に出て読まれない）
+local _, acc = run_levels(ow, oh, k0, false)
+-- [4] 合成。元の画像（元の解像度）の cache へ描いて object へ戻す（足し合わせの 1 枚は object にあり、元の画像より大きいことがある）
+obj.pixelshader("ps_halation_blend", "cache:halation/src", { "cache:halation/src", "object" },
+  { ow / (acc.w * acc.kx), oh / (acc.h * acc.ky), blend_mode, spill, lin_on }, "copy", "clamp")
 obj.copybuffer("object", "cache:halation/src")
-obj.pixelshader("ps_halation_blend", "object",
-  { "cache:halation/src", "cache:halation/core", "cache:halation/blur_a", "cache:halation/blur_b" },
-  { blend_mode, spill, ow / (Cw * sx0), oh / (Ch * sy0), asx, asy, bsx, bsy }, "copy", "clamp")
 
 @ライトリーク
 --information:ライトリーク@Filters_H v2.10 by HexBrowns
@@ -1775,7 +1940,7 @@ obj.pixelshader("ps_vignette", "object", "object", {
 })
 
 @アナモルフィックフレア
---information:アナモルフィックフレア@Filters_H v1.10 by HexBrowns
+--information:アナモルフィックフレア@Filters_H v1.11.0 by HexBrowns
 --label:HexScript
 --filter
 --group:基本
@@ -1786,8 +1951,8 @@ obj.pixelshader("ps_vignette", "object", "object", {
 --track@width:拡散幅,1,100,30,0.1
 --track@spread:拡散距離,0.1,10,2,0.1
 --group:品質
---track@sample_count:サンプル数,4,32,16,1
---track@pass_count:パス数,1,3,2,1
+--value@sample_count:サンプル数,16
+--select@pass_count:パス数=2,1=1,2=2,3=3
 --check@quality_mode:高品質モード,false
 --group:色
 --color@tint:色合い,0xFF8866
@@ -2429,8 +2594,15 @@ local noise = require("EffectUtils_Noise")
 
 intensity = math.max(0, math.min(200, intensity or 0))
 threshold = math.max(0, math.min(255, threshold or 100))
-sample_count = math.max(4, math.min(32, math.floor((sample_count or 16) + 0.5)))
-pass_count = math.max(1, math.min(3, math.floor((pass_count or 2) + 0.5)))
+-- v1.11.0: サンプル数は変数項目（--value@）、パス数は数字ラベルのリスト（--select@）。数でなければ既定値にし、旧トラックの範囲の整数にする
+do
+  local v = tonumber(sample_count)
+  if v == nil or v ~= v then v = 16 end
+  sample_count = math.max(4, math.min(32, math.floor(v + 0.5)))
+  v = tonumber(pass_count)
+  if v == nil or v ~= v then v = 2 end
+  pass_count = math.max(1, math.min(3, math.floor(v + 0.5)))
+end
 width = math.max(1, math.min(100, width or 30))
 spread = math.max(0.1, math.min(10, spread or 2))
 saturation = math.max(0, math.min(200, saturation or 120))
@@ -2942,13 +3114,13 @@ obj.pixelshader("ps_fog", "object", "object", {
 })
 
 @フィルムバーン
---information:フィルムバーン@Filters_H v1.21 by HexBrowns
+--information:フィルムバーン@Filters_H v1.22.0 by HexBrowns
 --label:HexScript
 --filter
 --track@intensity:強度,0,100,50,0.1
 --track@edge:エッジ,0,100,70,0.1
 --track@spread:拡散,1,200,35,0.1
---track@burn_seed:シード,0,10000,0,1
+--value@burn_seed:シード,0
 --color@burn_color:焼色,0xFF6622
 --select@edge_side:位置=0,右=0,左=1,上=2,下=3
 -- v1.20: edge_mask の x の 2 分岐が入れ替わっており、位置=右 で左端が焼けていた
@@ -2998,6 +3170,12 @@ local noise = require("EffectUtils_Noise")
 if intensity <= 0 then return end
 
 local br, bg, bb = color.color_from_hex(burn_color)
+-- v1.22.0: シードは変数項目（--value@）。数でなければ 0、旧トラックの範囲（0〜10000）の整数にする
+do
+  local v = tonumber(burn_seed)
+  if v == nil or v ~= v then v = 0 end
+  burn_seed = math.max(0, math.min(10000, math.floor(v)))
+end
 local offset = noise.noise_offset(burn_seed, obj.frame, true)
 
 -- float3 burn_color は 16 バイト境界をまたぐためスロット4へ押し出される。
@@ -5777,7 +5955,7 @@ obj.pixelshader("ps_ct_apply", "object", {"object", "cache:ct/lut"}, {
 }, "copy", "dot")
 
 @局所トーン補正
---information:局所トーン補正@Filters_H v1.01 by HexBrowns
+--information:局所トーン補正@Filters_H v1.2.0 by HexBrowns
 --label:HexScript
 --filter
 --track@strength:強さ,0,100,50,0.1
@@ -5787,6 +5965,44 @@ obj.pixelshader("ps_ct_apply", "object", {"object", "cache:ct/lut"}, {
 --track@max_gain:持ち上げの上限,1,32,4,0.01
 --track@cast:色かぶり補正,0,100,0,0.1
 --select@quality:品質=1,速度=0,標準=1,高品質=2
+--group:出力補正,false
+--select@ovf_mode:色オーバーフロー修正=1,なし=0,足切り頭打ち=1,色差縮小(標準)=2,色差縮小(改)=3
+--group
+--[[pixelshader@ps_ovf_rx:
+// 色オーバーフロー修正。乗算済みの色を 0 <= rgb <= a <= 1 に収める。
+// 正本: オープングロー_H の OG_Final 末尾の同じ式。直すときは同じ式を持つスクリプトを同時に直す。
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float mode;
+};
+// 色差縮小: 輝度 L を保ったまま、色と L の差を縮めてはみ出しを消す
+float3 ovf_shrink(float3 rgb, float a, bool wide) {
+    float3 res = float3(0.0, 0.0, 0.0);
+    float L = dot(float3(0.30, 0.59, 0.11), rgb);
+    if (L >= a) {
+        res = float3(a, a, a);
+    } else if (L > 0.0) {
+        float n = min(min(rgb.r, rgb.g), min(rgb.b, 0.0));
+        float x = max(max(rgb.r, rgb.g), max(rgb.b, a));
+        float sn = L / (L - n);
+        float sx = (a - L) / (x - L);
+        float k = wide ? min(sn, sx) : sn * sx;
+        res = L + (rgb - L) * k;
+    }
+    return res;
+}
+float4 ps_ovf_rx(float4 pos : SV_Position) : SV_Target {
+    float4 c = src.Load(int3(pos.xy, 0));
+    float a = saturate(max(max(c.r, c.g), max(c.b, c.a)));
+    float3 rgb = c.rgb;
+    if (mode < 1.5) {
+        rgb = clamp(rgb, 0.0, a);
+    } else {
+        rgb = ovf_shrink(rgb, a, mode > 2.5);
+    }
+    return float4(rgb, a);
+}
+]]
 --[[pixelshader@ps_rx_down:
 Texture2D src : register(t0);
 cbuffer constant0 : register(b0) {
@@ -6000,9 +6216,13 @@ obj.pixelshader("ps_rx_apply", "object", {"object", "cache:rx/g1", "cache:rx/g2"
   strength / 100, math.log(mid_gray / 100), math.log(math.max(max_gain, 1)), cast / 100, 1 / 4096,
   (quality == 2) and 1 or 0,
 }, "copy", "clamp")
+-- 色オーバーフロー修正: 乗算済みの色がアルファを超えた画素を直す。後ろに重ねるフィルタで色が破綻するのを防ぐ
+if ovf_mode > 0 then
+  obj.pixelshader("ps_ovf_rx", "object", "object", { ovf_mode })
+end
 
 @ローカルラプラシアン
---information:ローカルラプラシアン@Filters_H v1.00 by HexBrowns
+--information:ローカルラプラシアン@Filters_H v1.1.0 by HexBrowns
 --label:HexScript
 --filter
 --track@detail:ディテール,-100,100,0,0.1
@@ -6011,6 +6231,44 @@ obj.pixelshader("ps_rx_apply", "object", {"object", "cache:rx/g1", "cache:rx/g2"
 --track@sat_comp:彩度の補正,0,100,0,0.1
 --track@strength:強さ,0,100,100,0.1
 --select@quality:品質=1,速度=0,標準=1,高品質=2
+--group:出力補正,false
+--select@ovf_mode:色オーバーフロー修正=1,なし=0,足切り頭打ち=1,色差縮小(標準)=2,色差縮小(改)=3
+--group
+--[[pixelshader@ps_ovf_ll:
+// 色オーバーフロー修正。乗算済みの色を 0 <= rgb <= a <= 1 に収める。
+// 正本: オープングロー_H の OG_Final 末尾の同じ式。直すときは同じ式を持つスクリプトを同時に直す。
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float mode;
+};
+// 色差縮小: 輝度 L を保ったまま、色と L の差を縮めてはみ出しを消す
+float3 ovf_shrink(float3 rgb, float a, bool wide) {
+    float3 res = float3(0.0, 0.0, 0.0);
+    float L = dot(float3(0.30, 0.59, 0.11), rgb);
+    if (L >= a) {
+        res = float3(a, a, a);
+    } else if (L > 0.0) {
+        float n = min(min(rgb.r, rgb.g), min(rgb.b, 0.0));
+        float x = max(max(rgb.r, rgb.g), max(rgb.b, a));
+        float sn = L / (L - n);
+        float sx = (a - L) / (x - L);
+        float k = wide ? min(sn, sx) : sn * sx;
+        res = L + (rgb - L) * k;
+    }
+    return res;
+}
+float4 ps_ovf_ll(float4 pos : SV_Position) : SV_Target {
+    float4 c = src.Load(int3(pos.xy, 0));
+    float a = saturate(max(max(c.r, c.g), max(c.b, c.a)));
+    float3 rgb = c.rgb;
+    if (mode < 1.5) {
+        rgb = clamp(rgb, 0.0, a);
+    } else {
+        rgb = ovf_shrink(rgb, a, mode > 2.5);
+    }
+    return float4(rgb, a);
+}
+]]
 --[[pixelshader@ps_ll_luma_down:
 Texture2D src : register(t0);
 cbuffer constant0 : register(b0) {
@@ -6359,9 +6617,13 @@ for _, t in ipairs(batches(1)) do res[#res + 1] = t end
 obj.pixelshader("ps_ll_apply", "object", res, {
   L_LO, dg, K, B, sr, alpha_d, beta_t, strength / 100, EPS, sat_gain,
 }, "copy", "clamp")
+-- 色オーバーフロー修正: 乗算済みの色がアルファを超えた画素を直す。後ろに重ねるフィルタで色が破綻するのを防ぐ
+if ovf_mode > 0 then
+  obj.pixelshader("ps_ovf_ll", "object", "object", { ovf_mode })
+end
 
 @暗所視
---information:暗所視@Filters_H v1.01 by HexBrowns
+--information:暗所視@Filters_H v1.3.0 by HexBrowns
 --label:HexScript
 --filter
 --track@darkness:暗さ,0,100,70,0.1
@@ -6373,6 +6635,44 @@ obj.pixelshader("ps_ll_apply", "object", res, {
 --track@noise:ノイズ,0,100,30,0.1
 --select@noise_motion:ノイズの動き=0,止める=0,フレームごと=1
 --track@seed:シード,0,9999,0,1
+--group:出力補正,false
+--select@ovf_mode:色オーバーフロー修正=1,なし=0,足切り頭打ち=1,色差縮小(標準)=2,色差縮小(改)=3
+--group
+--[[pixelshader@ps_ovf_sv:
+// 色オーバーフロー修正。乗算済みの色を 0 <= rgb <= a <= 1 に収める。
+// 正本: オープングロー_H の OG_Final 末尾の同じ式。直すときは同じ式を持つスクリプトを同時に直す。
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float mode;
+};
+// 色差縮小: 輝度 L を保ったまま、色と L の差を縮めてはみ出しを消す
+float3 ovf_shrink(float3 rgb, float a, bool wide) {
+    float3 res = float3(0.0, 0.0, 0.0);
+    float L = dot(float3(0.30, 0.59, 0.11), rgb);
+    if (L >= a) {
+        res = float3(a, a, a);
+    } else if (L > 0.0) {
+        float n = min(min(rgb.r, rgb.g), min(rgb.b, 0.0));
+        float x = max(max(rgb.r, rgb.g), max(rgb.b, a));
+        float sn = L / (L - n);
+        float sx = (a - L) / (x - L);
+        float k = wide ? min(sn, sx) : sn * sx;
+        res = L + (rgb - L) * k;
+    }
+    return res;
+}
+float4 ps_ovf_sv(float4 pos : SV_Position) : SV_Target {
+    float4 c = src.Load(int3(pos.xy, 0));
+    float a = saturate(max(max(c.r, c.g), max(c.b, c.a)));
+    float3 rgb = c.rgb;
+    if (mode < 1.5) {
+        rgb = clamp(rgb, 0.0, a);
+    } else {
+        rgb = ovf_shrink(rgb, a, mode > 2.5);
+    }
+    return float4(rgb, a);
+}
+]]
 --[[pixelshader@ps_sv_down:
 Texture2D src : register(t0);
 cbuffer constant0 : register(b0) {
@@ -6565,9 +6865,13 @@ obj.pixelshader("ps_sv_final", "object", {"object", b1, b2}, {
   math.max(threshold / 100, 0.001), sharp, noise / 100, math.floor(seed + 0.5),
   (noise_motion == 1) and obj.frame or 0, use_blur and 1 or 0, dim / 100,
 }, "copy", "clamp")
+-- 色オーバーフロー修正: 乗算済みの色がアルファを超えた画素を直す。後ろに重ねるフィルタで色が破綻するのを防ぐ
+if ovf_mode > 0 then
+  obj.pixelshader("ps_ovf_sv", "object", "object", { ovf_mode })
+end
 
 @ホログラム箔
---information:ホログラム箔@Filters_H v1.00 by HexBrowns
+--information:ホログラム箔@Filters_H v1.01.1 by HexBrowns
 --label:HexScript
 --filter
 --track@strength:強さ,0,100,100,0.1
@@ -6837,7 +7141,7 @@ obj.pixelshader("ps_hf_main", "object", {"object", res_atlas}, {
 }, "copy", "clamp")
 
 @多面体ガラス
---information:多面体ガラス@Filters_H v1.00 by HexBrowns
+--information:多面体ガラス@Filters_H v1.01.1 by HexBrowns
 --label:HexScript
 --filter
 --track@strength:強さ,0,100,100,0.1
@@ -7066,7 +7370,7 @@ obj.pixelshader("ps_fg_main", "object", {"object"}, {
 }, "copy", "clamp")
 
 @レンズの汚れ
---information:レンズの汚れ@Filters_H v1.01 by HexBrowns
+--information:レンズの汚れ@Filters_H v1.02.1 by HexBrowns
 --label:HexScript
 --filter
 --track@threshold:しきい値,0,100,60,0.1
@@ -7315,7 +7619,7 @@ obj.pixelshader("ps_ld_apply", "object", {"object", "cache:ld/a"}, {
 }, "copy", "clamp")
 
 @古いフィルム
---information:古いフィルム@Filters_H v1.00 by HexBrowns
+--information:古いフィルム@Filters_H v1.01.0 by HexBrowns
 --label:HexScript
 --filter
 --track@scratch_amount:傷の量,0,100,30,0.1
@@ -7326,7 +7630,7 @@ obj.pixelshader("ps_ld_apply", "object", {"object", "cache:ld/a"}, {
 --select@dust_color:ゴミの色=2,白=0,黒=1,両方=2
 --track@weave:揺れ,0,50,2,0.01
 --track@flicker:明滅,0,100,15,0.1
---track@seed:シード,0,9999,0,1
+--value@seed:シード,0
 --[[pixelshader@ps_of_main:
 Texture2D src : register(t0);
 SamplerState smp : register(s0);
@@ -7422,7 +7726,13 @@ if w < 1 or h < 1 then return end
 
 local N_SCR = 10
 local f = obj.frame
-local sd = math.floor(seed + 0.5)
+-- v1.01.0: シードは変数項目（--value@）。数でなければ 0、旧トラックの範囲（0〜9999）の整数にする
+local sd
+do
+  local v = tonumber(seed)
+  if v == nil or v ~= v then v = 0 end
+  sd = math.max(0, math.min(9999, math.floor(v)))
+end
 local band, bxor, rshift, lshift, tobit = bit.band, bit.bxor, bit.rshift, bit.lshift, bit.tobit
 
 -- 32bit の積の下位 32bit（倍精度で厳密に扱える 16bit ずつに割る。EffectUtils_Lowpoly の mul32 と同じ）
@@ -8521,7 +8831,7 @@ if data == nil or dw ~= W or dh ~= H then return end
 if mod.render(id, data, W, H) == 1 then obj.putpixeldata("object", data, W, H, "rgba") end
 
 @色ノイズ
---information:色ノイズ@Filters_H v1.10 by HexBrowns
+--information:色ノイズ@Filters_H v1.11.1 by HexBrowns
 --label:HexScript
 --filter
 --select@color_space:色空間=4,HSL=4,Oklch=7

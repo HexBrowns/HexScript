@@ -1,5 +1,5 @@
 --[[
-ローポリ背景.obj2 v3.40
+ローポリ背景.obj2 v3.50
 
   通常 : ジッター格子 → Bowyer-Watson Delaunay → cbuffer バッチで HLSL 塗り。
          メッシュは EffectUtils_Lowpoly 側でメモ化されるので、アニメ OFF なら再計算は初回のみ。
@@ -36,12 +36,20 @@ v3.40 で「塗り方」（フラット / グーロー）を足した（候補 1
   明転は頂点ごとの係数を補間して掛ける。エッジ色の明転は フラット と同じ扱い（通常 は中央の係数、高速 は画素ごと）。
   検証器: AI/scripts/ローポリ/verify_gouraud.py
 
+v3.50 で 3 つ目のセクション「多角形分割」を足した（通常・高速のコードは変えていない）。
+  場所によって細かさが変わる点群（中心 / 周囲 / 左右上下 / ランダムな斑。可変半径のポアソン円盤）を
+  Delaunay で三角形に分け、隣り合う三角形を凸のまま辺数の上限まで結合して、三角形・四角形・五角形…が混ざる 1 枚の分割にする。
+  面ごとに 1 色で、塗る面の割合を決められる（塗らない面は透明のまま。線だけ描くこともできる）。
+  エッジは多角形の境界だけに引く（結合した三角形の対角線には引かない）。アニメ・明転・グーローは付けていない。
+  点群・結合・cbuffer 詰めは EffectUtils_Lowpoly（poly_points / build_polygons / build_poly_records）。
+  検証器: AI/scripts/ローポリ/verify_polymesh.py
+
 ※このコメント内で行頭に @ を置かないこと。ホストはブロックコメントの中も走査し、
   行頭 @ をセクション区切りとして扱うため、偽のスクリプトがエフェクト一覧に並ぶ。
 ]]
 
 @通常
---information:通常@ローポリ背景 v3.40 by HexBrowns
+--information:通常@ローポリ背景 v3.50 by HexBrowns
 --label:HexScript
 --object
 
@@ -367,7 +375,7 @@ else
 end
 
 @高速
---information:高速@ローポリ背景 v3.40 by HexBrowns
+--information:高速@ローポリ背景 v3.50 by HexBrowns
 --label:HexScript
 --object
 
@@ -1265,3 +1273,213 @@ local consts = {
 
 obj.clearbuffer("object", w, h)
 obj.pixelshader("ps_lpbg_grid", "object", nil, consts)
+
+@多角形分割
+--information:多角形分割@ローポリ背景 v3.50 by HexBrowns
+--label:HexScript
+--object
+
+--check@screen_size:画面サイズに合わせる,1
+--track@width:幅,1,8192,1920,1
+--hide@width:screen_size==1
+--track@height:高さ,1,8192,1080,1
+--hide@height:screen_size==1
+
+--group:分割の設定
+--track@cell_size:セルサイズ,20,500,120,1
+--track@seed:シード,-9999,9999,0,1
+--separator:※CPU分割のためセルは点数上限で自動的に粗くなります
+--group
+
+--group:密度の変化,1
+--select@density_mode:密度の分布=0,一様=0,中心が細かい=1,周囲が細かい=2,左ほど細かい=3,右ほど細かい=4,上ほど細かい=5,下ほど細かい=6,ランダムな斑=7
+--track@density_ratio:細かさの比(倍),1,8,3,0.1
+--hide@density_ratio:density_mode==0
+--track@density_size:斑の大きさ(px),100,2000,600,1
+--hide@density_size:density_mode~=7
+--separator:※セルサイズは最も粗い所の大きさ。細かい所は細かさの比で割った大きさ
+--group
+
+--group:多角形の結合,1
+--track@merge_rate:結合率(%),0,100,60,1
+--track@max_sides:最大の辺数,3,8,5,1
+--separator:※隣り合う三角形を凸のまま結合します。0% で三角形だけ
+--group
+
+--group:塗り,1
+--track@fill_rate:塗る面の割合(%),0,100,100,1
+--group
+
+--group:色設定,1
+--color@color1:色1,0x2980b9
+--color@color2:色2,0x8e44ad
+--select@color_mode:配色=0,グラデーション=0,ランダム=1
+--select@gradient_dir:グラデ方向=0,縦=0,横=1,対角=2
+--hide@gradient_dir:color_mode==1
+--track@mix_ratio:色2の割合,0,100,50,1
+--hide@mix_ratio:color_mode==0
+--track@mix_blend:中間色,0,100,0,1
+--hide@mix_blend:color_mode==0
+--select@color_space:色空間=0,sRGB=0,リニア=1,Oklab=2,HSV=3,HSL=4,Lab=5,LCh=6,Oklch=7,HWB=9
+--select@hue_path:色相経路=0,短経路=0,長経路=1
+--hide@hue_path:color_space<3
+--hide@hue_path:color_space==5
+--track@hue_var:色相変化(±度),0,180,6,1
+--track@val_var:明度変化(±%),0,100,8,1
+--group
+
+--group:エッジ,0
+--check@show_edges:エッジ表示,1
+--track@edge_width:エッジ幅,0.5,5,1,0.1
+--hide@edge_width:show_edges==0
+--color@edge_color:エッジ色,0xffffff
+--hide@edge_color:show_edges==0
+--check@outline_empty:塗らない面にも線を描く,0
+--hide@outline_empty:show_edges==0
+--group
+
+--[[pixelshader@ps_lpbg_poly:
+// 多角形分割（v3.50）。1 パス 256 三角形（Lua 側 EffectUtils_Lowpoly.POLY_BATCH と必ず一致させること）。
+// 1 三角形 = 3 float4: x0,y0,x1,y1 / x2,y2,r,g / b,a,辺の印,枠だけの印
+//   辺の印 = 1: 頂点 0→1、2: 1→2、4: 2→0 の辺にエッジを引く（辺の向こうが別の多角形か外のときだけ立つ。多角形の中の対角線は引かない）
+//   a = 0 は塗らない面。枠だけの印が 1 のときはエッジだけを描く
+cbuffer Params : register(b0) {
+    float4 meta;      // w, h, tri_count, show_edges
+    float4 edge;      // r, g, b, edge_width
+    float4 bbox;      // このバッチの三角形の外接矩形 x0, y0, x1, y1（画素。1 画素の余裕込み）
+    float4 tri[768];  // 256 tris * 3 float4
+};
+
+// 正本: ps_lpbg_fill（シェーダーをまたいでヘルパーは共有できないので複製。直すときは全部直す）
+float sign2d(float2 p1, float2 p2, float2 p3) {
+    return (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+}
+
+bool point_in_tri(float2 pt, float2 v0, float2 v1, float2 v2) {
+    float d1 = sign2d(pt, v0, v1);
+    float d2 = sign2d(pt, v1, v2);
+    float d3 = sign2d(pt, v2, v0);
+    bool has_neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    bool has_pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    return !(has_neg && has_pos);
+}
+
+float dist_seg(float2 p, float2 a, float2 b) {
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float denom = dot(ba, ba);
+    float h = (denom > 1e-8) ? saturate(dot(pa, ba) / denom) : 0.0;
+    return length(pa - ba * h);
+}
+
+float4 ps_lpbg_poly(float4 sv_pos : SV_Position, float2 texcoord : TEXCOORD) : SV_Target {
+    float2 pos = sv_pos.xy;
+    float4 result = float4(0.0, 0.0, 0.0, 0.0);
+    if (pos.x < bbox.x || pos.y < bbox.y || pos.x > bbox.z || pos.y > bbox.w) {
+        return result;
+    }
+    int count = (int)meta.z;
+    [loop]
+    for (int i = 0; i < 256; i++) {
+        if (i >= count) break;
+        int base = i * 3;
+        float2 v0 = tri[base].xy;
+        float2 v1 = tri[base].zw;
+        float2 v2 = tri[base + 1].xy;
+        float a = tri[base + 2].y;
+        float eo = tri[base + 2].w;
+        if (a <= 0.0 && eo <= 0.5) continue;
+        if (point_in_tri(pos, v0, v1, v2)) {
+            int mk = (int)(tri[base + 2].z + 0.5);
+            float ea = 0.0;
+            if (meta.w > 0.5) {
+                float d = 1.0e6;
+                if ((mk & 1) != 0) d = min(d, dist_seg(pos, v0, v1));
+                if ((mk & 2) != 0) d = min(d, dist_seg(pos, v1, v2));
+                if ((mk & 4) != 0) d = min(d, dist_seg(pos, v2, v0));
+                ea = 1.0 - smoothstep(edge.w * 0.5, edge.w * 0.5 + 1.0, d);
+            }
+            if (a > 0.0) {
+                float3 rgb = float3(tri[base + 1].z, tri[base + 1].w, tri[base + 2].x);
+                rgb = lerp(rgb, edge.rgb, ea);
+                result = float4(rgb * a, a);
+            } else {
+                result = float4(edge.rgb * ea, ea);
+            }
+            break;
+        }
+    }
+    return result;
+}
+]]
+
+local ok_lp, lp = pcall(require, "EffectUtils_Lowpoly")
+if not ok_lp or not lp then
+  return
+end
+
+local w, h
+if lp.as_bool(screen_size, true) then
+  w, h = obj.screen_w, obj.screen_h
+else
+  w = math.max(math.floor(width + 0.5), 1)
+  h = math.max(math.floor(height + 0.5), 1)
+end
+if w < 8 or h < 8 then
+  return
+end
+
+local is_edges = lp.as_bool(show_edges, false)
+local is_outline = is_edges and lp.as_bool(outline_empty, false)
+
+local r1, g1, b1 = lp.color_to_rgb01(color1)
+local r2, g2, b2 = lp.color_to_rgb01(color2)
+local er, eg, eb = lp.color_to_rgb01(edge_color)
+local gdir = gradient_dir or 0
+local color_random = (color_mode or 0) == 1
+local mix_blend01 = (mix_blend or 0) / 100
+local mix_center = lp.random_mix_center((mix_ratio or 50) / 100, mix_blend01)
+local mix_cs = lp.mix_prepare(r1, g1, b1, r2, g2, b2, color_space or 0, hue_path or 0)
+local seed_i = math.floor(seed)
+
+obj.clearbuffer("object", w, h)
+
+-- 点群（場所ごとの細かさ）→ 三角形分割 → 多角形の結合。パラメータが同じなら 2 フレーム目以降は作り直さない
+local mesh = lp.get_poly_mesh(
+  w, h, cell_size, density_ratio, density_mode, density_size, seed_i, merge_rate, max_sides)
+if not mesh or #mesh.tris < 1 then
+  return
+end
+
+-- 多角形ごとに 1 色。色の鍵は多角形の番号（結合しても動かない三角形の番号）。塗る面は乱数で決める
+local pay = {}
+local fill01 = fill_rate
+for k = 1, #mesh.live do
+  local pid = mesh.live[k]
+  local cx, cy = lp.poly_center(mesh.points, mesh.polys[pid].verts)
+  local mix_t
+  if color_random then
+    mix_t = lp.random_mix_t(lp.hash21(pid, 13, seed_i + 700), mix_center, mix_blend01)
+  else
+    mix_t = lp.gradient_t(cx, cy, w, h, gdir)
+  end
+  local r, g, b = lp.color_at(
+    mix_t, r1, g1, b1, r2, g2, b2, pid, seed_i, hue_var, val_var, 0, 0, mix_cs, 3)
+  local filled = (lp.hash21(pid, 5, seed_i + 1300) * 100 < fill01)
+  pay[pid] = { r, g, b, filled and 1 or 0 }
+end
+
+local recs = lp.build_poly_records(mesh, pay, is_outline)
+local batch_n = lp.POLY_BATCH
+local batches = lp.spatial_batches(mesh.points, mesh.tris, batch_n)
+for bi = 1, #batches do
+  local b = batches[bi]
+  local consts = {
+    w, h, 0, is_edges and 1 or 0,
+    er, eg, eb, edge_width,
+    b.x0 - 1, b.y0 - 1, b.x1 + 1, b.y1 + 1,
+  }
+  local n = lp.append_tri_list_poly(consts, recs, b.idx, batch_n)
+  consts[3] = n
+  obj.pixelshader("ps_lpbg_poly", "object", nil, consts, "draw")
+end

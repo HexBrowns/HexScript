@@ -1,9 +1,16 @@
 --[[
-キーイング_H.anm2（マット調整 v1.01 / スピル除去 v1.01 / トラックマット v1.04 / 動体抽出 v1.10 / 同型塗りつぶし v1.10 / 光の回り込み v1.00 / 色差領域塗りつぶし v1.00）
+キーイング_H.anm2（マット調整 v1.01 / スピル除去 v1.01 / トラックマット v1.07.0 / 動体抽出 v1.12.0 / 同型塗りつぶし v1.10 / 光の回り込み v1.01.0 / 色差領域塗りつぶし v1.00）
+
+履歴
+  トラックマット v1.07.0 / 光の回り込み v1.01.0 / 動体抽出 v1.12.0: 動かさない値のトラックバーを変数項目（--value@）に替えた
+    （トラックマットの 参照レイヤー、光の回り込みの 背景のレイヤー(相対)、動体抽出の 比較フレーム間隔・ノイズ除去・個数・グリッド間隔）。
+    項目名・並び・既定値・範囲は同じ。数でない値は既定値、範囲外は旧トラックの範囲に切り詰める（整数に丸める）。
+    保存値は数の形（-1 など）なら引き継がれる見込み。中間点をつけていた値（数,数,…,移動方法 の形）は構文エラーになるか初期値に戻る。
+    UI 定義の型が変わるので AviUtl2 の再起動が要る。実機未確認。
 
   マット調整   : アルファを 収縮／膨張 → エッジぼかし → レベル補正 の順で整える（マルチパス）
   スピル除去   : 背景色の回り込み（スピル）を中和する（1 パス）
-  トラックマット : 他レイヤーの輝度／アルファでマスクする
+  トラックマット : 他レイヤーの輝度／アルファでマスクする（消し方は 透明 か 白へ）
   動体抽出     : 前のフレーム（または動画ファイルの別の時刻）との差が大きい所だけを残す。枠・ターゲット選択・グリッド画像つき
   同型塗りつぶし : 種の位置の色の領域と同じ形の領域を全部見つけて塗る（回転・大きさ違いも同じ形。照合は same_shape.mod2）
   光の回り込み   : 抜いた前景の縁に、背景（下のレイヤーか下の画面）のぼかした光をにじませて合成をなじませる（ライトラップ）
@@ -363,12 +370,13 @@ obj.pixelshader("ps_spill", "object", { "object" }, {
 })
 
 @トラックマット
---information:トラックマット@キーイング_H v1.04 by HexBrowns
+--information:トラックマット@キーイング_H v1.07.0 by HexBrowns
 --label:HexScript
---track@layer_rel:参照レイヤー,-10,10,-1,1
+--value@layer_rel:参照レイヤー,-1
 --select@matte_src:マット元=0,輝度=0,アルファ=1
 --check@invert:反転,0
 --track@matte_strength:強度,0,100,100,0.1
+--select@erase_mode:消し方=0,透明=0,白へ=1
 --check@use_effect:エフェクト適用後を使う,1
 --group:位置補正
 --track@offset_x:オフセットX,-4000,4000,0,0.1
@@ -387,6 +395,9 @@ cbuffer constant0 : register(b0) {
     float matte_src;
     float invert;
     float strength;
+    float erase_mode;
+    float2 center_s;
+    float2 rot_cs;
 };
 float4 ps_trackmatte(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
     float4 c = src.SampleLevel(smp, uv, 0);
@@ -396,11 +407,14 @@ float4 ps_trackmatte(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     //       obj_pos は 標準描画の X/Y ＋ ここまでの効果の移動（obj.ox/oy）。
     //       obj_draw_size は画面上での表示サイズ = (obj.w * sx * obj.sx, obj.h * sy * obj.sy)。
     //       拡大率を織り込まないと等倍以外でマットの位置がズレる
-    //       （回転と中心は見ていない。回転させたオブジェクトではマットがズレる）
+    //       v1.06: 中心（center_s = 中心X/Y * 拡大率）を引いてから Z 軸回転（rot_cs = cos, sin）を掛ける。
+    //       式は画面座標 = 位置 + R(rz) * ((p - 中心) * 拡大率)（モザイク_H の画面固定の格子と同じ）。
+    //       X / Y 軸回転（3D）は見ない
     //   (2) 画面座標をマット uv へ。マットバッファは画面中心に等倍で置かれている前提
     //       muv = (s - matte_offset) / matte_size + 0.5
     //   matte_offset はズレの手動補正（正の値でマットを +X / +Y 方向へずらす）
-    float2 s = obj_pos + (uv - 0.5) * obj_draw_size;
+    float2 d = (uv - 0.5) * obj_draw_size - center_s;
+    float2 s = obj_pos + float2(d.x * rot_cs.x - d.y * rot_cs.y, d.x * rot_cs.y + d.y * rot_cs.x);
     float2 muv = (s - matte_offset) / matte_size + 0.5;
     float4 m = matte.SampleLevel(smp, saturate(muv), 0);
     float mv = m.a;
@@ -416,7 +430,12 @@ float4 ps_trackmatte(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target
         mv = 1.0 - mv;
     }
     float k = lerp(1.0, mv, strength);
-    // premultiplied なので RGBA をまとめて掛ける
+    if (erase_mode > 0.5) {
+        // v1.05 消し方=白へ: 透明にせず、元の色と白を k で混ぜる（k=1 で元の絵、k=0 で真っ白）。
+        // premultiplied: rgb' = lerp(白 * a, rgb, k)。アルファは元のまま（元の a の範囲だけが白くなる）
+        return float4(lerp(float3(1.0, 1.0, 1.0) * c.a, c.rgb, k), c.a);
+    }
+    // 消し方=透明: premultiplied なので RGBA をまとめて掛ける
     return float4(c.rgb * k, c.a * k);
 }
 ]]
@@ -425,6 +444,12 @@ local obj, math = obj, math
 
 if matte_strength <= 0 then return end
 
+-- v1.07.0: 参照レイヤーは変数項目（--value@）。数でなければ既定の -1、旧トラックの範囲（-10〜10）に切り詰める
+do
+  local v = tonumber(layer_rel)
+  if v == nil or v ~= v then v = -1 end
+  layer_rel = math.max(-10, math.min(10, v))
+end
 local target_layer = math.floor(obj.layer + layer_rel + 0.5)
 if target_layer < 1 then return end
 -- v1.04: 参照レイヤーが自分（参照レイヤー 0）なら読まない。読むと自分の描画の中でまた自分を読み、本体の Lua の入れ子の
@@ -474,6 +499,10 @@ local oy = gv_num("y", 0) + (tonumber(obj.oy) or 0)
 -- ここまでの効果の拡大（obj.sx/sy）も掛ける（v1.01）
 local sx = gv_num("sx", 1) * (tonumber(obj.sx) or 1)
 local sy = gv_num("sy", 1) * (tonumber(obj.sy) or 1)
+-- v1.06: 中心と Z 軸回転も標準描画の値＋ここまでの効果の値（モザイク_H と同じ。画面座標の式は @モザイク_H の block_of）
+local cxv = gv_num("cx", 0) + (tonumber(obj.cx) or 0)
+local cyv = gv_num("cy", 0) + (tonumber(obj.cy) or 0)
+local rz = (gv_num("rz", 0) + (tonumber(obj.rz) or 0)) * math.pi / 180
 
 obj.copybuffer("tempbuffer", "object")
 
@@ -501,11 +530,14 @@ obj.pixelshader("ps_trackmatte", "tempbuffer", { "tempbuffer", "object" }, {
   matte_src,
   (invert == 1) and 1 or 0,
   matte_strength / 100,
+  erase_mode,
+  cxv * sx, cyv * sy,
+  math.cos(rz), math.sin(rz),
 }, "copy", "clamp")
 obj.copybuffer("object", "tempbuffer")
 
 @動体抽出
---information:動体抽出@キーイング_H v1.11 by HexBrowns
+--information:動体抽出@キーイング_H v1.12.0 by HexBrowns
 --label:HexScript
 --filter
 --group:比較
@@ -514,7 +546,7 @@ obj.copybuffer("object", "tempbuffer")
 --hide@movie:src_mode==0
 --select@ref_mode:比較先=0,前のフレーム=0,基準の時刻=1
 --hide@ref_mode:src_mode==0
---track@interval:比較フレーム間隔,1,30,1,1
+--value@interval:比較フレーム間隔,1
 --track@ref_time:基準の時刻,0,36000,0,0.01
 --hide@ref_time:ref_mode==0
 --track@movie_offset:動画のずれ,-36000,36000,0,0.01
@@ -531,9 +563,9 @@ obj.copybuffer("object", "tempbuffer")
 --hide@color_metric:use_color==0
 --check@invert:反転,0
 --group:対象
---track@noise:ノイズ除去,0,100000,0,1
+--value@noise:ノイズ除去,0
 --select@target:ターゲット選択=0,すべて=0,面積が大きい順=1,最も近い順=2
---track@count:個数,1,32,1,1
+--value@count:個数,1
 --hide@count:target==0
 --track@target_x:ターゲット座標X,-4000,4000,0,0.1
 --hide@target_x:target~=2
@@ -555,7 +587,7 @@ obj.copybuffer("object", "tempbuffer")
 --check@grid:グリッド画像,0
 --file@grid_file:配置する画像
 --hide@grid_file:grid==0
---track@grid_pitch:グリッド間隔,8,1000,64,1
+--value@grid_pitch:グリッド間隔,64
 --hide@grid_pitch:grid==0
 --group:品質
 --select@res:解像度=2,等倍=1,1/2=2,1/4=4
@@ -1264,6 +1296,18 @@ end
 
 local w, h = obj.w, obj.h
 if w < 2 or h < 2 then return end
+-- v1.12.0: 比較フレーム間隔・ノイズ除去・個数・グリッド間隔は変数項目（--value@）。数でなければ既定値にし、旧トラックの範囲の整数に切り詰める
+do
+  local function fix(v, def, lo, hi)
+    v = tonumber(v)
+    if v == nil or v ~= v then v = def end
+    return math.max(lo, math.min(hi, math.floor(v + 0.5)))
+  end
+  interval = fix(interval, 1, 1, 30)
+  noise = fix(noise, 0, 0, 100000)
+  count = fix(count, 1, 1, 32)
+  grid_pitch = fix(grid_pitch, 64, 8, 1000)
+end
 local div = (res == 4) and 4 or ((res == 1) and 1 or 2)
 local color = (use_color == 1) and 1 or 0
 -- v1.10: 色の差の 色差。今まで（4）は v1.01 までの Y'CbCr の各成分の差の最大。ほかは ps_md_diff が詰めた Y'CbCr を
@@ -2285,11 +2329,11 @@ obj.pixelshader("ps_sf_final", "object", {"object", "cache:sf/mask"}, {
 }, "copy", "clamp")
 
 @光の回り込み
---information:光の回り込み@キーイング_H v1.00 by HexBrowns
+--information:光の回り込み@キーイング_H v1.01.0 by HexBrowns
 --label:HexScript
 --group:背景の取り方
 --select@bg_src:背景=0,レイヤー=0,下の画面=1
---track@bg_layer:背景のレイヤー(相対),-10,10,-1,1
+--value@bg_layer:背景のレイヤー(相対),-1
 --hide@bg_layer:bg_src==1
 --check@use_effect:エフェクト適用後を使う,1
 --hide@use_effect:bg_src==1
@@ -2490,7 +2534,11 @@ if bg_src == 1 then
   -- 下の画面は画面の大きさで画面の中心に置かれている。画面の外は端の色（clamp）
   bg_pass("framebuffer", 0, 0, obj.screen_w, obj.screen_h, "clamp")
 else
-  local target = math.floor(obj.layer + bg_layer + 0.5)
+  -- v1.01.0: 背景のレイヤーは変数項目（--value@）。数でなければ既定の -1、旧トラックの範囲（-10〜10）に切り詰める
+  local rel = tonumber(bg_layer)
+  if rel == nil or rel ~= rel then rel = -1 end
+  rel = math.max(-10, math.min(10, rel))
+  local target = math.floor(obj.layer + rel + 0.5)
   if target < 1 or target == obj.layer then return end
   -- 背景のレイヤーの標準描画は obj.load の前に読む
   local key = "layer" .. target

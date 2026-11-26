@@ -1,4 +1,4 @@
---information:コースティクス_H v1.00 by HexBrowns
+--information:コースティクス_H v1.1.0 by HexBrowns
 --label:HexScript
 --filter
 
@@ -39,6 +39,9 @@
 --track@water_amt:水の濃さ,0,100,0,0.1
 --select@view:表示=0,合成=0,コースティクスだけ=1,高さマップ=2
 --group
+--group:出力補正,false
+--select@ovf_mode:色オーバーフロー修正=1,なし=0,足切り頭打ち=1,色差縮小(標準)=2,色差縮小(改)=3
+--group
 
 --[[
 After Effects の「ウェーブワールド」と「コースティクス」を合わせた効果。水面の高さ h(x, y, t) を数式で作り、
@@ -56,6 +59,41 @@ After Effects の「ウェーブワールド」と「コースティクス」を
 机上検証: AI/scripts/コースティクス_H/verify_caustics.py
 ]]
 
+--[[pixelshader@ps_ovf_ca:
+// 色オーバーフロー修正。乗算済みの色を 0 <= rgb <= a <= 1 に収める。
+// 正本: オープングロー_H の OG_Final 末尾の同じ式。直すときは同じ式を持つスクリプトを同時に直す。
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float mode;
+};
+// 色差縮小: 輝度 L を保ったまま、色と L の差を縮めてはみ出しを消す
+float3 ovf_shrink(float3 rgb, float a, bool wide) {
+    float3 res = float3(0.0, 0.0, 0.0);
+    float L = dot(float3(0.30, 0.59, 0.11), rgb);
+    if (L >= a) {
+        res = float3(a, a, a);
+    } else if (L > 0.0) {
+        float n = min(min(rgb.r, rgb.g), min(rgb.b, 0.0));
+        float x = max(max(rgb.r, rgb.g), max(rgb.b, a));
+        float sn = L / (L - n);
+        float sx = (a - L) / (x - L);
+        float k = wide ? min(sn, sx) : sn * sx;
+        res = L + (rgb - L) * k;
+    }
+    return res;
+}
+float4 ps_ovf_ca(float4 pos : SV_Position) : SV_Target {
+    float4 c = src.Load(int3(pos.xy, 0));
+    float a = saturate(max(max(c.r, c.g), max(c.b, c.a)));
+    float3 rgb = c.rgb;
+    if (mode < 1.5) {
+        rgb = clamp(rgb, 0.0, a);
+    } else {
+        rgb = ovf_shrink(rgb, a, mode > 2.5);
+    }
+    return float4(rgb, a);
+}
+]]
 --[[pixelshader@ps_caustics_h:
 cbuffer P : register(b0) {
     float2 size;        // 0-1   大きさ（px）
@@ -197,3 +235,7 @@ obj.pixelshader("ps_caustics_h", "object", {"object"}, {
   math.max(num(ripple_decay, 600), 1), num(refract, 40), num(focus, 150), math.min(math.max(num(spec, 20), 0), 100) / 100,
   math.rad(num(light_dir, 135)), math.floor(num(view, 0) + 0.5),
 }, "copy", "clamp")
+-- 色オーバーフロー修正: 乗算済みの色がアルファを超えた画素を直す。後ろに重ねるフィルタで色が破綻するのを防ぐ
+if ovf_mode > 0 and math.floor(num(view, 0) + 0.5) == 0 then
+  obj.pixelshader("ps_ovf_ca", "object", "object", { ovf_mode })
+end

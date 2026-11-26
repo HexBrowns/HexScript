@@ -1,20 +1,20 @@
 @描画
---information:描画@図形グラデーション_H v2.10 by HexBrowns
+--information:描画@図形グラデーション_H v2.13.0 by HexBrowns
 --label:HexScript
 --filter
 
---select@grad_type:種類=0,角度=0,線形=1,円形=2,矩形=3,ひし形=4
+--select@grad_type:種類=0,角度=0,線形=1,円形=2,矩形=3,ひし形=4,凸形=5,角丸矩形=6,円形ループ=7,矩形ループ=8,凸形ループ=9,角丸矩形ループ=10
 --select@blend_mode:合成モード=0,塗り替え=0,通常=1,加算=2,減算=3,乗算=4,スクリーン=5,オーバーレイ=6,比較(明)=7,比較(暗)=8,輝度=9,色差=10,陰影=11,明暗=12,差分=13
 --track@strength:強さ,0,100,100,0.1
 --select@alpha_mode:透明な色=0,形ごと透明にする=0,元の色を残す=1
 --hide@alpha_mode:blend_mode>0
 
 --group:位置
---track@angle:角度,-3600,3600,0,0.1
+--track@angle:角度,-3600,3600,0,0.01
 --track@center_x:中心X,-5000,5000,0,0.1
 --track@center_y:中心Y,-5000,5000,0,0.1
 --check@center_percent:中心を%で指定,0
---select@extent_basis:範囲の基準=0,画像サイズ=0,ピクセル=1
+--select@extent_basis:範囲の基準=0,画像サイズ=0,ピクセル=1,画面の幅=2,画面の高さ=3
 --hide@extent_basis:grad_type==0
 --track@extent:範囲,1,1000,100,0.1
 --hide@extent:grad_type==0
@@ -22,6 +22,8 @@
 --track@extent_px:範囲(px),1,20000,300,0.1
 --hide@extent_px:grad_type==0
 --hide@extent_px:extent_basis==0
+--hide@extent_px:extent_basis==2
+--hide@extent_px:extent_basis==3
 --track@aspect:縦横比,-100,100,0,0.1
 --hide@aspect:grad_type<2
 --check@aspect_before:縦横比を回転前に掛ける,0
@@ -29,38 +31,67 @@
 --check@fixed_width:幅を角度で変えない,0
 --hide@fixed_width:grad_type~=1
 --hide@fixed_width:extent_basis==1
+--hide@fixed_width:extent_basis==2
+--hide@fixed_width:extent_basis==3
+--track@round_rate:角の丸み(%),0,100,50,0.01
+--hide@round_rate:grad_type<6
+--hide@round_rate:grad_type==7
+--hide@round_rate:grad_type==8
+--hide@round_rate:grad_type==9
 --group
 
 --group:色
---track@palette_id:パレットID,0,100,0,1,使わない
+--value@palette_id:パレットID,0
+--check@use_stops:色を配列で指定,0
+--value@stops:色の配列,{}
+--hide@stops:use_stops==0
+--value@stop_alpha:透明度の配列,{}
+--hide@stop_alpha:use_stops==0
+--value@stop_pos:位置の配列(%),{}
+--hide@stop_pos:use_stops==0
 --select@color_count:色数=2,2色=2,3色=3,4色=4,5色=5
+--hide@color_count:use_stops==1
 --check@even:位置を等間隔にする,1
 --hide@even:color_count==2
+--hide@even:use_stops==1
 --color@color_a:開始色,0xf1c85a
---track@alpha_a:開始色透明度,0,100,0,0.1
+--hide@color_a:use_stops==1
+--track@alpha_a:開始色透明度,0,100,0,0.01
+--hide@alpha_a:use_stops==1
 --color@color_m1:中間色1,0xffffff
 --hide@color_m1:color_count==2
---track@alpha_m1:中間色1透明度,0,100,0,0.1
+--hide@color_m1:use_stops==1
+--track@alpha_m1:中間色1透明度,0,100,0,0.01
 --hide@alpha_m1:color_count==2
---track@pos_m1:中間色1位置,0,100,25,0.1
+--hide@alpha_m1:use_stops==1
+--track@pos_m1:中間色1位置,0,100,25,0.01
 --hide@pos_m1:color_count==2
 --hide@pos_m1:even==1
+--hide@pos_m1:use_stops==1
 --color@color_m2:中間色2,0xff8040
 --hide@color_m2:color_count<4
---track@alpha_m2:中間色2透明度,0,100,0,0.1
+--hide@color_m2:use_stops==1
+--track@alpha_m2:中間色2透明度,0,100,0,0.01
 --hide@alpha_m2:color_count<4
---track@pos_m2:中間色2位置,0,100,50,0.1
+--hide@alpha_m2:use_stops==1
+--track@pos_m2:中間色2位置,0,100,50,0.01
 --hide@pos_m2:color_count<4
 --hide@pos_m2:even==1
+--hide@pos_m2:use_stops==1
 --color@color_m3:中間色3,0x4080ff
 --hide@color_m3:color_count<5
---track@alpha_m3:中間色3透明度,0,100,0,0.1
+--hide@color_m3:use_stops==1
+--track@alpha_m3:中間色3透明度,0,100,0,0.01
 --hide@alpha_m3:color_count<5
---track@pos_m3:中間色3位置,0,100,75,0.1
+--hide@alpha_m3:use_stops==1
+--track@pos_m3:中間色3位置,0,100,75,0.01
 --hide@pos_m3:color_count<5
 --hide@pos_m3:even==1
+--hide@pos_m3:use_stops==1
 --color@color_b:終了色,0xfaf3de
---track@alpha_b:終了色透明度,0,100,0,0.1
+--hide@color_b:use_stops==1
+--track@alpha_b:終了色透明度,0,100,0,0.01
+--hide@alpha_b:use_stops==1
 --select@space:色空間=0,sRGB=0,リニア=1,Oklab=2,HSV=3,HSL=4,Lab=5,LCh=6,Oklch=7,XYZ=8,HWB=9
 --select@hue_path:色相経路=0,短経路=0,長経路=1
 --hide@hue_path:space<3
@@ -75,16 +106,32 @@
 --track@offset:オフセット,-1000,1000,0,0.1
 --track@pos_start:開始位置,0,100,0,0.1
 --track@pos_end:終了位置,0,100,100,0.1
---track@repeat_n:繰り返し,1,100,1,1
+--value@repeat_n:繰り返し,1
 --check@mirror:折り返す,0
+--hide@mirror:grad_type>6
 --check@invert:反転,0
---track@grad_steps:段数(0で連続),0,256,0,1
+--value@grad_steps:段数(0で連続),0
 --select@grad_dither:ディザ=0,なし=0,Bayer=1,ノイズ=2
 --group
 
 --[[
-図形グラデーション_H v2.10 描画
+図形グラデーション_H v2.13.0 描画
 
+  v2.13.0: 多色グラデーション_H の形状を取り込んだ（多色を図形へ一本化するため）。種類の末尾に 凸形・角丸矩形・円形ループ・矩形ループ・
+  凸形ループ・角丸矩形ループ の 6 つを足し、位置の グループの末尾に 角の丸み(%) を足した（角丸矩形の 2 つのときだけ出る）。
+  角度・各色の透明度・中間色の位置のトラックの刻みを 0.1 から 0.01 にした（多色と同じ刻み）。
+  既存の項目名・選択肢のラベル・並び・既定値は変えていない。種類 0〜4 の定数の先頭 184 個と描く経路は v2.12.0 と同じ（足した定数 1 個だけが増える）。
+  足した 6 つは別の関数 grad_t_multi で測り、grad_t は 1 文字も変えていない（GPU の出力が v2.12.0 と完全一致。verify_gradient.py の 45）。
+  足した 6 つは、範囲の基準 ピクセル・範囲(px) に多色の 幅、同じ角度・中心、変化の仕方 なめらか、色空間 リニア で、多色と同じ絵になる
+  （机上の写しで 8bit の差が最大 2。AI/scripts/図形グラデーション_H/verify_multi_port.py）。多色と同じく、矩形系（角丸矩形・矩形ループ・
+  角丸矩形ループ）は角度 0 で菱形の向き。多色の 矩形 は図形の ひし形、多色の 線形 は図形の 線形 に 反転 を付けたものと同じ絵になる。
+  UI 定義を変えたので AviUtl2 の再起動が要る。
+  v2.12.0: 色を配列で指定できるようにした（最大 16 色。チェック「色を配列で指定」。色の配列・透明度の配列・位置の配列の 3 つの欄）。
+  旧来の 13 欄と今の描画の経路は変えていない（チェックが 0、または配列に有効な色が 1 つも無いときは v2.11 と同じ定数・同じ絵）。
+  あわせて 動かさない値の 3 項目（パレットID・繰り返し・段数(0で連続)）をトラックバーから変数項目に替えた（項目名は同じ）。
+  保存値は引き継がれる見込み（実機未確認）。トラックから変数項目に替えた項目は AviUtl2 の再起動が要る。パレットID の表示名「使わない」は無くなった（0 が使わない）。
+  v2.11: 範囲の基準に「画面の幅」「画面の高さ」を足した（選択肢は末尾に足しただけ）。範囲(%) x 画面の幅（高さ）の長さを、ピクセルと同じ形で使う
+  （範囲 100% で画面の幅 / 高さ。縦動画 1080x1920 でも打ち直しが要らない）。既存の画像サイズ・ピクセルは v2.10 と同じ絵。
   v2.10: 段数(0で連続) / ディザ を足した（多色グラデーション_H v1.10 と同じ項目名・同じ式）。既定の 0 / なし で v2.02 と同じ絵。
   v2.02: 合成モードのときの素材の退避（cache）を 1 つの名前にし、読み終えたら縮める。
   並べたオブジェクトを描き直すと退避が消えて invalid buffer type になりうる（多色グラデーション_H v1.03 と同じ直し）
@@ -109,6 +156,16 @@
     円形    オブジェクトに内接する楕円の縁で 100%（円の図形ならちょうど縁）
     矩形    オブジェクトの外枠で 100%
     ひし形  オブジェクトの上下左右の端を結ぶひし形で 100%
+    以下の 6 つは v2.13.0 で多色グラデーション_H から取り込んだ形（式も多色と同じ。範囲は多色の 幅 に当たる）
+    凸形    中心を通る横線（角度 0）で 0%、そこから上下に 範囲 離れて 100%（線形を中心で折り返した形）
+    角丸矩形  角度 0 で菱形の向きの四角。中心から 範囲 の 50% までは角の尖った四角、その外は角が丸くなり、
+            斜め 45 度の 4 方向に 範囲 離れて 100%。角の丸み(%) で、角を丸めない部分の大きさを変える
+            （0 で角の尖った四角、既定の 50 で多色と同じ、100 で円形）
+    円形ループ / 矩形ループ / 凸形ループ  円形 / ひし形 / 凸形 を 範囲 ごとに折り返して繰り返す（中心が 0%、範囲で 100%、範囲 x 2 で 0%）。
+            矩形ループは多色と同じく菱形の向き
+    角丸矩形ループ  角丸矩形の 2 倍の大きさの形を 範囲 ごとに折り返して繰り返す（多色と同じく中心が 100%、角を丸めない四角の縁で 0%）
+    ループの 4 つは 折り返す を常に掛ける（チェックは隠れる）。繰り返し は折り返しの回数を増やし、反転 は 0% と 100% を入れ替える
+    範囲の基準 = 画面の幅 / 画面の高さ（v2.11）では、範囲(%) x 画面の幅 / 高さ（obj.screen_w / obj.screen_h）がピクセルの 範囲(px) になる。
     範囲の基準 = ピクセル（v2.01）では、範囲(px) が 0% から 100% までの距離になる（多色グラデーション_H の 幅 と同じ）。
     線形は全長（中心の両側に半分ずつ。角度によらない）、円形 / 矩形 / ひし形は中心からの半径で、オブジェクトの縦横比は効かない
     円形 / 矩形 / ひし形 は「角度」で時計回りに回り、「縦横比」で潰れる
@@ -119,6 +176,14 @@
       → 開始位置 / 終了位置 で切り出し
     開始位置 > 終了位置 にすると向きが逆になる。オフセットを動かすと模様が流れる。
     ジェネレーターの ズーム・幅拡縮基準点 は、範囲 と 開始位置 / 終了位置 で同じことができる
+
+  色を配列で指定（v2.12.0）
+    チェック「色を配列で指定」を ON にすると、色の配列（0xRRGGBB の数。"ff8040" や "#ff8040" の文字列も 16 進として受ける）・
+    透明度の配列（0〜100。足りない要素は 0）・位置の配列(%)（0〜100。色より少なければすべて等間隔。多い分は捨てる）で
+    最大 16 色を指定する。位置は前の位置より手前にならない（並べ替えない）。1 色なら同じ色を 0% と 100% に置く。
+    17 色以上は 16 色で切る。数でない色は黒にする（どちらもログに 1 回だけ警告）。
+    配列に有効な色が 1 つも無いときは、隠れている旧来の欄（色数・開始色など）をそのまま使う。
+    読み取りは stops_from_arrays（正本。色設定 に同じ関数を複製してある。多色グラデーション_H にも同じものを複製する予定）。
 
   色
     色数 2〜5。開始色が 0%、終了色が 100%、中間色は位置を指定するか等間隔に並ぶ。
@@ -188,6 +253,11 @@ cbuffer Params : register(b0) {
     float fixed_width;    // 50
     float step_count;     // 51    [v2.10] 段数（2 未満は連続）
     float dither_mode;    // 52    [v2.10] ディザ（0 なし / 1 Bayer / 2 ノイズ）
+    float ext_count;      // 53    [v2.12.0] 配列で指定した色の数（2〜16。0 = 使わない）
+    float2 ext_reserved;  // 54-55 [v2.12.0] 詰め物（使わない）
+    float4 ext_col[16];   // 56-119 [v2.12.0] 配列の色（rgb = ストレートの sRGB、w = 不透明度）
+    float4 ext_pos[16];   // 120-183 [v2.12.0] 配列の位置（x だけ使う。0〜1）
+    float round_rate;     // 184   [v2.13.0] 角の丸み（0〜1。角丸矩形 / 角丸矩形ループ だけが使う）
 };
 
 Texture2D tex : register(t0);
@@ -423,6 +493,55 @@ bool no_hue(float3 v) {
 
 // ---------------------------------------------------------------- 位置
 
+// ---- [v2.13.0 から] 多色グラデーション_H の形状（5 凸形 / 6 角丸矩形 / 7 円形ループ / 8 矩形ループ / 9 凸形ループ /
+// 10 角丸矩形ループ）の t。p は grad_t と同じ。式は多色の grad_convex 〜 grad_round_square_loop と同じで、
+// 多色の 幅 が 範囲 に当たる。
+// 多色の矩形系は角度から 45 度引いた座標で測るので、s = qn を -45 度回した座標で測る（角度 0 で菱形の向き）。
+// ループは形の 2 倍の大きさ（qn x 0.5）で測り、折り返す を常に掛ける（多色の fmod の三角波と同じ。周期は 範囲 x 2）。
+// 角丸矩形は 角の尖った四角（半幅 rb）までは max ノルム、その外は四角からの距離（多色の sd_round_square + 半幅）。
+// rb = 1 - 角の丸み。角の丸み 0.5 で多色と同じ（rb 0.5）、0 で角の尖った四角、1 で円形（length）。
+// 種類 0〜4 の grad_t を v2.12.0 から 1 文字も変えないために別の関数にした（grad_t の中に足すと fxc が 0〜4 の式の並びも変え、
+// f16 の 1 目盛りの違いが出た）。qn の作り方と、ずれ・繰り返し・反転・開始位置と終了位置は grad_t と同じ式
+float grad_t_multi(float2 p) {
+    float cs = cos(angle);
+    float sn = sin(angle);
+    float2 pa = aspect_before > 0.5 ? p / aspect_mul : p;
+    float2 q = float2(pa.x * cs + pa.y * sn, -pa.x * sn + pa.y * cs);
+    float2 den = aspect_before > 0.5 ? half_ext : half_ext * aspect_mul;
+    float2 qn = q / max(den, float2(0.0001, 0.0001));
+    float2 v = grad_type > 6.5 ? qn * 0.5 : qn;
+    float2 s = float2(v.x - v.y, v.x + v.y) * 0.70710678118654752;
+    float rb = 1.0 - saturate(round_rate);
+    float2 bd = abs(s) - float2(rb, rb);
+    float rbox = length(max(bd, float2(0.0, 0.0))) + min(max(bd.x, bd.y), 0.0) + rb;
+    float t = abs(v.y);                                 // 5 凸形 / 9 凸形ループ
+    if (grad_type > 9.5 || (grad_type > 5.5 && grad_type < 6.5)) {
+        t = rbox;                                       // 6 角丸矩形 / 10 角丸矩形ループ
+    } else if (grad_type > 6.5 && grad_type < 7.5) {
+        t = length(v);                                  // 7 円形ループ
+    } else if (grad_type > 7.5 && grad_type < 8.5) {
+        t = abs(v.x) + abs(v.y);                        // 8 矩形ループ（多色の 矩形 = 図形の ひし形 と同じ形）
+    }
+    t = t - offset;
+    float u = t * repeat_count;
+    if (mirror > 0.5 || grad_type > 6.5) {              // ループ（7〜10）は 折り返す のチェックによらず折り返す
+        t = 1.0 - abs(frac(u) * 2.0 - 1.0);
+    } else if (repeat_count > 1.5) {
+        t = frac(u);
+    } else {
+        t = saturate(t);
+    }
+    if (grad_type > 9.5) {                              // 角丸矩形ループは多色と同じく中心が 100% 側
+        t = 1.0 - t;
+    }
+    if (invert > 0.5) {
+        t = 1.0 - t;
+    }
+    float span = t_end - t_start;
+    t = abs(span) > 0.00001 ? saturate((t - t_start) / span) : step(t_start, t);
+    return t;
+}
+// ---- [v2.13.0 まで] ----
 // バッファ中心からの位置 p（画素、Y 下向き）→ グラデーション上の位置 t（0〜1）
 float grad_t(float2 p) {
     float cs = cos(angle);
@@ -511,6 +630,23 @@ float4 grad_color(float t) {
     if (t > stop_pos.w && stop_count > 4.5) {
         k0 = stop_col[3]; k1 = stop_col[4]; p0 = stop_pos.w; p1 = stop_pos4;
     }
+    // ---- [v2.12.0 から] 色の配列（最大 16 色）。ext_count が 2 以上のときだけ、区間の 2 色と位置を配列から選び直す ----
+    static const int EXT_MAX = 16;
+    if (ext_count > 1.5) {
+        int ext_n = min((int)ext_count, EXT_MAX);
+        int seg = 0;
+        [loop]
+        for (int si = 1; si < ext_n - 1; si++) {
+            if (t > ext_pos[si].x) {
+                seg = si;
+            }
+        }
+        k0 = ext_col[seg];
+        k1 = ext_col[seg + 1];
+        p0 = ext_pos[seg].x;
+        p1 = ext_pos[seg + 1].x;
+    }
+    // ---- [v2.12.0 まで] ----
     // 2 色の変換も [loop] で 1 回分のコードにまとめる（展開すると to_space が 2 回複製される）
     float3 c0 = float3(0.0, 0.0, 0.0);
     float3 c1 = float3(0.0, 0.0, 0.0);
@@ -610,7 +746,15 @@ float4 ps_sg_main(float4 pos : SV_Position) : SV_Target {
         float q_thr = step_count > 1.5 ? grad_dither_threshold(uint2(pos.xy), dither_mode) : 0.5;  // [v2.10]
         [loop]
         for (int k = 0; k < 4; k++) {
-            g += grad_color(grad_quantize(grad_t(p + AA_OFFSET[k]), step_count, dither_mode, q_thr));  // [v2.10]
+            // ---- [v2.13.0 から] 種類 5〜10（多色の形状）は grad_t_multi で測る ----
+            float tk = 0.0;
+            [branch] if (grad_type > 4.5) {
+                tk = grad_t_multi(p + AA_OFFSET[k]);
+            } else {
+                tk = grad_t(p + AA_OFFSET[k]);
+            }
+            g += grad_color(grad_quantize(tk, step_count, dither_mode, q_thr));
+            // ---- [v2.13.0 まで] ----
         }
         g *= 0.25;
 
@@ -692,18 +836,106 @@ local function build_stops(count, even_flag, cols, alphas, poss)
   return list
 end
 
+-- 正本: stops_from_arrays と num_item はこの 描画 セクションのもの（色設定 セクションに同じものがある。変えるときは両方を直す。
+-- 多色グラデーション_H にも同じ関数を複製する）。
+-- 色の配列・透明度の配列・位置の配列（--value@ の値）から色の並び（build_stops と同じ { r, g, b, a, 位置 } の列）を作る。
+-- 有効な色が 1 つも無ければ nil。位置は 0〜1 に収め、前の位置より手前にならない（並べ替えない）。
+-- 1 色なら同じ色を位置 0 と 1 に置く。max_n 色を超える分は切る。警告は原因ごとに初回だけ（global に記録）
+local function stops_from_arrays(cols, alphas, poss, max_n)
+  if type(cols) ~= "table" then return nil end
+  local warned = SHAPE_GRADIENT_H_WARNED
+  if type(warned) ~= "table" then
+    warned = {}
+    SHAPE_GRADIENT_H_WARNED = warned
+  end
+  local function warn(key, msg)
+    if not warned[key] then
+      warned[key] = true
+      print("@warn", "[図形グラデーション_H] " .. msg)
+    end
+  end
+  local n = #cols
+  if n < 1 then return nil end
+  if n > max_n then
+    warn("over", "色の配列が " .. max_n .. " 色を超えています。" .. max_n .. " 色で切ります")
+    n = max_n
+  end
+  alphas = type(alphas) == "table" and alphas or {}
+  poss = type(poss) == "table" and poss or {}
+  local list = {}
+  for i = 1, n do
+    local c = cols[i]
+    if type(c) == "string" then
+      local h = c:match("^%s*#?(%x+)%s*$") or c:match("^%s*0[xX](%x+)%s*$")
+      c = h and #h <= 6 and tonumber(h, 16) or nil
+    end
+    if type(c) ~= "number" or c ~= c then
+      warn("badcolor", "色の配列に色として読めない値があります。黒にします")
+      c = 0
+    end
+    c = math.max(0, math.min(16777215, math.floor(c)))
+    local t = tonumber(alphas[i])
+    if t == nil or t ~= t then t = 0 end
+    t = math.max(0, math.min(100, t))
+    list[i] = { math.floor(c / 65536) % 256 / 255, math.floor(c / 256) % 256 / 255, c % 256 / 255, 1 - t / 100, 0 }
+  end
+  if n == 1 then
+    local one = list[1]
+    list[2] = { one[1], one[2], one[3], one[4], 1 }
+    return list
+  end
+  local use_pos = #poss >= n
+  if #poss > 0 and #poss < n then
+    warn("fewpos", "位置の配列が色より少ないので、位置を等間隔にします")
+  end
+  local prev = 0
+  for i = 1, n do
+    local pos = (i - 1) / (n - 1)
+    if use_pos then
+      local p = tonumber(poss[i])
+      if p == nil or p ~= p then p = prev * 100 end
+      pos = math.max(prev, math.max(0, math.min(1, p / 100)))
+    end
+    prev = pos
+    list[i][5] = pos
+  end
+  return list
+end
+
+-- 変数項目の数値: 数に読めなければ既定値、小数は切り捨て、lo〜hi に収める
+local function num_item(v, default, lo, hi)
+  v = tonumber(v)
+  if v == nil or v ~= v then v = default end
+  return math.max(lo, math.min(hi, math.floor(v)))
+end
+
+-- 配列の 3 項目の値。下の local stops が UI の変数 stops を隠すので、先に別の名前で受ける
+local arr_cols, arr_alpha, arr_pos = stops, stop_alpha, stop_pos
+
 local stops = build_stops(color_count, even,
   { color_a, color_m1, color_m2, color_m3, color_b },
   { alpha_a, alpha_m1, alpha_m2, alpha_m3, alpha_b },
   { pos_m1, pos_m2, pos_m3 })
 
+-- 色を配列で指定: ON で有効な色が 1 つ以上あるときだけ配列の経路。無ければ旧来の欄（上の stops）のまま
+local EXT_MAX = 16
+local from_array = false
+if use_stops == 1 or use_stops == true then
+  local arr = stops_from_arrays(arr_cols, arr_alpha, arr_pos, EXT_MAX)
+  if arr then
+    stops = arr
+    from_array = true
+  end
+end
+
 -- パレットID: 同じフレームで先に描かれた 色設定 の色を使う（フレームが違えば古い値なので使わない）
-local pid = math.floor((palette_id or 0) + 0.5)
+local pid = num_item(palette_id, 0, 0, 100)
 if pid >= 1 then
   local store = SHAPE_GRADIENT_H_PALETTES
   local entry = store and store[pid]
   if entry and entry.frame == obj.getvalue("frame_s") + obj.frame then
     stops = entry.stops
+    from_array = entry.from_array == true
   end
 end
 
@@ -722,8 +954,17 @@ end
 -- 線形は全長を範囲(px) にするため、半分の長さを高さ側に入れて「幅を角度で変えない」の経路を使う
 local half_x, half_y = obj.w * 0.5 * ext, obj.h * 0.5 * ext
 local fixed = (fixed_width == 1 or fixed_width == true) and 1 or 0
+-- v2.11: 画面の幅 / 画面の高さ は 範囲(%) x 画面の幅（高さ）の長さを、ピクセルと同じ形で使う
+local basis_len = nil
 if extent_basis == 1 then
-  local len = math.max(extent_px or 300, 1)
+  basis_len = math.max(extent_px or 300, 1)
+elseif extent_basis == 2 then
+  basis_len = math.max(obj.screen_w * ext, 1)
+elseif extent_basis == 3 then
+  basis_len = math.max(obj.screen_h * ext, 1)
+end
+if basis_len then
+  local len = basis_len
   if grad_type == 1 then
     half_x, half_y = len * 0.5, len * 0.5
     fixed = 1
@@ -739,6 +980,17 @@ local out_mode = (alpha_mode == 1) and 1 or 0
 local str = math.min(strength, 100) / 100
 if mode > 0 then
   out_mode = 2
+end
+
+-- v2.12.0: 配列で指定した色。K[k] = { r, g, b, 不透明度, 位置 }（k = 1〜16。使わない分は 0）。
+-- 配列の経路でなければ ext_n = 0 で、足した 131 個はすべて 0（先頭の 53 個は v2.11 と同じ）
+local ext_n = 0
+if from_array and n >= 2 then
+  ext_n = math.min(n, EXT_MAX)
+end
+local K = {}
+for k = 1, EXT_MAX do
+  K[k] = (ext_n >= k) and stops[k] or { 0, 0, 0, 0, 0 }
 end
 
 local C = {
@@ -758,7 +1010,7 @@ local C = {
   grad_type,
   pos_start / 100,
   pos_end / 100,
-  math.max(1, math.floor(repeat_n + 0.5)),
+  num_item(repeat_n, 1, 1, 100),
   (mirror == 1 or mirror == true) and 1 or 0,
   curve,
   (invert == 1 or invert == true) and 1 or 0,
@@ -771,8 +1023,44 @@ local C = {
   offset / 100,
   (aspect_before == 1 or aspect_before == true) and 1 or 0,
   fixed,
-  math.floor((grad_steps or 0) + 0.5),   -- [v2.10] 段数（2 未満は連続）
+  num_item(grad_steps, 0, 0, 256),       -- [v2.10] 段数（2 未満は連続）
   grad_dither or 0,                      -- [v2.10] ディザ
+  ext_n, 0, 0,                           -- [v2.12.0] 53 ext_count / 54-55 ext_reserved
+  -- [v2.12.0] 56-119 ext_col（rgb = ストレートの sRGB、4 つ目 = 不透明度）
+  K[1][1], K[1][2], K[1][3], K[1][4],
+  K[2][1], K[2][2], K[2][3], K[2][4],
+  K[3][1], K[3][2], K[3][3], K[3][4],
+  K[4][1], K[4][2], K[4][3], K[4][4],
+  K[5][1], K[5][2], K[5][3], K[5][4],
+  K[6][1], K[6][2], K[6][3], K[6][4],
+  K[7][1], K[7][2], K[7][3], K[7][4],
+  K[8][1], K[8][2], K[8][3], K[8][4],
+  K[9][1], K[9][2], K[9][3], K[9][4],
+  K[10][1], K[10][2], K[10][3], K[10][4],
+  K[11][1], K[11][2], K[11][3], K[11][4],
+  K[12][1], K[12][2], K[12][3], K[12][4],
+  K[13][1], K[13][2], K[13][3], K[13][4],
+  K[14][1], K[14][2], K[14][3], K[14][4],
+  K[15][1], K[15][2], K[15][3], K[15][4],
+  K[16][1], K[16][2], K[16][3], K[16][4],
+  -- [v2.12.0] 120-183 ext_pos（x だけ使う）
+  K[1][5], 0, 0, 0,
+  K[2][5], 0, 0, 0,
+  K[3][5], 0, 0, 0,
+  K[4][5], 0, 0, 0,
+  K[5][5], 0, 0, 0,
+  K[6][5], 0, 0, 0,
+  K[7][5], 0, 0, 0,
+  K[8][5], 0, 0, 0,
+  K[9][5], 0, 0, 0,
+  K[10][5], 0, 0, 0,
+  K[11][5], 0, 0, 0,
+  K[12][5], 0, 0, 0,
+  K[13][5], 0, 0, 0,
+  K[14][5], 0, 0, 0,
+  K[15][5], 0, 0, 0,
+  K[16][5], 0, 0, 0,
+  math.max(0, math.min(100, round_rate or 50)) / 100,   -- [v2.13.0] 184 角の丸み（0〜1）
 }
 
 if mode == 0 then
@@ -806,42 +1094,67 @@ obj.pixelshader("ps_sg_restore", "object", { "object", src_cache }, {}, "copy")
 obj.clearbuffer(src_cache, 1, 1)
 
 @色設定
---information:色設定@図形グラデーション_H v2.01 by HexBrowns
+--information:色設定@図形グラデーション_H v2.02.0 by HexBrowns
 --label:HexScript
 --filter
 
---track@palette_id:パレットID,1,100,1,1
+--value@palette_id:パレットID,1
+--check@use_stops:色を配列で指定,0
+--value@stops:色の配列,{}
+--hide@stops:use_stops==0
+--value@stop_alpha:透明度の配列,{}
+--hide@stop_alpha:use_stops==0
+--value@stop_pos:位置の配列(%),{}
+--hide@stop_pos:use_stops==0
 --select@color_count:色数=2,2色=2,3色=3,4色=4,5色=5
+--hide@color_count:use_stops==1
 --check@even:位置を等間隔にする,1
 --hide@even:color_count==2
+--hide@even:use_stops==1
 --color@color_a:開始色,0xf1c85a
+--hide@color_a:use_stops==1
 --track@alpha_a:開始色透明度,0,100,0,0.1
+--hide@alpha_a:use_stops==1
 --color@color_m1:中間色1,0xffffff
 --hide@color_m1:color_count==2
+--hide@color_m1:use_stops==1
 --track@alpha_m1:中間色1透明度,0,100,0,0.1
 --hide@alpha_m1:color_count==2
+--hide@alpha_m1:use_stops==1
 --track@pos_m1:中間色1位置,0,100,25,0.1
 --hide@pos_m1:color_count==2
 --hide@pos_m1:even==1
+--hide@pos_m1:use_stops==1
 --color@color_m2:中間色2,0xff8040
 --hide@color_m2:color_count<4
+--hide@color_m2:use_stops==1
 --track@alpha_m2:中間色2透明度,0,100,0,0.1
 --hide@alpha_m2:color_count<4
+--hide@alpha_m2:use_stops==1
 --track@pos_m2:中間色2位置,0,100,50,0.1
 --hide@pos_m2:color_count<4
 --hide@pos_m2:even==1
+--hide@pos_m2:use_stops==1
 --color@color_m3:中間色3,0x4080ff
 --hide@color_m3:color_count<5
+--hide@color_m3:use_stops==1
 --track@alpha_m3:中間色3透明度,0,100,0,0.1
 --hide@alpha_m3:color_count<5
+--hide@alpha_m3:use_stops==1
 --track@pos_m3:中間色3位置,0,100,75,0.1
 --hide@pos_m3:color_count<5
 --hide@pos_m3:even==1
+--hide@pos_m3:use_stops==1
 --color@color_b:終了色,0xfaf3de
+--hide@color_b:use_stops==1
 --track@alpha_b:終了色透明度,0,100,0,0.1
+--hide@alpha_b:use_stops==1
 
 --[[
-図形グラデーション_H v2.01 色設定
+図形グラデーション_H v2.02.0 色設定
+
+  v2.02.0: 色を配列で指定できるようにした（最大 16 色。描画 と同じ 4 項目）。配列から作ったパレットは、読む側の 描画 が配列の経路で塗る。
+  パレットID を変数項目にした（項目名は同じ。保存値は引き継がれる見込み・実機未確認。AviUtl2 の再起動が要る）。
 
   色の並び（パレット）を ID を付けて置いておく。画像は変えない。
   描画@図形グラデーション_H の パレットID を同じ番号にすると、その色で塗る。
@@ -885,14 +1198,89 @@ local function build_stops(count, even_flag, cols, alphas, poss)
   return list
 end
 
-local pid = math.floor((palette_id or 0) + 0.5)
-if pid < 1 then return end
+-- 正本: stops_from_arrays と num_item は 描画 セクションのもの（変えるときは両方を直す）
+local function stops_from_arrays(cols, alphas, poss, max_n)
+  if type(cols) ~= "table" then return nil end
+  local warned = SHAPE_GRADIENT_H_WARNED
+  if type(warned) ~= "table" then
+    warned = {}
+    SHAPE_GRADIENT_H_WARNED = warned
+  end
+  local function warn(key, msg)
+    if not warned[key] then
+      warned[key] = true
+      print("@warn", "[図形グラデーション_H] " .. msg)
+    end
+  end
+  local n = #cols
+  if n < 1 then return nil end
+  if n > max_n then
+    warn("over", "色の配列が " .. max_n .. " 色を超えています。" .. max_n .. " 色で切ります")
+    n = max_n
+  end
+  alphas = type(alphas) == "table" and alphas or {}
+  poss = type(poss) == "table" and poss or {}
+  local list = {}
+  for i = 1, n do
+    local c = cols[i]
+    if type(c) == "string" then
+      local h = c:match("^%s*#?(%x+)%s*$") or c:match("^%s*0[xX](%x+)%s*$")
+      c = h and #h <= 6 and tonumber(h, 16) or nil
+    end
+    if type(c) ~= "number" or c ~= c then
+      warn("badcolor", "色の配列に色として読めない値があります。黒にします")
+      c = 0
+    end
+    c = math.max(0, math.min(16777215, math.floor(c)))
+    local t = tonumber(alphas[i])
+    if t == nil or t ~= t then t = 0 end
+    t = math.max(0, math.min(100, t))
+    list[i] = { math.floor(c / 65536) % 256 / 255, math.floor(c / 256) % 256 / 255, c % 256 / 255, 1 - t / 100, 0 }
+  end
+  if n == 1 then
+    local one = list[1]
+    list[2] = { one[1], one[2], one[3], one[4], 1 }
+    return list
+  end
+  local use_pos = #poss >= n
+  if #poss > 0 and #poss < n then
+    warn("fewpos", "位置の配列が色より少ないので、位置を等間隔にします")
+  end
+  local prev = 0
+  for i = 1, n do
+    local pos = (i - 1) / (n - 1)
+    if use_pos then
+      local p = tonumber(poss[i])
+      if p == nil or p ~= p then p = prev * 100 end
+      pos = math.max(prev, math.max(0, math.min(1, p / 100)))
+    end
+    prev = pos
+    list[i][5] = pos
+  end
+  return list
+end
+
+-- 変数項目の数値: 数に読めなければ既定値、小数は切り捨て、lo〜hi に収める
+local function num_item(v, default, lo, hi)
+  v = tonumber(v)
+  if v == nil or v ~= v then v = default end
+  return math.max(lo, math.min(hi, math.floor(v)))
+end
+
+local pid = num_item(palette_id, 1, 1, 100)
+
+-- 色を配列で指定: ON で有効な色が 1 つ以上あるときだけ配列から作る。無ければ旧来の欄で作る
+local made = nil
+if use_stops == 1 or use_stops == true then
+  made = stops_from_arrays(stops, stop_alpha, stop_pos, 16)
+end
 
 SHAPE_GRADIENT_H_PALETTES = SHAPE_GRADIENT_H_PALETTES or {}
 SHAPE_GRADIENT_H_PALETTES[pid] = {
   frame = obj.getvalue("frame_s") + obj.frame,
-  stops = build_stops(color_count, even,
+  stops = made or build_stops(color_count, even,
     { color_a, color_m1, color_m2, color_m3, color_b },
     { alpha_a, alpha_m1, alpha_m2, alpha_m3, alpha_b },
     { pos_m1, pos_m2, pos_m3 }),
+  from_array = made ~= nil,
 }

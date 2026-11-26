@@ -1,9 +1,19 @@
---information:電波_H v1.00 by HexBrowns
+--information:電波_H v1.01 by HexBrowns
 --label:HexScript
 --object
 
 --group:波
---track@freq:周波数,0.01,30,2,0.01
+--select@freq_mode:波の間隔の指定=0,秒数=0,フレーム=1,BPM=2
+--track@freq:周波数,0.01,30,2,0.001
+--hide@freq:freq_mode~=0
+--track@freq_frames:間隔(f),1,3600,15,1,,0.05
+--hide@freq_frames:freq_mode~=1
+--track@freq_bpm:BPM,1,1800,120,0.1,,0.2
+--hide@freq_bpm:freq_mode~=2
+--track@beat_num:拍子の拍数,1,32,4,1
+--hide@beat_num:freq_mode~=2
+--select@beat_unit:拍子の音符=4,2分音符=2,4分音符=4,8分音符=8,16分音符=16
+--hide@beat_unit:freq_mode~=2
 --track@speed:拡張速度,0,4000,200,0.1
 --track@life:寿命,0.01,60,3,0.01
 --track@emit_end:発生時間,0,600,0,0.01,無制限
@@ -39,6 +49,8 @@ After Effects の「電波」に当たるカスタムオブジェクト。オブ
 一定の間隔で生まれて広がり、寿命が来ると消える。
 
 - 波 k は時刻 k / 周波数 に生まれ、年齢 a のとき外接半径 拡張速度 * a で描かれる
+- 周波数は 秒数（1 秒あたりの本数）・フレーム（N フレームごと）・BPM（拍子の 1 小節に 1 本）のどれかで指定する。
+  BPM に周波数 = BPM / 60 を小数 2 桁で入れると、時間が経つほど波の位置がずれるので、フレームと BPM は別の欄にした
 - 多角形・星は「外接半径 1 の図形を拡大したもの」を等値線にとる。ρ = |p| / s(θ)
   （s(θ) は角度 θ の方向で外接半径 1 の図形の輪郭までの距離）。線の幅は ρ の勾配で割って画素に直す
 - 波の間隔が一定なので、画素ごとに年齢 ρ / 拡張速度 に近い波だけを調べる（全部の波を回さない）
@@ -142,7 +154,21 @@ local function rgb_of(c)
   return math.floor(c / 0x10000) / 255, math.floor(c / 0x100) % 0x100 / 255, c % 0x100 / 255
 end
 
-local f = math.max(num(freq, 2), 0.01)
+-- 波の間隔の指定。フレームは「N フレームごと」なので 1 秒あたりの本数は fps / N、
+-- BPM は 1 拍に 1 本なので BPM / 60。割り算は 1 回だけで、時刻 k / f はフレーム・拍に揃う
+local fmode = math.floor(num(freq_mode, 0) + 0.5)
+local f
+if fmode == 1 then
+  f = num(obj.framerate, 30) / math.max(math.floor(num(freq_frames, 15) + 0.5), 1)
+elseif fmode == 2 then
+  -- BPM は 4 分音符の数 / 分。1 小節は 拍数 * 4 / 音符 個の 4 分音符（6/8 なら 3 個）。1 小節に 1 本
+  local bn = math.min(math.max(math.floor(num(beat_num, 4) + 0.5), 1), 32)
+  local bu = math.max(math.floor(num(beat_unit, 4) + 0.5), 1)
+  f = math.max(num(freq_bpm, 120), 1) * bu / (240 * bn)
+else
+  f = num(freq, 2)
+end
+f = math.max(f, 0.01)
 local v = math.max(num(speed, 200), 0)
 local lf = math.max(num(life, 3), 0.01)
 local w0 = math.max(num(w_start, 4), 0)

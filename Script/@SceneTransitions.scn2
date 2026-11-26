@@ -14,6 +14,12 @@ v1.10 (2026-09-27)
   式の直しと根拠: AI/scripts/issues/20260926_scene_transitions_undocumented_api.md
   検証器: AI/scripts/SceneTransitions/verify_scene.py
 
+v1.20 (2026-10-28)
+  ロゴトランジション節を追加した（ロゴの形に新しい絵が開き、拡大して画面を抜ける）。
+  既存の 3 節（スマッシュカット・ズームトランジション・パララックス）は変えていない。
+  仕様: AI/specifications/20261028_ロゴトランジション_spec.md
+  検証器: AI/scripts/SceneTransitions/verify_logo.py
+
 ※このファイルは名前が @ で始まるので、このコメント内でも行頭に @ を置かないこと
   （セクションの区切りとして読まれる。ルール au2-multisection）。
 ]]
@@ -226,3 +232,169 @@ local a_next = -(1 - p) * depth * NEXT_RATIO
 obj.pixelshader("ps_parallax", "framebuffer", {"object", "framebuffer"}, {
   dx * a_prev, dy * a_prev, dx * a_next, dy * a_next, p,
 }, "copy", "clamp")
+
+@ロゴトランジション
+--information:ロゴトランジション@SceneTransitions v1.20 by HexBrowns
+--label:HexScript
+--require:2010800
+--file@logo_file:ロゴの画像
+--select@mask_source:形の取り方=0,アルファ=0,明るさ=1
+--track@start_size:最初の大きさ(%),1,300,30,0.1
+--track@end_scale:最終の倍率,1,500,40,0.1
+--track@center_x:拡大の中心X(%),-100,100,0,0.1
+--track@center_y:拡大の中心Y(%),-100,100,0,0.1
+--select@easing:動きの緩急=1,直線=0,加速=1,減速=2,加減速=3
+--track@appear:出現の割合(%),0,50,10,0.1
+--check@invert:形の内と外を入れ替える,0
+--track@edge_width:縁の太さ(px),0,200,0,0.1
+--color@edge_color:縁の色,0xffffff
+--check@show_logo:ロゴの形を表示,0
+--[[pixelshader@ps_logo:
+Texture2D img_prev : register(t0);
+Texture2D img_next : register(t1);
+Texture2D img_logo : register(t2);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+    float2 uv_scale;
+    float2 uv_center;
+    float4 edge_col;
+    float2 uv_px;
+    float opacity;
+    float invert_on;
+    float edge_px;
+    float mask_bright;
+    float show_logo_on;
+    float finish;
+};
+float logo_m(float2 luv) {
+    float4 lg = img_logo.SampleLevel(smp, luv, 0);
+    float a_safe = max(lg.a, 0.000001);
+    float3 straight = lg.rgb / a_safe;
+    float lum_s = saturate(dot(straight, float3(0.2126, 0.7152, 0.0722)));
+    float m_lum = lum_s * step(0.000001, lg.a);
+    return lerp(lg.a, m_lum, mask_bright);
+}
+float4 ps_logo(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+    float4 c_prev = img_prev.Sample(smp, uv);
+    float4 c_next = img_next.Sample(smp, uv);
+    float4 white = float4(1.0, 1.0, 1.0, 1.0);
+    float4 c_new = lerp(c_next, white, show_logo_on);
+    float2 luv = (uv - float2(0.5, 0.5)) * uv_scale + uv_center;
+    float m = logo_m(luv);
+    float m_in = lerp(m, 1.0 - m, invert_on);
+    float w = saturate(m_in * opacity);
+    float4 result = lerp(c_prev, c_new, w);
+    float mmax = m;
+    if (edge_px > 0.001) {
+        [loop] for (int ri = 1; ri <= 4; ri++) {
+            float rr = edge_px * float(ri) * 0.25;
+            [loop] for (int di = 0; di < 16; di++) {
+                float ang = float(di) * 0.39269908;
+                float2 off = float2(cos(ang), sin(ang)) * rr * uv_px;
+                mmax = max(mmax, logo_m(luv + off));
+            }
+        }
+    }
+    float edge_k = saturate(mmax - m) * opacity * edge_col.a;
+    result = lerp(result, float4(edge_col.r, edge_col.g, edge_col.b, 1.0), edge_k);
+    return lerp(result, c_new, finish);
+}
+]]
+
+-- 縁は、ロゴの形の外側へ edge_width 画素ぶん広げた範囲（円周上の 16 方向 × 4 つの半径で形を読んだ最大値）から形そのものを引いた帯。
+-- ロゴの形（アルファ、または明るさ）の内側に新しい絵、外側に古い絵を出し、ロゴを拡大の中心から指数で拡大する。
+-- 進み 1 のフレームは常に新しい絵だけ、進み 0 のフレームは常に古い絵だけ（invert でも同じ）。
+-- ロゴの大きさは、ロゴの長い方の辺が 画面の短い辺 × 最初の大きさ(%) になる。
+-- 拡大の中心がロゴの穴や透明な所にあると最終の倍率でも画面が埋まらない。その場合も進み 1 では新しい絵だけにする。
+-- 読み込みに失敗した・画像が大きすぎる（一辺 4000 画素超）ときは、何もせず古い絵のまま戻る（ログは同じ内容を続けて出さない）。
+-- バッファ: cache:logo_trans/prev（古い絵の退避）と cache:logo_trans/logo（ロゴ）。FHD とロゴ 2K 以下で 1600 万ドットの枠に収まる。
+
+local MAX_LOGO = 4000
+
+local function clamp01(v)
+  if v ~= v then return 0 end
+  if v < 0 then return 0 end
+  if v > 1 then return 1 end
+  return v
+end
+
+local function warn_once(msg)
+  if global.logo_trans_warn ~= msg then
+    global.logo_trans_warn = msg
+    print("@warn", msg)
+  end
+end
+
+local p = clamp01(tonumber((obj.getvalue("scenechange"))) or 0)
+local sw = math.max(obj.screen_w or 1, 1)
+local sh = math.max(obj.screen_h or 1, 1)
+
+if logo_file == nil or logo_file == "" then
+  warn_once("[ロゴトランジション] ロゴの画像が選ばれていない。古い絵のまま戻る")
+  return
+end
+
+obj.copybuffer("cache:logo_trans/prev", "object")
+local loaded = obj.load("image", logo_file) and true or false
+local lw, lh = obj.w, obj.h
+if not loaded or not lw or not lh or lw <= 0 or lh <= 0 then
+  obj.copybuffer("object", "cache:logo_trans/prev")
+  warn_once("[ロゴトランジション] ロゴの画像を読み込めない: " .. tostring(logo_file))
+  return
+end
+if lw > MAX_LOGO or lh > MAX_LOGO then
+  obj.copybuffer("object", "cache:logo_trans/prev")
+  warn_once("[ロゴトランジション] ロゴの画像が大きすぎる（一辺 " .. MAX_LOGO .. " 画素まで）: " .. lw .. "x" .. lh)
+  return
+end
+obj.copybuffer("cache:logo_trans/logo", "object")
+obj.copybuffer("object", "cache:logo_trans/prev")
+
+-- 緩急
+local mode_e = tonumber(easing) or 1
+local e = p
+if mode_e == 1 then
+  e = p * p
+elseif mode_e == 2 then
+  e = 1 - (1 - p) * (1 - p)
+elseif mode_e == 3 then
+  e = p * p * (3 - 2 * p)
+end
+
+-- ロゴの大きさ（画面の短い辺に対する比）。指数で補間する
+local s0 = math.max(start_size, 0.1) / 100
+local s1 = s0 * math.max(end_scale, 1)
+local size = s0 * (s1 / s0) ^ e
+
+-- 出現の不透明度。進み 0 は常に 0
+local ap = math.max(appear, 0) / 100
+local opacity = 1
+if p <= 0 then
+  opacity = 0
+elseif ap > 0 and p < ap then
+  opacity = p / ap
+end
+
+-- ロゴの画面上の大きさ（画素）。画面の座標 → ロゴの座標: luv = (uv - 0.5) * 係数 + 拡大の中心
+local longer = math.max(lw, lh)
+local short = math.min(sw, sh)
+local dw = lw / longer * size * short
+local dh = lh / longer * size * short
+local cu = 0.5 + center_x / 200
+local cv = 0.5 + center_y / 200
+
+local col = tonumber(edge_color) or 0xffffff
+local er = (math.floor(col / 65536) % 256) / 255
+local eg = (math.floor(col / 256) % 256) / 255
+local eb = (col % 256) / 255
+
+local function flag(v)
+  return (v == 1 or v == true) and 1 or 0
+end
+
+obj.pixelshader("ps_logo", "framebuffer", {"object", "framebuffer", "cache:logo_trans/logo"}, {
+  sw / dw, sh / dh, cu, cv,
+  er, eg, eb, 1,
+  1 / dw, 1 / dh, opacity, flag(invert),
+  math.max(edge_width, 0), (tonumber(mask_source) == 1) and 1 or 0, flag(show_logo), (p >= 1) and 1 or 0,
+}, "copy", "clip")

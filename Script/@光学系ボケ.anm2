@@ -1,5 +1,5 @@
 @玉ボケ
---information:玉ボケ@光学系ボケ v1.10 by HexBrowns
+--information:玉ボケ@光学系ボケ v1.20 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:ボケ半径,0,200,30,0.1
@@ -9,6 +9,8 @@
 --select@shape:形状,円=0,六角形=1,八角形=2
 --check@add_blend:加算合成,true
 
+-- v1.20（ファイル全体の履歴）: @小数ぼかし を追加した。他の節（玉ボケ・レンズぼかし・チルトシフト・球面収差ボケ・マップぼかし）の動作は変えていない
+--   （情報の版を v1.10 / マップぼかしは v1.00 から 1 つ上げただけ。保存キーも同じ）。
 -- v1.10（強化デバッグ 7.5）: 速くし、4K・横長の素材でも cache の枠に収める。
 --   v1.02 までは元の大きさのまま、半径の内側の画素を 1 画素ずつ集めていた（1 画素あたり (2 x 半径 + 1)^2 回。
 --   FHD の既定で 58ms、半径 200 で 3.3 秒。実機 2026-10-13）。v1.10 は
@@ -252,7 +254,7 @@ obj.pixelshader("tama_blend", "object", { "object", "cache:tama_blur" },
 
 
 @レンズぼかし
---information:レンズぼかし@光学系ボケ v1.10 by HexBrowns
+--information:レンズぼかし@光学系ボケ v1.20 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:ボケ半径,0,200,30,0.1
@@ -452,7 +454,7 @@ obj.pixelshader("lens_blend", "object", { "object", "cache:lens_blur" },
 
 
 @チルトシフト
---information:チルトシフト@光学系ボケ v1.10 by HexBrowns
+--information:チルトシフト@光学系ボケ v1.20 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:ボケ半径,0,200,30,0.1
@@ -665,7 +667,7 @@ obj.pixelshader("tilt_blend", "object", { "object", "cache:tilt_blur" },
 
 
 @球面収差ボケ
---information:球面収差ボケ@光学系ボケ v1.10 by HexBrowns
+--information:球面収差ボケ@光学系ボケ v1.20 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:ボケ半径,0,200,20,0.1
@@ -874,7 +876,7 @@ obj.pixelshader("sa_blend", "object", { "object", "cache:sa_blur" },
     { Wbig, Hbig, pad_x, pad_y, W, H, str }, "copy", "clamp")
 
 @マップぼかし
---information:マップぼかし@光学系ボケ v1.00 by HexBrowns
+--information:マップぼかし@光学系ボケ v1.10 by HexBrowns
 --label:HexScript
 --filter
 --track@radius:最大ボケ半径,0,200,30,0.1
@@ -1410,3 +1412,608 @@ else
         ext[5][1], ext[5][2], ext[6][1], ext[6][2], ext[7][1], ext[7][2],
         sig_top, nlv, sig_max, count_out, shape, taps_m }, "copy", smp)
 end
+
+@小数ぼかし
+--information:小数ぼかし@光学系ボケ v1.00 by HexBrowns
+--label:HexScript
+--filter
+--require:2011200
+--track@range:範囲,0,1000,5,0.01,,0.3
+--track@aspect:縦横比,-100,100,0,0.001
+--track@luma_weight:光の強さ,0,60,0,0.1
+--checksection@fixed_size:サイズ固定,false,false
+--hide@fixed_size:filter~=0
+--select@distribution:分布=1,矩形分布=0,三角分布=1,ガウス分布=2
+--group:その他,false
+--check@preview_mode:プレビューモード,true
+--value@PI:PI,{}
+--[[
+MIT License
+
+Copyright (c) 2025-2026 sigma-axis
+Copyright (c) 2026 HexBrowns
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+https://mit-license.org/
+]]
+
+-- v1.00  小数ぼかし@Basic_S v2.93 (sigma-axis) のフォーク（光学系ボケ 1.20 の節として追加）
+--
+-- 原作: https://github.com/sigma-axis/aviutl2_script_Basic_S
+--
+-- 原作からの変更点:
+--   1. ガウス分布は、縮小 → ぼかし → 拡大で戻す（原作は元の大きさのまま、1 画素あたり約 (範囲 x 2) 回読む）。
+--      [1] 横 → 縦の順に、幅 2 x k 画素の三角形の重みで 1 / k に縮小する（k は軸ごとの整数。k = 1 は縮小なし）
+--      [2] 縮小した画像で、原作と同じ打ち切りのガウスの重みで横 → 縦にぼかす（σ は縮小と拡大で増える分を引いてある）
+--      [3] バイリニアで元の大きさ（サイズ固定でなければ範囲ぶん広げた大きさ）に戻す
+--      k は「縮小した画像での σ」が 16 以上になる最大の整数（σ = (範囲 + 0.5) / √6）。この倍率なら、どんな画像でも
+--      原作との差は 8bit で 0.5 階調未満（横と縦の合計の上限。AI/scripts/光学系ボケ/verify_fractional_blur.py の 3 番）。
+--      FHD・範囲 400（σ = 163.5、k = 10）のガウス分布は、読み込みの合計が 3228.5 M 回から 31.9 M 回（verify_fractional_blur.py の 6 番の数え方）。
+--      軸ごとに k = 1（その軸の範囲が 77.9 未満）のときは、その軸の値が原作と一致する（誤差 2.4e-16）。両軸とも k = 1 なら原作と同じ呼び出しの列になる。
+--      サイズ固定のときの「範囲内だけで正規化」は、縮小した画像でも同じ手順で行う（セルが元の画像で覆われる割合で重みを数える）。
+--      矩形分布と三角分布は原作と同じ手順（縮小しない）。
+--   2. 「プレビューモード」（既定 ON）を足した。編集画面のプレビューの間だけ、k を「縮小した画像での σ が 2.5 以上」に
+--      なる最大の整数にする（出力は WIP 出力も含めて常に上の k）。原作との差の上限は 8bit で 5 階調未満（同じ検証の 3 番）。
+--      FHD・範囲 400 の読み込みの合計は 25.1 M 回。
+--   3. 他のスクリプトのシェーダー（transpose@四角縁取り@Basic_S）と共有モジュール（Basic_S.lua）に頼らず、このファイルだけで動く。
+-- 机上の検証: AI/scripts/光学系ボケ/verify_fractional_blur.py
+--
+-- ※このコメントの中で行頭に @ を置かないこと（マルチセクションの区切りと取り違えられる）。
+--[[computeshader@fbl_convol:
+RWTexture2D<half4> dst : register(u0);
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+	float2 dst_size_f;
+	float span_i_f, span_f, inv_span;
+};
+static const uint2 dst_size = uint2(dst_size_f);
+static const uint span_i = uint(span_i_f);
+int4 quantize(float4 v)
+{
+	return int4(round((1 << 12) * v));
+}
+[numthreads(1, 64, 1)]
+void fbl_convol(uint2 id : SV_DispatchThreadID)
+{
+	if (id.y >= dst_size.x) return;
+	uint dst_x = dst_size.x - 1 - id.y;
+
+	int4 sum = 0;
+	for (uint x = 0; x < dst_size.y; x++) {
+		const float4 c = src.Load(int3(x, id.y, 0)),
+			c0 = src.Load(int3(x - span_i, id.y, 0));
+		dst[uint2(dst_x, x)] = inv_span * (sum + span_f * c);
+		sum += quantize(c) - quantize(c0);
+	}
+}
+
+]]
+--[[pixelshader@fbl_unweight_alpha:
+cbuffer constant0 : register(b0) {
+	float2 size_f, span_i_f, span_f, wt;
+};
+static const int2 size = int2(size_f), span_i = int2(span_i_f);
+int2 sum_steps(int2 i)
+{
+	return i * (i + 1) >> 1;
+}
+float4 fbl_unweight_alpha(float4 pos : SV_Position) : SV_Target
+{
+	const int2 p = int2(pos.xy);
+
+	float2 sum = wt;
+	sum -= max(span_i - p, 0) * span_f + sum_steps(max(span_i - p - 1, 0));
+	sum -= max(span_i - size + p + 1, 0) * span_f + sum_steps(max(span_i - size + p, 0));
+
+	return float4(0, 0, 0, (wt.x * wt.y) / (sum.x * sum.y));
+}
+
+]]
+--[[computeshader@fbl_convol_box:
+RWTexture2D<half4> dst : register(u0);
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+	float2 dst_size_f;
+	float span_i_f, span_f, inv_span;
+};
+static const uint2 dst_size = uint2(dst_size_f);
+static const uint span_i = uint(span_i_f);
+int4 quantize(float4 v)
+{
+	return int4(round((1 << 11) * v));
+}
+[numthreads(1, 64, 1)]
+void fbl_convol_box(uint2 id : SV_DispatchThreadID)
+{
+	if (id.y >= dst_size.x) return;
+
+	int4 sum = 0; float4 c0 = 0;
+	for (uint x = 0; x < dst_size.y; x++) {
+		const float4 c = src.Load(int3(x, id.y, 0)),
+			c1 = src.Load(int3(x - 2 * span_i + 1, id.y, 0));
+		dst[uint2(id.y, x)] = inv_span * (sum + span_f * (c + c0));
+		sum += quantize(c) - quantize(c1);
+		c0 = c1;
+	}
+}
+
+]]
+--[[pixelshader@fbl_unweight_alpha_box:
+cbuffer constant0 : register(b0) {
+	float2 size_f, span_i_f, span_f, wt;
+};
+static const int2 size = int2(size_f), span_i = int2(span_i_f);
+float4 fbl_unweight_alpha_box(float4 pos : SV_Position) : SV_Target
+{
+	const int2 p = int2(pos.xy);
+
+	float2 sum = wt;
+	sum -= (span_i > p ? span_f : 0) + max(span_i - p - 1, 0);
+	sum -= (span_i > size - p - 1 ? span_f : 0) + max(span_i - size + p, 0);
+
+	return float4(0, 0, 0, (wt.x * wt.y) / (sum.x * sum.y));
+}
+
+]]
+--[[pixelshader@fbl_convol_gauss:
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+cbuffer constant0 : register(b0) {
+	float2 dst_size_f;
+	float span_i_f, min_pixel_wt;
+	float4 rates;
+};
+static const uint span_i = uint(span_i_f);
+static const uint2
+	dst_size = uint2(dst_size_f),
+	src_size = dst_size.yx - uint2(2 * span_i, 0);
+static const float2 inv_size_src = 1.0 / src_size;
+float4 pick(float2 pos, out float wt)
+{
+	wt = clamp(0.5 + min(pos.x, float(src_size.x) - pos.x), min_pixel_wt, 1);
+	return src.SampleLevel(smp, pos * inv_size_src, 0);
+}
+float4 fbl_convol_gauss(float4 pos : SV_Position) : SV_Target
+{
+	const float2 pos_src = pos.yx - float2(span_i, 0);
+	float4 sum = src.Load(int3(floor(pos_src), 0));
+	float sum_wt = 1,
+		dwt0 = 1, wt0 = rates[0], dwt01 = rates[1];
+	for (uint x = 1; x <= span_i; x += 2, dwt0 *= rates[3], wt0 *= dwt0, dwt01 *= rates[2]) {
+		const float wt1 = wt0 * dwt01, med = saturate(1 - rcp(1 + dwt01)), x_med = x + med;
+		float wt_add_l, wt_add_r;
+		sum += (wt0 + wt1) * (
+			pick(pos_src - float2(x_med, 0), wt_add_l) +
+			pick(pos_src + float2(x_med, 0), wt_add_r));
+		sum_wt += (wt0 + wt1) * (wt_add_l + wt_add_r);
+	}
+
+	return sum / sum_wt;
+}
+
+]]
+--[[pixelshader@fbl_weight_luma:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+	float log2_base, scale;
+};
+static const float3x3 mat_rgb2yc = {
+	0.299, 0.587, 0.114,
+	-0.16873589, -0.3312641, 0.5,
+	0.5, -0.41868758, -0.08131241
+};
+float4 fbl_weight_luma(float4 pos : SV_Position) : SV_Target
+{
+	float4 col = src[pos.xy];
+	col.xyz = mul(mat_rgb2yc, col.rgb);
+	col.x = scale * (exp2(log2_base * (col.a > 0 ? col.x / col.a : 0)) - 1) * col.a;
+	return col;
+}
+
+]]
+--[[pixelshader@fbl_unweight_luma:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+	float r_log2_base, r_scale;
+};
+static const float3x3 mat_yc2rgb = {
+	1, 0, 1.402,
+	1, -0.3441363, -0.7141363,
+	1, 1.772, 0
+};
+float4 fbl_unweight_luma(float4 pos : SV_Position) : SV_Target
+{
+	float4 col = src[pos.xy];
+	col.x = r_log2_base * log2(1 + r_scale * (col.a > 0 ? col.x / col.a : 0)) * col.a;
+	col.rgb = mul(mat_yc2rgb, col.xyz);
+	return col;
+}
+
+]]
+--[[pixelshader@fbl_transpose:
+Texture2D src : register(t0);
+float4 fbl_transpose(float4 pos : SV_Position) : SV_Target
+{
+	return src[pos.yx];
+}
+
+]]
+--[[pixelshader@fbl_down:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+	float axis, k, n_src, use_src;
+};
+// 1 軸の縮小。出力の列(axis = 0)または行(axis = 1)の番号 t はセル j = t - 1 に当たる。
+// セル j の中心は元の画像の (j + 0.5) x k の位置で、重みは中心から k 画素までの三角形（合計 k）。
+// use_src が 0 のときは画像の代わりに 1 を縮小し、セルが元の画像で覆われる割合を返す。
+float4 fbl_down(float4 pos : SV_Position) : SV_Target
+{
+	const int2 p = int2(pos.xy);
+	const bool on_y = axis > 0.5;
+	const float j = float(on_y ? p.y : p.x) - 1.0;
+	const int i_lo = max(int(floor((j - 0.5) * k)), 0);
+	const int i_hi = min(int(ceil((j + 1.5) * k)), int(n_src + 0.5));
+	float4 acc = float4(0, 0, 0, 0);
+	[loop] for (int i = i_lo; i < i_hi; i++) {
+		const float w = max(1.0 - abs((float(i) + 0.5) / k - (j + 0.5)), 0.0);
+		const int2 q = on_y ? int2(p.x, i) : int2(i, p.y);
+		acc += (use_src > 0.5 ? src.Load(int3(q, 0)) : float4(1, 1, 1, 1)) * w;
+	}
+	return acc / k;
+}
+
+]]
+--[[pixelshader@fbl_blur:
+Texture2D src : register(t0);
+Texture2D cov_tex : register(t1);
+cbuffer constant0 : register(b0) {
+	float2 ofs;
+	float axis, taps, hh, a_cut, use_cov;
+};
+// 縮小した画像での 1 軸のガウスぼかし。出力の画素に ofs を足した位置が入力の中心のセル。
+// 重みは exp(-hh x m^2)、端の 1 タップは a_cut - |m| (0〜1) で数える（原作と同じ打ち切りの位置にする）。
+// 範囲外は透明。use_cov が 1 のときは、元の画像で覆われる割合（cov_tex の列 = セル番号 + 1）を重みに掛けて正規化する。
+float4 fbl_blur(float4 pos : SV_Position) : SV_Target
+{
+	const int2 c = int2(pos.xy) + int2(ofs);
+	const bool on_y = axis > 0.5;
+	const int2 dir = on_y ? int2(0, 1) : int2(1, 0);
+	const int ic = on_y ? c.y : c.x;
+	const int nt = int(taps + 0.5);
+	const bool in_range_only = use_cov > 0.5;
+
+	float4 sum = src.Load(int3(c, 0));
+	float norm = in_range_only ? cov_tex.Load(int3(ic, 0, 0)).x : 1.0;
+	[loop] for (int m = 1; m <= nt; m++) {
+		const float w = exp(-hh * float(m) * float(m)) * saturate(a_cut - float(m));
+		sum += w * (src.Load(int3(c - dir * m, 0)) + src.Load(int3(c + dir * m, 0)));
+		norm += in_range_only ?
+			w * (cov_tex.Load(int3(ic - m, 0, 0)).x + cov_tex.Load(int3(ic + m, 0, 0)).x) :
+			2.0 * w;
+	}
+	return norm > 0 ? sum / norm : float4(0, 0, 0, 0);
+}
+
+]]
+--[[pixelshader@fbl_up:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+	float2 k;
+	float2 org;
+	float2 n0;
+	float2 lim;
+};
+// バイリニアで元の大きさに戻す。org は出力での元の画像の左上、n0 は縮小した画像の先頭のセルが -n0 番であること。
+float4 fbl_up(float4 pos : SV_Position) : SV_Target
+{
+	const float2 c = (floor(pos.xy) - org + 0.5) / k - 0.5;
+	const float2 c0 = floor(c);
+	const float2 f = c - c0;
+	const int2 mx = int2(lim) - int2(1, 1);
+	const int2 a = max(min(int2(c0 + n0), mx), int2(0, 0));
+	const int2 b = max(min(int2(c0 + n0) + int2(1, 1), mx), int2(0, 0));
+	const float4 v00 = src.Load(int3(a.x, a.y, 0)), v10 = src.Load(int3(b.x, a.y, 0));
+	const float4 v01 = src.Load(int3(a.x, b.y, 0)), v11 = src.Load(int3(b.x, b.y, 0));
+	return lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y);
+}
+
+]]
+local obj, math, tonumber, type = obj, math, tonumber, type;
+local math_min, math_max, math_floor, math_ceil, math_exp, math_log, math_sqrt =
+	math.min, math.max, math.floor, math.ceil, math.exp, math.log, math.sqrt;
+local image_max_w, image_max_h = obj.getinfo("image_max");
+
+---PI で `boolean|number|nil` での指定を適用する．number の場合，0 を false 扱い，0 以外を true 扱いとする．
+local function as_bool(pi_value, gui_value)
+	if type(pi_value) == "boolean" then return pi_value;
+	elseif type(pi_value) == "number" then return pi_value ~= 0;
+	else return gui_value end
+end
+
+---サイズと縦横比から幅と高さを計算する．
+local function size_from_aspect(size, aspect)
+	return math_min(1 - aspect, 1) * size, math_min(1 + aspect, 1) * size;
+end
+
+---領域拡張やクリッピングを利用してサイズを変更する．4000 上限を配慮．
+local function add_canvas_size(add_L, add_R, add_T, add_B, move_center, fill)
+	if move_center == false then
+		obj.cx, obj.cy = obj.cx + (add_L - add_R) / 2, obj.cy + (add_T - add_B) / 2;
+	end
+
+	local W, H = obj.w + add_L + add_R, obj.h + add_T + add_B;
+	if W <= 0 or H <= 0 then
+		-- empty while keeping properties such as `obj.ox`.
+		obj.effect("リサイズ", "X", 0);
+		return;
+	elseif math_min(add_L, add_R) <= -obj.w or math_min(add_T, add_B) <= -obj.h then
+		if fill ~= true then
+			obj.clearbuffer("object", W, H);
+			return;
+		end
+		local L, R, T, B =
+			math_max(add_L, -(obj.w - 1)), math_max(add_R, -(obj.w - 1)),
+			math_max(add_T, -(obj.h - 1)), math_max(add_B, -(obj.h - 1));
+		add_L, add_R, add_T, add_B =
+			add_R + L - R, add_L - L + R, add_B + T - B, add_T - T + B;
+	end
+
+	while add_L < 0 or add_R < 0 or add_T < 0 or add_B < 0 do
+		local L, R, T, B =
+			math_min(math_max(add_L, -4000), 0), math_min(math_max(add_R, -4000), 0),
+			math_min(math_max(add_T, -4000), 0), math_min(math_max(add_B, -4000), 0);
+		add_L, add_R, add_T, add_B = add_L - L, add_R - R, add_T - T, add_B - B;
+		obj.effect("クリッピング", "左", -L, "右", -R, "上", -T, "下", -B, "中心の位置を変更", 1);
+	end
+	while add_L > 0 or add_R > 0 or add_T > 0 or add_B > 0 do
+		local L, R, T, B =
+			math_min(math_max(add_L, 0), 4000), math_min(math_max(add_R, 0), 4000),
+			math_min(math_max(add_T, 0), 4000), math_min(math_max(add_B, 0), 4000);
+		add_L, add_R, add_T, add_B = add_L - L, add_R - R, add_T - T, add_B - B;
+		obj.effect("領域拡張", "左", L, "右", R, "上", T, "下", B, "塗りつぶし", fill == true and 1 or 0);
+	end
+end
+
+--#region PI / normalize parameters.
+
+-- take parameters.
+range = tonumber(PI.range) or range;
+aspect = tonumber(PI.aspect) or aspect;
+luma_weight = tonumber(PI.luma_weight) or luma_weight;
+fixed_size = as_bool(PI.fixed_size, fixed_size);
+preview_mode = as_bool(PI.preview_mode, preview_mode);
+if preview_mode == nil then preview_mode = true end -- UI 定義を変えた後に再起動していないとき．
+if PI.distribution then
+	local name2num = {
+		["矩形分布"] = 0, ["三角分布"] = 1, ["ガウス分布"] = 2
+	};
+	distribution = name2num[PI.distribution] or distribution;
+end
+
+-- normalize parameters.
+range = math_min(math_max(range, 0), 1000);
+aspect = math_min(math_max(aspect / 100, -1), 1);
+luma_weight = math_min(math_max(luma_weight, 0), 60);
+if range == 0 then return end
+fixed_size = fixed_size or obj.getinfo("filter");
+distribution = math_min(math_max(math_floor(0.5 + distribution), 0), 2);
+
+--#endregion PI / normalize parameters.
+
+-- 縮小した画像での σ の下限（この値以上になる最大の整数を縮小率 k にする）．
+-- 通常は 16: 横と縦の合計の最悪値（どんな画像でも）が 8bit で 0.5 階調未満．
+-- プレビューは 2.5: 同じく 5 階調未満（検証 4 番）．
+local SIGMA_LOW_NORMAL, SIGMA_LOW_PREVIEW = 16, 2.5;
+
+---ガウス分布の 1 軸の縮小率．原作の σ は (span - 0.5) / √6.
+local function pick_scale(span, preview)
+	local sigma = (span - 0.5) / math_sqrt(6);
+	return math_max(1, math_floor(sigma / (preview and SIGMA_LOW_PREVIEW or SIGMA_LOW_NORMAL)));
+end
+
+---縮小したガウスぼかしの 1 軸ぶんの寸法と重み．
+---@param n integer 元の画像のこの軸の長さ．
+---@param span number 原作の span（範囲 + 1）．
+---@param span_i integer 原作の span_i（ceil(span) - 1）．
+---@param k integer 縮小率．
+---@param fixed boolean サイズ固定．
+local function axis_plan(n, span, span_i, k, fixed)
+	-- 原作は 2 タップずつ読むので，span_i が奇数だと最大距離は span_i + 1.
+	local D = span_i + span_i % 2;
+	local sigma2 = (span - 0.5) ^ 2 / 6;
+	local s = fixed and 0 or span_i;
+	local nl = fixed and 1 or math_ceil(s / k) + 1; -- 先頭のセルの番号は -nl.
+	local nr = math_ceil((n + s) / k) + 1;
+	-- 縮小(三角形)と拡大(バイリニア)で増える分散 (k^2 - 1) / 3 を引く．k = 1 では 0.
+	local s2l = math_max(sigma2 - (k * k - 1) / 3, 1e-6 * k * k) / (k * k);
+	return {
+		k = k, s = s, nl = nl, wl = nl + nr, wd = math_ceil(n / k) + 2,
+		taps = math_ceil((D + 0.5) / k + 0.5),
+		hh = 0.5 / s2l, a_cut = (D + 0.5) / k + 0.5,
+	};
+end
+
+---ガウス分布を縮小 → ぼかし → 拡大で行う．
+local function scaled_gauss(span_x, span_y, span_x_i, span_y_i, kx, ky, fixed_size)
+	local w, h = obj.w, obj.h;
+	local ax = axis_plan(w, span_x, span_x_i, kx, fixed_size);
+	local ay = axis_plan(h, span_y, span_y_i, ky, fixed_size);
+	local use_cov = fixed_size and 1 or 0;
+	local cache_a, cache_b, cache_c, cache_e = "cache:fbl/a", "cache:fbl/b", "cache:fbl/c", "cache:fbl/e";
+	local cache_cx, cache_cy = "cache:fbl/cx", "cache:fbl/cy";
+
+	-- [1] 横 → 縦の順に縮小．
+	obj.clearbuffer(cache_a, ax.wd, h);
+	obj.pixelshader("fbl_down", cache_a, "object", { 0, kx, w, 1 });
+	obj.clearbuffer(cache_b, ax.wd, ay.wd);
+	obj.pixelshader("fbl_down", cache_b, cache_a, { 1, ky, h, 1 });
+	if fixed_size then
+		-- セルが元の画像で覆われる割合（範囲内だけで正規化するため）．
+		obj.clearbuffer(cache_cx, ax.wd, 1);
+		obj.pixelshader("fbl_down", cache_cx, cache_a, { 0, kx, w, 0 });
+		obj.clearbuffer(cache_cy, ay.wd, 1);
+		obj.pixelshader("fbl_down", cache_cy, cache_a, { 0, ky, h, 0 });
+	end
+
+	-- [2] 縮小した画像で横 → 縦にぼかす．
+	obj.clearbuffer(cache_c, ax.wl, ay.wd);
+	obj.pixelshader("fbl_blur", cache_c, { cache_b, fixed_size and cache_cx or cache_b }, {
+		1 - ax.nl, 0; 0, ax.taps, ax.hh, ax.a_cut, use_cov;
+	});
+	obj.clearbuffer(cache_e, ax.wl, ay.wl);
+	obj.pixelshader("fbl_blur", cache_e, { cache_c, fixed_size and cache_cy or cache_c }, {
+		0, 1 - ay.nl; 1, ay.taps, ay.hh, ay.a_cut, use_cov;
+	});
+
+	-- [3] バイリニアで戻す．
+	local W, H = w + 2 * ax.s, h + 2 * ay.s;
+	if W ~= w or H ~= h then obj.clearbuffer("object", W, H) end
+	obj.pixelshader("fbl_up", "object", cache_e, {
+		kx, ky; ax.s, ay.s; ax.nl, ay.nl; ax.wl, ay.wl;
+	});
+end
+
+---小数ぼかしの実体関数．値の型や範囲チェックは行われないので，事前に指定範囲内の保証をしておくこと．
+---@param span_x number 横方向のぼかし範囲，0 -- 1000.
+---@param span_y number 縦方向のぼかし範囲，0 -- 1000.
+---@param luma_weight number 光の強さ，0 -- 60.
+---@param fixed_size boolean サイズ固定．
+---@param distribution `0`|`1`|`2` ぼかしの分布関数．0 -> 矩形分布，1 -> 三角分布，2 -> ガウス分布．
+---@param preview boolean 編集画面のプレビューかどうか．ガウス分布の縮小率を上げる．
+local function prec_blur(span_x, span_y, luma_weight, fixed_size, distribution, preview)
+	-- cap by maximum size.
+	span_x = math_min(span_x, math_floor((image_max_w - obj.w) / 2));
+	span_y = math_min(span_y, math_floor((image_max_h - obj.h) / 2));
+
+	span_x, span_y = span_x + 1, span_y + 1;
+	local span_x_i, span_y_i = math_ceil(span_x) - 1, math_ceil(span_y) - 1;
+	local span_x_f, span_y_f = span_x - span_x_i, span_y - span_y_i;
+
+	-- weight to luma.
+	local log_base = 256 * math_log(1 + luma_weight / 1000, 2);
+	local luma_scale = 2 ^ (9 - log_base); -- for float16 not to overflow.
+	if luma_weight > 0 then
+		obj.pixelshader("fbl_weight_luma", "object", "object", { log_base, luma_scale });
+	end
+
+	-- 縮小率．ガウス分布だけ．
+	local kx, ky = 1, 1;
+	if distribution == 2 then
+		kx, ky = pick_scale(span_x, preview), pick_scale(span_y, preview);
+	end
+
+	-- apply the blur by shaders.
+	local w, h = obj.w, obj.h;
+	local cache_name = "cache:basic_s/prec_blur/intermed";
+	if distribution == 0 then
+		-- box kernel.
+		obj.clearbuffer(cache_name, h, w + 2 * span_x_i);
+		if span_x_i > 0 then
+			obj.computeshader("fbl_convol_box", cache_name, "object", {
+				h, w + 2 * span_x_i;
+				span_x_i, 2 ^ 11 * span_x_f, 2 ^ -11 / (2 * span_x - 1),
+			}, 1, math_ceil(h / 64), 1);
+		else obj.pixelshader("fbl_transpose", cache_name, "object") end
+		obj.clearbuffer("object", w + 2 * span_x_i, h + 2 * span_y_i);
+		if span_y_i > 0 then
+			obj.computeshader("fbl_convol_box", "object", cache_name, {
+				w + 2 * span_x_i, h + 2 * span_y_i;
+				span_y_i, 2 ^ 11 * span_y_f, 2 ^ -11 / (2 * span_y - 1),
+			}, 1, math_ceil((w + 2 * span_x_i) / 64), 1);
+		else obj.pixelshader("fbl_transpose", "object", cache_name) end
+
+		-- normalize the sum on the edges.
+		if fixed_size then
+			add_canvas_size(-span_x_i, -span_x_i, -span_y_i, -span_y_i);
+			obj.pixelshader("fbl_unweight_alpha_box", "object", nil, {
+				w, h; span_x_i, span_y_i; span_x_f, span_y_f;
+				2 * span_x - 1, 2 * span_y - 1;
+			}, "mask");
+		end
+	elseif distribution == 2 and (kx > 1 or ky > 1) then
+		-- gaussian kernel, 縮小 → ぼかし → 拡大.
+		scaled_gauss(span_x, span_y, span_x_i, span_y_i, kx, ky, fixed_size);
+	elseif distribution == 2 then
+		-- gaussian kernel.
+		-- the triangular distribution of the support [-1, +1] has the variance of 1/6.
+		local inv_vari_x, inv_vari_y =
+			6 * (span_x - 0.5) ^ -2, 6 * (span_y - 0.5) ^ -2;
+
+		obj.clearbuffer(cache_name, h, w + 2 * span_x_i);
+		obj.pixelshader("fbl_convol_gauss", cache_name, "object", {
+			h, w + 2 * span_x_i;
+			span_x_i, fixed_size and 0 or 1;
+			math_exp(-0.5 * inv_vari_x),
+			math_exp(-1.5 * inv_vari_x),
+			math_exp(-2.0 * inv_vari_x),
+			math_exp(-4.0 * inv_vari_x);
+		}, "copy", "clip");
+		obj.clearbuffer("object", w + 2 * span_x_i, h + 2 * span_y_i);
+		obj.pixelshader("fbl_convol_gauss", "object", cache_name, {
+			w + 2 * span_x_i, h + 2 * span_y_i;
+			span_y_i, fixed_size and 0 or 1;
+			math_exp(-0.5 * inv_vari_y),
+			math_exp(-1.5 * inv_vari_y),
+			math_exp(-2.0 * inv_vari_y),
+			math_exp(-4.0 * inv_vari_y);
+		}, "copy", "clip");
+
+		-- crop the edges.
+		if fixed_size then add_canvas_size(-span_x_i, -span_x_i, -span_y_i, -span_y_i) end
+	else
+		-- triangular kernel.
+		obj.clearbuffer(cache_name, h + 2 * span_y_i, w + 2 * span_x_i);
+		obj.computeshader("fbl_convol", cache_name, "object", {
+			h, w + span_x_i;
+			span_x_i, 2 ^ 12 * span_x_f, 2 ^ -12 / span_x,
+		}, 1, math_ceil(h / 64), 1);
+		obj.clearbuffer("object", w + 2 * span_x_i, h + 2 * span_y_i);
+		obj.computeshader("fbl_convol", "object", cache_name, {
+			w + span_x_i, h + span_y_i;
+			span_y_i, 2 ^ 12 * span_y_f, 2 ^ -12 / span_y,
+		}, 1, math_ceil((w + span_x_i) / 64), 1);
+		obj.computeshader("fbl_convol", cache_name, "object", {
+			h + span_y_i, w + 2 * span_x_i;
+			span_x_i, 2 ^ 12 * span_x_f, 2 ^ -12 / span_x,
+		}, 1, math_ceil((h + span_y_i) / 64), 1);
+		obj.computeshader("fbl_convol", "object", cache_name, {
+			w + 2 * span_x_i, h + 2 * span_y_i;
+			span_y_i, 2 ^ 12 * span_y_f, 2 ^ -12 / span_y,
+		}, 1, math_ceil((w + 2 * span_x_i) / 64), 1);
+
+		-- normalize the sum on the edges.
+		if fixed_size then
+			add_canvas_size(-span_x_i, -span_x_i, -span_y_i, -span_y_i);
+			obj.pixelshader("fbl_unweight_alpha", "object", nil, {
+				w, h; span_x_i, span_y_i; span_x_f, span_y_f;
+				span_x ^ 2, span_y ^ 2;
+			}, "mask");
+		end
+	end
+
+	-- remove the weight of luma.
+	if luma_weight > 0 then
+		obj.pixelshader("fbl_unweight_luma", "object", "object", { 1 / log_base, 1 / luma_scale });
+	end
+end
+
+-- pass to core.
+local range_x, range_y = size_from_aspect(range, -aspect); -- intentionally negated.
+prec_blur(range_x, range_y, luma_weight, fixed_size, distribution, preview_mode and obj.getoption("gui") and true or false);

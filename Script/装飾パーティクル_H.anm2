@@ -1,4 +1,4 @@
---information:装飾パーティクル_H v1.00 by HexBrowns
+--information:装飾パーティクル_H v1.10.1 by HexBrowns
 --label:HexScript
 --track@co:個数,1,100,16,1
 --track@ti_sh:表示時間[f],1,2000,60,1
@@ -13,51 +13,51 @@
 
 --check@isfig:図形／画像,1
 --figure@fig:図形,円
+--hide@fig:isfig==0
 --file@path:画像
+--hide@path:isfig==1
 --track@alpha:透明度[%],0,100,0,0.01
 
---track@rot_m:回転min,-360,360,0,0.01
---track@rot_M:回転max,-360,360,0,0.01
---track@asp_m:縦横比min,-100,100,0,0.01
---track@asp_M:縦横比max,-100,100,0,0.01
+--value@rot_r:回転の範囲[min/max],{0,0}
+--value@asp_r:縦横比の範囲[min/max],{0,0}
 
 --track@zrange:Z軸幅,0,1000,0,0.01
 
 --check@delay:徐々に増減,1
 
---track@iox:登場X,-1000,1000,0,0.01
---track@ioy:登場Y,-1000,1000,0,0.01
---track@ioz:登場Z,-1000,1000,0,0.01
---track@irx:登場rX,-3600,3600,0,0.01
---track@iry:登場rY,-3600,3600,0,0.01
---track@irz:登場rZ,-3600,3600,0,0.01
---track@izoom:登場zoom[%],0,1000,100,0.01
---track@ialpha:登場alpha[%],0,100,100,0.01
-
---track@oox:退場X,-1000,1000,0,0.01
---track@ooy:退場Y,-1000,1000,0,0.01
---track@ooz:退場Z,-1000,1000,0,0.01
---track@orx:退場rX,-3600,3600,0,0.01
---track@ory:退場rY,-3600,3600,0,0.01
---track@orz:退場rZ,-3600,3600,0,0.01
---track@ozoom:退場zoom[%],0,1000,100,0.01
---track@oalpha:退場alpha[%],0,100,100,0.01
+--value@io_in:登場の動き[X/Y/Z/rX/rY/rZ/拡大%/不透明%],{0,0,0,0,0,0,100,100}
+--value@io_out:退場の動き[X/Y/Z/rX/rY/rZ/拡大%/不透明%],{0,0,0,0,0,0,100,100}
 
 --check@sarea:領域可視化,0
 
---track@o_u:外領域上,-1000,1000,0,0.01
---track@o_d:外領域下,-1000,1000,0,0.01
---track@o_r:外領域右,-1000,1000,0,0.01
---track@o_l:外領域左,-1000,1000,0,0.01
---track@i_u:内領域除上,0,1000,0,0.01
---track@i_d:内領域除下,0,1000,0,0.01
---track@i_r:内領域除右,0,1000,0,0.01
---track@i_l:内領域除左,0,1000,0,0.01
+--value@area_o:外領域[上/下/右/左],{0,0,0,0}
+--value@area_i:内領域除[上/下/右/左],{0,0,0,0}
 
 --track@seed:シード,0,1000,0,1
 
 --[[
-装飾パーティクル.anm2 の軽量版。設定項目と描画結果は元と同じにしてある（元は残してある）。
+装飾パーティクル.anm2 の軽量版。描画結果は元と同じにしてある（元は残してある）。
+
+v1.10 で、動かさない静的な値 28 本のトラックを変数項目（配列）6 つに束ねた（設定画面を短くするため）。
+項目名が変わったので、v1.00 で保存した値は初期値に戻る。引き継ぐ道具と差し戻し方は下。
+  束ねた対応（旧項目 → 新項目。配列の並びは左から）
+    回転min・回転max → 回転の範囲[min/max]（単位: 度、範囲 ±360）
+    縦横比min・縦横比max → 縦横比の範囲[min/max]（範囲 ±100）
+    登場X・Y・Z・rX・rY・rZ・zoom[%]・alpha[%] → 登場の動き[X/Y/Z/rX/rY/rZ/拡大%/不透明%]
+      （X・Y・Z は px で ±1000、rX・rY・rZ は度で ±3600、拡大は 0〜1000%、不透明は 0〜100%。初期値 {0,0,0,0,0,0,100,100}）
+    退場X・Y・Z・rX・rY・rZ・zoom[%]・alpha[%] → 退場の動き[X/Y/Z/rX/rY/rZ/拡大%/不透明%]（同上）
+    外領域上・下・右・左 → 外領域[上/下/右/左]（px、±1000）
+    内領域除上・下・右・左 → 内領域除[上/下/右/左]（px、0〜1000）
+  トラックのまま残したもの: 透明度[%]（制作で中間点を付けて動かしていたため）、シード
+    （v1.10.1。v1.10.0 では変数項目にしたが、粒の並びは時間で変わらない固定の模様の種なので、コマ単位の切り替えや
+    移動方法を使えるトラックバーに戻した。2026-11-12 の基準。項目名・範囲・既定値は v1.00 と同じ。小数は切り捨て）
+  配列は個数・型が合わなければ初期値で補い、旧トラックの範囲に収めて読む。
+  保存値の引き継ぎ: python AI/tools/migrate_decoration_particle.py（既定は dry-run。--apply --out <新ファイル>）
+  差し戻し: 束ねる直前の版は git のコミット 1a5a66751406fa69560e6c71d1d388e4db04334e
+    （このファイルの最後の変更は 5bbf6aca2c6635179743b0367a40f97d4cccf872）。
+    git show 1a5a66751406fa69560e6c71d1d388e4db04334e:Script/装飾パーティクル_H.anm2 で取り出せる。
+    プロジェクトの保存値は migrate_decoration_particle.py --reverse で旧項目へ戻せる。
+    経緯: AI/scripts/issues/20261112_decoration_particle_h_bundle_tracks.md
 原作: アス（AVILITY）「装飾パーティクル」 https://avilityyy.blogspot.com/2025/11/decoParticle.html
 AVILITY の利用規約（https://avilityyy.blogspot.com/p/blog-page_83.html）に従い、原作を組み込んだ自作として配布する。
 
@@ -75,7 +75,41 @@ AVILITY の利用規約（https://avilityyy.blogspot.com/p/blog-page_83.html）�
 （元と本版を同じ入力で走らせ、描画命令の列が一致することを確かめる）
 ]]
 
-local obj, math, tostring = obj, math, tostring
+local obj, math, tostring, tonumber, type = obj, math, tostring, tonumber, type
+
+-- 変数項目（配列）の読み取り。個数が足りない・数値でない要素は初期値で補い、旧トラックの範囲に収める
+local function load_array(t, defaults, lows, highs)
+  local r = {}
+  for i = 1, #defaults do
+    local v = nil
+    if type(t) == "table" then v = tonumber(t[i]) end
+    if v == nil or v ~= v then v = defaults[i] end
+    if v < lows[i] then v = lows[i] elseif v > highs[i] then v = highs[i] end
+    r[i] = v
+  end
+  return r
+end
+
+local io_defaults = {0, 0, 0, 0, 0, 0, 100, 100}
+local io_lows = {-1000, -1000, -1000, -3600, -3600, -3600, 0, 0}
+local io_highs = {1000, 1000, 1000, 3600, 3600, 3600, 1000, 100}
+local io_a = load_array(io_in, io_defaults, io_lows, io_highs)
+local io_b = load_array(io_out, io_defaults, io_lows, io_highs)
+local iox, ioy, ioz, irx, iry, irz, izoom, ialpha =
+  io_a[1], io_a[2], io_a[3], io_a[4], io_a[5], io_a[6], io_a[7], io_a[8]
+local oox, ooy, ooz, orx, ory, orz, ozoom, oalpha =
+  io_b[1], io_b[2], io_b[3], io_b[4], io_b[5], io_b[6], io_b[7], io_b[8]
+
+local ao = load_array(area_o, {0, 0, 0, 0}, {-1000, -1000, -1000, -1000}, {1000, 1000, 1000, 1000})
+local o_u, o_d, o_r, o_l = ao[1], ao[2], ao[3], ao[4]
+local ai = load_array(area_i, {0, 0, 0, 0}, {0, 0, 0, 0}, {1000, 1000, 1000, 1000})
+local i_u, i_d, i_r, i_l = ai[1], ai[2], ai[3], ai[4]
+local rr = load_array(rot_r, {0, 0}, {-360, -360}, {360, 360})
+local rot_m, rot_M = rr[1], rr[2]
+local ar = load_array(asp_r, {0, 0}, {-100, -100}, {100, 100})
+local asp_m, asp_M = ar[1], ar[2]
+-- シードは整数にする（小数のままだと中間点の途中で形が変わる）
+seed = math.floor(seed)
 
 local izoom_v = izoom / 100
 local ozoom_v = ozoom / 100
@@ -129,7 +163,7 @@ local cache_key = table.concat({
   tostring(ory), tostring(orz), tostring(ozoom_v), tostring(oalpha_v), tostring(sarea),
   tostring(o_u), tostring(o_d), tostring(o_r), tostring(o_l), tostring(i_u),
   tostring(i_d), tostring(i_r), tostring(i_l), tostring(alpha_v), tostring(obj.w),
-  tostring(obj.h), tostring(seed)
+  tostring(obj.h), tostring(seed), tostring(obj.totalframe)
 }, "\n")
 
 local root = decor_particle_H_state
@@ -290,7 +324,7 @@ if amlast then
       end
       local j = lo
 
-      if j > 0 and (delay == 0 or (delay == 1 and till[j + 1] < total_frame)) and j <= #till then
+      if j > 0 and j < #till and (delay == 0 or (delay == 1 and till[j + 1] < total_frame)) then
         local frame = frame_now - till[j]
         local lasting = till[j + 1] - till[j]
 
